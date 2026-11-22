@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "labels": [
+    {
+      "sample_id": "synthetic-001",
+      "claim_id": "c-a",
+      "verdict": "supported",
+      "accepted_evidence_groups": [["e-a"]]
+    },
+    {
+      "sample_id": "synthetic-001",
+      "claim_id": "c-b",
+      "verdict": "refuted",
+      "accepted_evidence_groups": [["e-b"]]
+    },
+    {
+      "sample_id": "synthetic-001",
+      "claim_id": "c-c",
+      "verdict": "insufficient",
+      "accepted_evidence_groups": []
+    }
+  ]
+}

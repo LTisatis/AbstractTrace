@@ -1,0 +1,27 @@
+name: Offline CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-offline:
+    name: Windows offline checks
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.18"
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run abstract-review doctor
+      - run: uv run pytest -m "not live"
