@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if report %}审阅报告{% else %}导入论文{% endif %} · AbstractTrace</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --background: #f6f7f3;
+      --paper: #fff;
+      --ink: #172921;
+      --muted: #51645b;
+      --accent: #17624a;
+      --line: #d8e2d9;
+      --tint: #eaf4ed;
+      --warning: #943e28;
+      --soft-warning: #fbf0e9;
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--background); color: var(--ink); font-size: 15px; line-height: 1.55; }
+    a { color: var(--accent); text-underline-offset: .18em; }
+    a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
+      outline: 3px solid #62a98e;
+      outline-offset: 3px;
+    }
+    header { background: #fbfcf8; border-bottom: 1px solid var(--line); }
+    .header-inner, main { width: min(100% - 2.5rem, 1280px); margin: 0 auto; }
+    .header-inner { min-height: 4rem; display: flex; gap: 1rem; justify-content: space-between; align-items: center; }
+    .brand { color: var(--ink); font-size: 1.22rem; font-weight: 720; text-decoration: none; }
+    .brand::before { content: ""; display: inline-block; width: .75rem; height: .75rem; margin-right: .55rem; background: var(--accent); border-radius: 2px; transform: rotate(-10deg); }
+    main { padding: 2.1rem 0 3rem; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: .45rem; font-size: clamp(1.6rem, 3vw, 2.18rem); line-height: 1.25; font-weight: 680; letter-spacing: -.035em; overflow-wrap: anywhere; }
+    h2 { margin-bottom: .8rem; font-size: 1.12rem; font-weight: 680; }
+    h3 { margin-bottom: .45rem; font-size: .99rem; }
+    ul, ol { padding-left: 1.25rem; margin-top: .35rem; }
+    p:last-child, ul:last-child { margin-bottom: 0; }
+    .muted, .meta { color: var(--muted); }
+    .meta { font-size: .86rem; }
+    .intro { margin-bottom: 1.45rem; }
+    .title-row { display: flex; justify-content: space-between; gap: 1rem; align-items: start; flex-wrap: wrap; }
+    .upload { max-width: 660px; margin: .8rem auto 0; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.04fr); gap: 1.3rem; align-items: start; }
+    .stack { display: grid; gap: 1rem; min-width: 0; }
+    .card { background: var(--paper); border: 1px solid var(--line); border-radius: .8rem; padding: 1.15rem; min-width: 0; }
+    .upload .card { padding: 1.45rem; }
+    .toolbar, .anchors, .form-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
+    .button { display: inline-flex; padding: .46rem .75rem; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: .45rem; color: var(--accent); background: #fff; font-size: .88rem; font-family: inherit; font-weight: 650; text-decoration: none; cursor: pointer; }
+    .button:hover, .anchor:hover { background: var(--tint); }
+    .primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+    .primary:hover { background: #124d3a; }
+    .pill { display: inline-flex; border-radius: .35rem; background: #edf1ed; color: #3f5549; padding: .12rem .42rem; font-size: .8rem; font-weight: 650; white-space: nowrap; }
+    .pill-supported, .pill-passed { background: var(--tint); color: #18533f; }
+    .pill-refuted, .pill-returned, .pill-manual_conflict { background: var(--soft-warning); color: var(--warning); }
+    .pill-insufficient, .pill-manual_review { background: #fbf3d9; color: #694d0d; }
+    .alert { background: var(--soft-warning); color: var(--warning); border: 1px solid #ebcbbf; border-radius: .55rem; padding: .75rem; margin: 0 0 1.1rem; overflow-wrap: anywhere; }
+    form { margin: 0; }
+    .fields { display: grid; gap: 1rem; }
+    label.field { display: grid; gap: .35rem; font-weight: 610; }
+    label small { color: var(--muted); font-weight: 400; }
+    input[type=file], textarea, select, input[type=number] { max-width: 100%; color: var(--ink); font: inherit; }
+    select, textarea, input[type=number] { width: 100%; padding: .55rem .65rem; background: #fcfdfc; border: 1px solid #b6c6ba; border-radius: .4rem; }
+    textarea { resize: vertical; }
+    input[type=number] { width: 6rem; }
+    input[type=file]::file-selector-button { margin-right: .7rem; padding: .4rem .65rem; border: 1px solid var(--line); border-radius: .4rem; background: var(--tint); color: var(--ink); cursor: pointer; }
+    .abstract, .excerpt { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .finding, .revision { padding: .8rem 0; border-top: 1px solid var(--line); }
+    .finding:first-of-type, .revision:first-of-type { border-top: 0; padding-top: .1rem; }
+    .finding:last-child, .revision:last-child { padding-bottom: 0; }
+    .finding p, .revision p { margin: .35rem 0; }
+    .finding header { background: none; border: none; display: flex; gap: .55rem; align-items: start; }
+    .finding header h3 { margin: 0; }
+    .anchor { color: var(--accent); display: inline-block; border: 1px solid var(--line); border-radius: .35rem; padding: .15rem .43rem; font-size: .81rem; text-decoration: none; overflow-wrap: anywhere; }
+    .anchor[aria-current=true] { background: var(--tint); border-color: #7cbe9e; }
+    .preview { position: sticky; top: 1rem; }
+    .preview img { width: 100%; display: block; background: #fff; }
+    .pdf { border: 1px solid var(--line); border-radius: .42rem; overflow: auto; max-height: max(480px, 75vh); }
+    .pdf-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: .25rem .6rem; margin-bottom: .6rem; }
+    .pdf-heading h2 { margin: 0; }
+    .preview figcaption { margin-top: .7rem; border-left: 3px solid #7cbe9e; padding-left: .65rem; }
+    .preview figure { margin: 0; }
+    .evidence-list { max-height: 21rem; overflow: auto; padding-right: .25rem; margin-top: .5rem; }
+    .evidence-row + .evidence-row { margin-top: .6rem; }
+    .evidence-row p { margin-bottom: .2rem; }
+    .change { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: .55rem; }
+    .change > div { padding: .45rem .6rem; border-radius: .35rem; background: #f3f5f2; }
+    .change > :last-child { background: var(--tint); }
+    .selection { display: grid; gap: .65rem; }
+    details { min-width: 0; }
+    summary { color: var(--accent); font-weight: 620; cursor: pointer; }
+    .group { margin-top: .75rem; }
+    .compact { margin-bottom: 0; }
+    @media (max-width: 840px) {
+      .layout { grid-template-columns: minmax(0, 1fr); }
+      .preview { position: static; }
+      .pdf { max-height: 75vh; }
+    }
+    @media (max-width: 420px) {
+      .header-inner, main { width: calc(100% - 1.4rem); }
+      main { padding-top: 1.4rem; }
+      .change { grid-template-columns: minmax(0, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <nav class="header-inner" aria-label="工作区">
+      <a class="brand" href="{{ request.url_for('home') }}">AbstractTrace</a>
+      {% if report %}<a class="button" href="{{ request.url_for('home') }}">审阅新论文</a>{% endif %}
+    </nav>
+  </header>
+
+  {% if not report %}
+  <main class="upload">
+    <div class="intro">
+      <h1>导入论文</h1>
+      <p class="muted">核查摘要中的断言，并按页回看支持或反驳它们的证据。</p>
+    </div>
+    {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
+    <form class="card fields" method="post" enctype="multipart/form-data" action="{{ request.url_for('start_review') }}">
+      <label class="field">论文 PDF<input name="pdf" type="file" accept="application/pdf,.pdf" required></label>
+      <label class="field">补充材料 <small>可选。选择附件即确认它属于这篇论文。</small>
+        <input name="supplements" type="file" accept="application/pdf,.pdf" multiple>
+      </label>
+      <label class="field">待审摘要来源
+        <select name="abstract_source"><option value="pdf">从 PDF 提取</option><option value="pasted">使用粘贴内容</option></select>
+      </label>
+      <label class="field">粘贴摘要 <small>选择使用粘贴内容时填写。</small>
+        <textarea name="pasted_abstract" rows="5"></textarea>
+      </label>
+      <label class="field">审阅方式
+        <select name="engine"><option value="offline">本地规则</option><option value="openai">OpenAI 模型</option></select>
+        <small>使用 OpenAI 模型时，审阅所需的摘要和证据会发送给模型。</small>
+      </label>
+      <div class="fields">
+        <label><input type="checkbox" name="check_omissions" value="true"> 核查摘要遗漏</label>
+        <label><input type="checkbox" name="check_external" value="true"> 核查外部参考文献</label>
+      </div>
+      <div class="form-actions"><button class="button primary" type="submit">开始审阅</button></div>
+    </form>
+  </main>
+  {% else %}
+  {% set run_id = report.run_id %}
+  {% set version_id = report.report_version_id %}
+  {% set documents = report.documents|default([]) %}
+  {% set abstract_review = report.abstract_review|default({}) %}
+  {% set verification = abstract_review.status|default('pending') %}
+  {% set selected_revision_ids = report.reviewed_abstract.revision_ids|default([]) %}
+  {% set revisions = report.revisions|default([]) %}
+  {% macro evidence_link(id) -%}
+    {% set record = evidence_by_id.get(id) %}
+    {% if record %}
+      {% set loc = record.locator %}
+      {% if record.doc_id and loc.bbox %}
+      <a class="anchor"{% if selected and selected.evidence_id == id %} aria-current="true"{% endif %}
+         href="{{ request.url_for('view_run', run_id=run_id).include_query_params(version_id=version_id, evidence_id=id) }}#pdf-preview">
+        第 {{ loc.page_label or loc.page_number }} 页{% if record.kind == 'table_cell' %} · 表格{% elif loc.section %} · {{ loc.section }}{% endif %}
+      </a>
+      {% else %}<span class="meta">{{ loc.section }} · 第 {{ loc.page_index + 1 }} 页</span>{% endif %}
+    {% endif %}
+  {%- endmacro %}
+  {% macro evidence_links(ids) -%}
+    {% if ids %}<div class="anchors">{% for id in ids %}{{ evidence_link(id) }}{% endfor %}</div>{% endif %}
+  {%- endmacro %}
+  <main>
+    <div class="intro title-row">
+      <div>
+        <h1>{{ documents[0].name if documents else '审阅报告' }}</h1>
+        <p class="meta">{{ statuses.get(state.run_status, state.run_status) }} · 版本 <code>{{ version_id[:12] }}</code>{% if not is_current %} · 历史版本{% endif %}</p>
+      </div>
+      <div class="toolbar" aria-label="下载当前报告">
+        <a class="button" href="{{ request.url_for('export_review', run_id=run_id).include_query_params(version_id=version_id, format='json') }}">下载 JSON</a>
+        <a class="button" href="{{ request.url_for('export_review', run_id=run_id).include_query_params(version_id=version_id, format='md') }}">下载 Markdown</a>
+      </div>
+    </div>
+    {% if error %}<p class="alert" role="alert">{{ error }}{% if not is_current %}。<a href="{{ request.url_for('view_run', run_id=run_id) }}">打开当前版本</a>{% endif %}</p>{% endif %}
+    <div class="layout">
+      <div class="stack">
+        <section class="card">
+          <h2>{{ '当前摘要' if is_current else '历史摘要' }} <span class="pill pill-{{ verification }}">{{ statuses.get(verification, verification) }}</span></h2>
+          <p class="abstract">{{ report.reviewed_abstract.text }}</p>
+          {% if abstract_review.reason %}<p class="meta">{{ abstract_review.reason }}</p>{% endif %}
+          {% if report.original_abstract.text != report.reviewed_abstract.text %}
+          <details><summary>查看原摘要</summary><p class="abstract group">{{ report.original_abstract.text }}</p></details>
+          {% endif %}
+          {% if report.abstract_versions and report.abstract_versions|length > 1 %}
+          <details><summary>摘要版本</summary>
+            <ul>
+              {% for version in report.abstract_versions %}
+                {% set kind = {'pdf_original': 'PDF 摘要', 'pasted_original': '粘贴摘要', 'candidate': '候选改写', 'selected': '用户确认版'}.get(version.kind, version.kind) %}
+                <li>
+                  {% if version.version_id == version_id %}
+                    <span>{{ kind }} · 当前显示</span>
+                  {% elif version.version_id == report.original_abstract.version_id or version.kind in ['candidate', 'selected'] %}
+                    <a href="{{ request.url_for('view_run', run_id=run_id).include_query_params(version_id=version.version_id) }}">{{ kind or '历史版本' }}</a>
+                  {% else %}
+                    <details><summary>{{ kind or '备用摘要' }}</summary><p class="abstract group">{{ version.text }}</p></details>
+                  {% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          </details>
+          {% endif %}
+          {% if not is_current %}<a href="{{ request.url_for('view_run', run_id=run_id) }}">返回最新版本</a>{% endif %}
+        </section>
+
+        <section class="card">
+          <h2>断言与证据</h2>
+          {% for finding in report.findings %}
+            {% set verdict = finding.verdict or finding.review_status %}
+            <article class="finding">
+              <header><span class="pill pill-{{ verdict }}">{{ statuses.get(verdict, verdict) }}</span><h3>{{ finding.text }}</h3></header>
+              {% if finding.reason %}<p class="muted">{{ finding.reason }}</p>{% endif %}
+              {{ evidence_links(finding.evidence_ids|default([])) }}
+              {% if finding.retrieval_paths %}
+                <details class="group"><summary>取证路径</summary>
+                  <ul class="compact">
+                    {% for path in finding.retrieval_paths %}<li>{{ evidence_links(path.evidence_ids) }}</li>{% endfor %}
+                  </ul>
+                </details>
+              {% endif %}
+            </article>
+          {% else %}<p class="muted">这份报告尚无断言裁决。可以先查看已提取的原文证据。</p>{% endfor %}
+          {% if report.evidence %}
+          <details class="group"><summary>查阅原文证据（{{ report.evidence|length }}）</summary>
+            <div class="evidence-list">
+              {% for evidence in report.evidence %}
+              <div class="evidence-row"><p class="excerpt">{{ evidence.text }}</p>{{ evidence_link(evidence.evidence_id) }}</div>
+              {% endfor %}
+            </div>
+          </details>
+          {% endif %}
+        </section>
+
+        {% if report.calculations %}
+        <section class="card">
+          <h2>数值核算</h2>
+          <ul class="compact">
+            {% for calculation in report.calculations %}
+            <li>
+              {% if calculation.formula %}<code>{{ calculation.formula }}</code> = <strong>{{ calculation.result }}</strong> {{ {'percentage_points': '个百分点', 'percent': '%'}.get(calculation.unit, calculation.unit) }}
+              {% else %}{{ calculation.reason|default(calculation.status) }}{% endif %}
+              {{ evidence_links(calculation.evidence_ids|default([])) }}
+            </li>
+            {% endfor %}
+          </ul>
+        </section>
+        {% endif %}
+
+        <section class="card">
+          <h2>修订建议</h2>
+          {% if revisions %}
+          <form class="selection" method="post" action="{{ request.url_for('select_revision', run_id=run_id) }}">
+            <input type="hidden" name="base_version_id" value="{{ version_id }}">
+            <input type="hidden" name="submission_id" value="{{ token }}-choose">
+            {% for revision in revisions %}
+            <article class="revision">
+              <span class="pill pill-{{ revision.status }}">{{ statuses.get(revision.status, revision.status) }}</span>
+              <div class="change group">
+                <div><div class="meta">原文</div><p class="excerpt">{{ revision.original_text }}</p></div>
+                <div><div class="meta">改写</div><p class="excerpt">{{ revision.replacement }}</p></div>
+              </div>
+              {{ evidence_links(revision.evidence_ids|default([])) }}
+              {% if revision.semantic_diff %}
+                <details class="group"><summary>语义差异</summary>
+                  <ul class="compact">
+                    {% for change in revision.semantic_diff %}<li>{{ change.field }} · {{ change.before or '无' }} → {{ change.after or '无' }}{{ evidence_links(change.evidence_ids|default([])) }}</li>{% endfor %}
+                  </ul>
+                </details>
+              {% endif %}
+              {% if is_current and revision.status == 'passed' %}
+                <label><input type="checkbox" name="revision_ids" value="{{ revision.revision_id }}"{% if revision.revision_id in selected_revision_ids %} checked{% endif %}> 采用这条建议</label>
+              {% endif %}
+            </article>
+            {% endfor %}
+            {% if is_current %}<div class="form-actions"><button class="button" type="submit">保存所选修订</button></div>{% endif %}
+          </form>
+          {% else %}<p class="muted">还没有生成修订建议。</p>{% endif %}
+          {% if abstract_review.sentence_checks %}
+          <details class="group"><summary>逐句复核</summary>
+            <ul class="compact">
+              {% for check in abstract_review.sentence_checks %}
+              <li><span class="pill pill-{{ check.status }}">{{ statuses.get(check.status, check.status) }}</span> {{ check.revised.text if check.revised else check.original.text }}
+                <p class="meta">{{ check.reason }}</p>{{ evidence_links(check.evidence_ids|default([])) }}</li>
+              {% endfor %}
+            </ul>
+          </details>
+          {% endif %}
+          {% if is_current %}
+          <details class="group"><summary>手动修改摘要</summary>
+            <form class="fields group" method="post" action="{{ request.url_for('select_revision', run_id=run_id) }}">
+              <input type="hidden" name="base_version_id" value="{{ version_id }}">
+              <input type="hidden" name="submission_id" value="{{ token }}-edit">
+              <label class="field">确认提交文本<textarea name="edited_text" rows="7" required>{{ report.reviewed_abstract.text }}</textarea></label>
+              <div class="form-actions"><button class="button primary" type="submit">保存并复核</button></div>
+            </form>
+          </details>
+          {% endif %}
+        </section>
+
+        {% if report.omissions or report.external_checks %}
+        <section class="card">
+          <h2>扩展核查</h2>
+          {% if report.omissions %}
+          <h3>摘要遗漏</h3>
+          <ul>{% for item in report.omissions %}<li>{{ item.reason }}{{ evidence_links(item.evidence_ids|default([])) }}</li>{% endfor %}</ul>
+          {% endif %}
+          {% if report.external_checks %}
+          <h3>外部参考文献</h3>
+          <ul>{% for item in report.external_checks %}<li><span class="pill">{{ statuses.get(item.support_status, item.support_status) }}</span> {{ item.attribution }}<p class="meta">{{ item.reason }}</p></li>{% endfor %}</ul>
+          {% endif %}
+        </section>
+        {% endif %}
+
+        {% if report.unresolved_items or report.diagnostics or abstract_review.issues or report.runtime_error or state.run_status == 'paused' %}
+        <section class="card">
+          <h2>待处理事项</h2>
+          <ul>
+            {% for item in report.unresolved_items|default([]) %}<li>{{ item.reason|default(item.code, true) }}</li>{% endfor %}
+            {% for item in report.diagnostics|default([]) %}<li>{{ item.name|default('') }} {{ item.reason|default(item.code, true) }}</li>{% endfor %}
+            {% for item in abstract_review.issues|default([]) %}<li>{{ item.reason|default(item) }}</li>{% endfor %}
+            {% if report.runtime_error %}<li>{{ report.runtime_error }}</li>{% endif %}
+          </ul>
+          {% if is_current and state.run_status == 'paused' %}
+          <form class="form-actions" method="post" action="{{ request.url_for('resume_review', run_id=run_id) }}">
+            <input type="hidden" name="request_id" value="{{ token }}-resume">
+            <label>追加请求 <input name="add_requests" type="number" min="0" value="0"></label>
+            <label>追加秒数 <input name="add_seconds" type="number" min="0" value="0"></label>
+            <button class="button" type="submit">继续审阅</button>
+          </form>
+          {% endif %}
+        </section>
+        {% endif %}
+      </div>
+
+      <aside class="card preview" id="pdf-preview" aria-label="原文定位">
+        <div class="pdf-heading"><h2>PDF 原页</h2>
+          {% if preview_document %}<span class="meta">{{ preview_document.name }} · 第 {{ preview_page + 1 }} 页</span>{% endif %}
+        </div>
+        {% if preview_url %}
+          <figure>
+            <div class="pdf"><img src="{{ preview_url }}" alt="第 {{ preview_page + 1 }} 页原文{% if selected %}，已高亮所选证据{% endif %}"></div>
+            {% if selected %}<figcaption class="excerpt">{{ selected.text }}</figcaption>{% endif %}
+          </figure>
+        {% else %}<p class="muted">当前报告没有可打开的 PDF 页。</p>{% endif %}
+      </aside>
+    </div>
+  </main>
+  {% endif %}
+</body>
+</html>

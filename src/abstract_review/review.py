@@ -2,14 +2,14 @@
 
 import hashlib
 import json
-import sqlite3
 import unicodedata
-from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Literal, Protocol
 from uuid import uuid4
+
+from .run_store import RunStore
 
 
 Verdict = Literal["supported", "refuted", "insufficient"]
@@ -55,6 +55,14 @@ class PdfReviewInput:
     supplements: tuple[Path, ...] = ()
     pasted_abstract: str | None = None
     abstract_source: Literal["pdf", "pasted"] = "pdf"
+    engine: Literal["offline", "openai"] | None = None
+    model: str = "gpt-6.2-sol"
+    embed_model: Path | None = None
+    check_omissions: bool = False
+    check_external: bool = False
+    remote_source: dict | None = None
+    provided_claims: tuple[tuple[str, str], ...] = ()
+    ocr_language: str | None = None
 
 
 def _object(value: object, keys: set[str], path: str) -> dict[str, object]:
@@ -190,6 +198,7 @@ class ReviewService:
 
     def __init__(self, database: Path, model: ReviewModel | None = None) -> None:
         self.database = database
+        self.store = RunStore(database)
         self.model = model if model is not None else FakeModel()
 
     def start(self, review_input: ReviewInput | PdfReviewInput) -> dict:
@@ -263,9 +272,10 @@ class ReviewService:
             raise ValueError("--abstract-file is empty")
         if request.abstract_source == "pasted" and request.pasted_abstract is None:
             raise ValueError("--abstract-source pasted requires --abstract-file")
-        primary = parse_pdf(request.pdf)
+        primary = parse_pdf(request.pdf, ocr_language=request.ocr_language)
         versions = {}
-        for source, abstract in (("pdf", primary.abstract), ("pasted", request.pasted_abstract)):
+        provided_text = "\n".join(text for _, text in request.provided_claims) or None
+        for source, abstract in (("pdf", primary.abstract), ("pasted", request.pasted_abstract), ("provided", provided_text)):
             if abstract is None:
                 continue
             version_key = json.dumps((primary.document["sha256"], source, abstract), ensure_ascii=False)
@@ -275,16 +285,17 @@ class ReviewService:
                 "text": abstract,
                 "revision_ids": [],
             }
-        if request.abstract_source not in versions:
+        selected_source = "provided" if provided_text else request.abstract_source
+        if selected_source not in versions:
             raise ValueError("could not identify a PDF abstract; supply --abstract-file and --abstract-source pasted")
-        version = versions[request.abstract_source]
+        version = versions[selected_source]
 
         parsed_pdfs = [primary]
         seen_hashes = {primary.document["sha256"]}
         diagnostics = []
         for path in request.supplements:
             try:
-                supplement = parse_pdf(path, role="supplement")
+                supplement = parse_pdf(path, role="supplement", ocr_language=request.ocr_language)
             except (OSError, ValueError) as exc:
                 diagnostics.append({"code": "supplement_unreadable", "name": path.name, "reason": str(exc)})
                 continue
@@ -300,7 +311,7 @@ class ReviewService:
             documents.append({**parsed.document, "blob_path": blob_path})
             evidence.extend(parsed.evidence)
 
-        return self._persist_report({
+        report = {
             "schema_version": 1,
             "mode": "pdf",
             "run_id": uuid4().hex,
@@ -320,7 +331,26 @@ class ReviewService:
             "external_checks": [],
             "unresolved_items": [{"code": "review_pending", "reason": "PDF evidence has been parsed for review."}],
             "usage": {"external_requests": 0, "local_model_calls": 0},
-        })
+        }
+        if request.remote_source is not None:
+            report["documents"][0]["resolved_source"] = request.remote_source
+        if request.provided_claims:
+            from .audit import supplied_claims
+
+            report["claims"] = supplied_claims(request.provided_claims)
+        if request.engine is not None:
+            report["run_status"] = "queued"
+            report["configuration"] = {
+                "engine": request.engine, "model": request.model,
+                "embed_model": str(request.embed_model.resolve()) if request.embed_model else None,
+                "check_omissions": request.check_omissions, "check_external": request.check_external,
+                "ocr_language": request.ocr_language,
+                "max_requests": 80, "max_seconds": 900,
+            }
+        elif request.check_omissions or request.check_external:
+            raise ValueError("optional checks require --engine offline or --engine openai")
+        started = self._persist_report(report)
+        return self.resume(started["run_id"]) if request.engine else started
 
     def _store_pdf(self, data: bytes, sha256: str) -> str:
         relative_path = Path("blobs") / f"{sha256}.pdf"
@@ -339,45 +369,40 @@ class ReviewService:
         return relative_path.as_posix()
 
     def _persist_report(self, report: dict) -> dict:
-        run_id = report["run_id"]
-        version_id = report["report_version_id"]
-        self.database.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.database)) as connection, connection:
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS runs (
-                    run_id TEXT PRIMARY KEY,
-                    report_version_id TEXT NOT NULL,
-                    report_json TEXT NOT NULL
-                )"""
-            )
-            connection.execute(
-                "INSERT INTO runs (run_id, report_version_id, report_json) VALUES (?, ?, ?)",
-                (run_id, version_id, json.dumps(report, ensure_ascii=False)),
-            )
-        return self._run_ref(run_id, version_id)
+        self.store.save(report, new=True)
+        return self._run_ref(report)
 
     def status(self, run_id: str) -> dict:
-        row = self._get_run(run_id)
-        return self._run_ref(run_id, row[0])
+        return self._run_ref(self.store.read(run_id))
 
     def export(self, run_id: str, version_id: str) -> dict:
-        stored_version, report = self._get_run(run_id)
-        if stored_version != version_id:
-            raise ValueError(f"report version {version_id!r} does not belong to run {run_id!r}")
-        return json.loads(report)
+        return self.store.read(run_id, version_id)
 
-    def _get_run(self, run_id: str) -> tuple[str, str]:
-        if self.database.is_file():
-            with closing(sqlite3.connect(self.database)) as connection:
-                table = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'")
-                if table.fetchone() is not None:
-                    row = connection.execute(
-                        "SELECT report_version_id, report_json FROM runs WHERE run_id = ?", (run_id,)
-                    ).fetchone()
-                    if row is not None:
-                        return row
-        raise ValueError(f"unknown review run {run_id!r}")
+    def _responses(self, report: dict, *, before_call=None):
+        from .models import ResponsesModel
+
+        config = report.get("configuration", {})
+        if config.get("engine") != "openai":
+            return None
+        usage = report["usage"]
+        return ResponsesModel(config["model"], config["max_requests"], config["max_seconds"],
+                              previous_attempts=usage["external_requests"], previous_seconds=usage.get("elapsed_seconds", 0),
+                              before_call=before_call)
+
+    def resume(self, run_id: str, request_id: str | None = None, add_requests: int = 0, add_seconds: int = 0) -> dict:
+        from .workflow import process
+
+        return process(self, run_id, request_id, add_requests, add_seconds)
+
+    def submit_selection(
+        self, run_id: str, base_version_id: str, submission_id: str,
+        revision_ids: tuple[str, ...] = (), edited_text: str | None = None,
+    ) -> dict:
+        from .workflow import submit_selection
+
+        return submit_selection(self, run_id, base_version_id, submission_id, revision_ids, edited_text)
 
     @staticmethod
-    def _run_ref(run_id: str, version_id: str) -> dict:
-        return {"run_id": run_id, "report_version_id": version_id, "run_status": "report_ready"}
+    def _run_ref(report: dict) -> dict:
+        return {"run_id": report["run_id"], "report_version_id": report["report_version_id"],
+                "run_status": report.get("run_status", "report_ready")}
