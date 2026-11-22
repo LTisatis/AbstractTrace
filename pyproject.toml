@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Evidence-linked review of research paper abstracts"
 readme = "README.md"
 requires-python = ">=3.12"
+dependencies = ["pymupdf>=1.28.2,<2"]
 
 [project.scripts]
 abstract-review = "abstract_review.cli:main"

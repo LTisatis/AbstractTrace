@@ -7,6 +7,7 @@ import unicodedata
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Literal, Protocol
 from uuid import uuid4
 
@@ -46,6 +47,14 @@ class ReviewInput:
     abstract: str
     claims: tuple[Claim, ...]
     evidence: tuple[Evidence, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PdfReviewInput:
+    pdf: Path
+    supplements: tuple[Path, ...] = ()
+    pasted_abstract: str | None = None
+    abstract_source: Literal["pdf", "pasted"] = "pdf"
 
 
 def _object(value: object, keys: set[str], path: str) -> dict[str, object]:
@@ -183,7 +192,9 @@ class ReviewService:
         self.database = database
         self.model = model if model is not None else FakeModel()
 
-    def start(self, review_input: ReviewInput) -> dict:
+    def start(self, review_input: ReviewInput | PdfReviewInput) -> dict:
+        if isinstance(review_input, PdfReviewInput):
+            return self._start_pdf(review_input)
         run_id = uuid4().hex
         abstract = review_input.abstract
         version_key = json.dumps((review_input.sample_id, abstract), ensure_ascii=False)
@@ -243,6 +254,93 @@ class ReviewService:
             "unresolved_items": unresolved,
             "usage": {"external_requests": 0, "local_model_calls": len(review_input.claims)},
         }
+        return self._persist_report(report)
+
+    def _start_pdf(self, request: PdfReviewInput) -> dict:
+        from .ingest import parse_pdf
+
+        if request.pasted_abstract is not None and not request.pasted_abstract.strip():
+            raise ValueError("--abstract-file is empty")
+        if request.abstract_source == "pasted" and request.pasted_abstract is None:
+            raise ValueError("--abstract-source pasted requires --abstract-file")
+        primary = parse_pdf(request.pdf)
+        versions = {}
+        for source, abstract in (("pdf", primary.abstract), ("pasted", request.pasted_abstract)):
+            if abstract is None:
+                continue
+            version_key = json.dumps((primary.document["sha256"], source, abstract), ensure_ascii=False)
+            versions[source] = {
+                "version_id": hashlib.sha256(version_key.encode("utf-8")).hexdigest(),
+                "kind": f"{source}_original",
+                "text": abstract,
+                "revision_ids": [],
+            }
+        if request.abstract_source not in versions:
+            raise ValueError("could not identify a PDF abstract; supply --abstract-file and --abstract-source pasted")
+        version = versions[request.abstract_source]
+
+        parsed_pdfs = [primary]
+        seen_hashes = {primary.document["sha256"]}
+        diagnostics = []
+        for path in request.supplements:
+            try:
+                supplement = parse_pdf(path, role="supplement")
+            except (OSError, ValueError) as exc:
+                diagnostics.append({"code": "supplement_unreadable", "name": path.name, "reason": str(exc)})
+                continue
+            sha256 = supplement.document["sha256"]
+            if sha256 not in seen_hashes:
+                parsed_pdfs.append(supplement)
+                seen_hashes.add(sha256)
+
+        documents = []
+        evidence = []
+        for parsed in parsed_pdfs:
+            blob_path = self._store_pdf(parsed.data, parsed.document["sha256"])
+            documents.append({**parsed.document, "blob_path": blob_path})
+            evidence.extend(parsed.evidence)
+
+        return self._persist_report({
+            "schema_version": 1,
+            "mode": "pdf",
+            "run_id": uuid4().hex,
+            "report_version_id": version["version_id"],
+            "original_abstract": version,
+            "reviewed_abstract": version,
+            "abstract_versions": list(versions.values()),
+            "documents": documents,
+            "diagnostics": diagnostics,
+            "findings": [],
+            "revisions": [],
+            "verifications": [],
+            "abstract_review": {"version_id": version["version_id"], "status": "pending"},
+            "evidence": evidence,
+            "calculations": [],
+            "omissions": [],
+            "external_checks": [],
+            "unresolved_items": [{"code": "review_pending", "reason": "PDF evidence has been parsed for review."}],
+            "usage": {"external_requests": 0, "local_model_calls": 0},
+        })
+
+    def _store_pdf(self, data: bytes, sha256: str) -> str:
+        relative_path = Path("blobs") / f"{sha256}.pdf"
+        path = self.database.parent / relative_path
+        if not path.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = None
+            try:
+                with NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+                    temporary_path = Path(temporary.name)
+                    temporary.write(data)
+                temporary_path.replace(path)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+        return relative_path.as_posix()
+
+    def _persist_report(self, report: dict) -> dict:
+        run_id = report["run_id"]
+        version_id = report["report_version_id"]
         self.database.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute(

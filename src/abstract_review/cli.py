@@ -77,11 +77,23 @@ def doctor(args: argparse.Namespace) -> None:
         "python_version": sys.version.split()[0],
         "sqlite_version": sqlite3.sqlite_version,
         "fts5": True,
+        "pdf_parser": "pymupdf",
         "data_dir": str(args.data_dir.resolve()),
     })
 
 
 def start_review(args: argparse.Namespace) -> None:
+    if args.pdf is not None:
+        from .review import PdfReviewInput
+
+        if args.sample_id is not None:
+            raise ValueError("--sample-id is for --fixture")
+        pasted = args.abstract_file.read_bytes().decode("utf-8-sig") if args.abstract_file else None
+        request = PdfReviewInput(args.pdf, tuple(args.supplement), pasted, args.abstract_source)
+        emit(review_service(args.data_dir).start(request))
+        return
+    if args.supplement or args.abstract_file or args.abstract_source != "pdf":
+        raise ValueError("supplements and abstract options require --pdf")
     samples = load_samples(args.fixture)
     sample_id = args.sample_id
     if sample_id is None:
@@ -140,7 +152,7 @@ def score_benchmark(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="abstract-review", description="AbstractTrace synthetic review")
+    parser = argparse.ArgumentParser(prog="abstract-review", description="AbstractTrace paper evidence review")
     parser.add_argument(
         "--data-dir", type=Path, default=Path(os.environ.get("ABSTRACT_REVIEW_DATA_DIR") or ".review-data"),
         help="local state directory (default: .review-data or ABSTRACT_REVIEW_DATA_DIR)",
@@ -150,11 +162,16 @@ def build_parser() -> argparse.ArgumentParser:
         handler=doctor
     )
 
-    review = commands.add_parser("review", help="run and export a synthetic review")
+    review = commands.add_parser("review", help="review local PDFs or synthetic fixtures")
     review_commands = review.add_subparsers(dest="review_command", required=True)
-    start = review_commands.add_parser("start", help="review a sample from a synthetic input manifest")
-    start.add_argument("--fixture", type=Path, required=True)
+    start = review_commands.add_parser("start", help="start a review from a local PDF or synthetic fixture")
+    source = start.add_mutually_exclusive_group(required=True)
+    source.add_argument("--fixture", type=Path)
+    source.add_argument("--pdf", type=Path)
     start.add_argument("--sample-id")
+    start.add_argument("--supplement", type=Path, action="append", default=[], help="confirmed supplement PDF")
+    start.add_argument("--abstract-file", type=Path, help="UTF-8 alternate abstract")
+    start.add_argument("--abstract-source", choices=("pdf", "pasted"), default="pdf")
     start.set_defaults(handler=start_review)
 
     status = review_commands.add_parser("status", help="read persisted run status")
