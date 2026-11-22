@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "abstract-trace"
+version = "0.1.0"
+description = "Evidence-linked review of research paper abstracts"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[project.scripts]
+abstract-review = "abstract_review.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.4,<9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/abstract_review"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: requires an explicitly configured external service"]

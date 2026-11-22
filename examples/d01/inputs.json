@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "samples": [
+    {
+      "sample_id": "synthetic-001",
+      "abstract": "在数据集甲上，准确率提高了 8 个百分点。在数据集乙上，准确率提高了 12 个百分点。在数据集丙上，准确率提高了 10 个百分点。",
+      "claims": [
+        {
+          "claim_id": "c-a",
+          "text": "在数据集甲上，准确率提高了 8 个百分点。",
+          "subject": "数据集甲",
+          "metric": "准确率提升（百分点）",
+          "value": "8"
+        },
+        {
+          "claim_id": "c-b",
+          "text": "在数据集乙上，准确率提高了 12 个百分点。",
+          "subject": "数据集乙",
+          "metric": "准确率提升（百分点）",
+          "value": "12"
+        },
+        {
+          "claim_id": "c-c",
+          "text": "在数据集丙上，准确率提高了 10 个百分点。",
+          "subject": "数据集丙",
+          "metric": "准确率提升（百分点）",
+          "value": "10"
+        }
+      ],
+      "evidence": [
+        {
+          "evidence_id": "e-a",
+          "text": "合成结果表：在数据集甲上，同一测试划分的准确率由 80% 提高到 88%，提升 8 个百分点。",
+          "subject": "数据集甲",
+          "metric": "准确率提升（百分点）",
+          "value": "8",
+          "locator": {"section": "3. 合成结果", "page_index": 2}
+        },
+        {
+          "evidence_id": "e-b",
+          "text": "合成结果表：在数据集乙上，同一测试划分的准确率由 70% 提高到 79%，提升 9 个百分点。",
+          "subject": "数据集乙",
+          "metric": "准确率提升（百分点）",
+          "value": "9",
+          "locator": {"section": "3. 合成结果", "page_index": 2}
+        }
+      ]
+    }
+  ]
+}
