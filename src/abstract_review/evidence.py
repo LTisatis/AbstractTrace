@@ -47,6 +47,11 @@ _NUMBER = re.compile(rf"(?<![a-z0-9_.])([+-]?(?:\d+(?:\.\d+)?|\.\d+))(?:\s*({_UN
 _MAX_CANDIDATES = 24
 _MAX_BODY_PASSAGE = 8
 _PASSAGE_SEEDS = 2
+_CONTEXT_WINDOW_LINES = 8
+_CONTEXT_MAX_LINES = 24
+_CONTEXT_MAX_CHARS = 1800
+_CONTEXT_SHORTLIST = 12
+_SUMMARY_SECTION = re.compile(r"^(?:abstract|introduction|conclusions?|摘要|引言|结论)(?:\b|$)")
 _LINE_END = re.compile(r"[.!?。！？][\"'”’）)】\]]*$")
 _ABBREVIATION_END = re.compile(r"\b(?:e\.g|i\.e|et al|fig|eq|ref|no|vs|pp|vol|dr|prof)\.$", re.IGNORECASE)
 _TRAILING_TRANSITION = re.compile(
@@ -90,6 +95,13 @@ _TABLE_CONTEXT = {"row_header", "column_header", "table_note"}
 
 class Embedder(Protocol):
     def encode(self, texts: list[str]) -> Iterable[Iterable[float]]: ...
+
+
+@dataclass(frozen=True)
+class _ContextWindow:
+    text: str
+    evidence_ids: tuple[str, ...]
+    expanded_ids: tuple[str, ...]
 
 
 class SentenceTransformerEmbedder:
@@ -280,6 +292,8 @@ class EvidenceIndex:
         self._body_windows: dict[str, tuple[str, ...]] = {}
         self._passage_index: dict[str, tuple[str, ...]] | None = None
         self._witness_passages: set[str] = set()
+        self._context_windows: dict[str, _ContextWindow] | None = None
+        self._context_vectors: dict[str, tuple[float, ...]] = {}
         self._embedder = embedder
         self._reranker = reranker
         texts = []
@@ -722,6 +736,133 @@ class EvidenceIndex:
                 if not seek_witness and len(matched) >= _PASSAGE_SEEDS:
                     break
         return [*witnesses, *matched][:_PASSAGE_SEEDS]
+
+    def _index_context_windows(self) -> dict[str, _ContextWindow]:
+        if self._context_windows is not None:
+            return self._context_windows
+        windows = {}
+        terms = []
+        visited = set()
+        for eid, record in self._records.items():
+            if (eid in visited or record.get("kind") != "body_text" or _bbox(record) is None
+                    or _section_key(_text_field(record["locator"], "section")) in {"references", "bibliography"}):
+                continue
+            previous = self._adjacent_line(eid, -1)
+            if previous and self._adjacent_line(previous, 1) == eid:
+                continue
+            run = [eid]
+            while following := self._adjacent_line(run[-1], 1):
+                if self._adjacent_line(following, -1) != run[-1] or following in visited:
+                    break
+                run.append(following)
+            visited.update(run)
+            if len(run) < 3:
+                continue
+            last_start = max(0, len(run) - _CONTEXT_WINDOW_LINES)
+            starts = range(0, last_start, _CONTEXT_WINDOW_LINES // 2)
+            for start in (*starts, last_start):
+                ids = tuple(run[start:start + _CONTEXT_WINDOW_LINES])
+                left = max(0, min(start - (_CONTEXT_MAX_LINES - _CONTEXT_WINDOW_LINES) // 2,
+                                  len(run) - _CONTEXT_MAX_LINES))
+                expanded = tuple(run[left:left + _CONTEXT_MAX_LINES])
+                text = "\n".join(self._records[item]["text"] for item in ids)
+                joined = " ".join(_WRAPPED_WORD.sub("", text).split())
+                windows[ids[0]] = _ContextWindow(joined, ids, expanded)
+                terms.append((ids[0], " ".join(sorted(_terms(text, index=True) | _terms(joined, index=True)))))
+        if windows:
+            self._fts.execute(
+                "CREATE VIRTUAL TABLE context_windows USING fts5(evidence_id UNINDEXED, text, tokenize='unicode61')"
+            )
+            self._fts.executemany(
+                "INSERT INTO context_windows(evidence_id, text) VALUES (?, ?)", terms,
+            )
+            if self._embedder is not None:
+                vectors = _unit_vectors(self._embedder, [window.text for window in windows.values()])
+                self._context_vectors = dict(zip(windows, vectors))
+        self._context_windows = windows
+        return windows
+
+    def _rank_context_windows(self, query: str, windows: dict[str, _ContextWindow]) -> list[str]:
+        tokens = _terms(query) - _PASSAGE_QUERY_NOISE
+        if not tokens or not windows:
+            return []
+        lexical = [eid for (eid,) in self._fts.execute(
+            "SELECT evidence_id FROM context_windows WHERE context_windows MATCH ? ORDER BY bm25(context_windows), evidence_id",
+            (_fts_expression(tokens),),
+        ) if eid in windows]
+        ranks = [lexical]
+        if self._context_vectors:
+            query_vector, = _unit_vectors(self._embedder, [query])
+            similarities = {eid: math.fsum(a * b for a, b in zip(query_vector, self._context_vectors[eid], strict=True))
+                            for eid in windows}
+            ranks.append(sorted((eid for eid in similarities if similarities[eid] > 0),
+                                key=lambda eid: (-similarities[eid], eid)))
+        scores: dict[str, float] = defaultdict(float)
+        for rank in ranks:
+            for position, eid in enumerate(rank[:_CONTEXT_SHORTLIST], 1):
+                scores[eid] += 1 / (60 + position)
+        ranked = sorted(scores, key=lambda eid: (-scores[eid], eid))[:_CONTEXT_SHORTLIST]
+        if self._reranker is not None and ranked:
+            raw = self._reranker.score(query, [windows[eid].text for eid in ranked])
+            if len(raw) != len(ranked) or any(type(value) not in (int, float) or not math.isfinite(value) for value in raw):
+                raise ValueError("reranker must return one finite score per passage")
+            ranked = [eid for eid, _ in sorted(zip(ranked, raw), key=lambda pair: -pair[1])]
+        return ranked
+
+    def ranked_body_context(
+        self, queries: Iterable[str], *, doc_id: str | None = None, doc_version_id: str | None = None,
+        page_index: int | None = None, section: str | None = None,
+    ) -> list[_ContextWindow]:
+        """Return one ranked source range per query, without changing the primary results."""
+        section_key = _inspection_section(section) if section is not None else None
+        windows = {
+            eid: window for eid, window in self._index_context_windows().items()
+            if (doc_id is None or self._records[eid]["doc_id"] == doc_id)
+            and (doc_version_id is None or _document_key(self._records[eid])[1] == doc_version_id)
+            and (page_index is None or self._records[eid]["locator"]["page_index"] == page_index)
+            and (section_key is None or _inspection_section(_text_field(self._records[eid]["locator"], "section"))
+                 == section_key)
+        }
+        results = {}
+        for query in dict.fromkeys(query for query in queries if query.strip()):
+            ranked = self._rank_context_windows(query, windows)
+            if ranked:
+                first = ranked[0]
+                if page_index is None and section is None:
+                    # The primary lane still exposes repeated claims in summary sections.
+                    first = next((eid for eid in ranked if not _SUMMARY_SECTION.search(
+                        _section_key(_text_field(self._records[eid]["locator"], "section")),
+                    )), first)
+                window = windows[first]
+                results.setdefault(window.expanded_ids, window)
+        return list(results.values())
+
+    def pack_body_context(self, windows: Iterable[_ContextWindow], primary_ids: Iterable[str]) -> list[dict]:
+        """Attach original anchors under one extra-text budget across all passages."""
+        primary = set(primary_ids)
+        selected = primary.copy()
+        remaining, chars = _CONTEXT_MAX_LINES, _CONTEXT_MAX_CHARS
+
+        def reserve(unit: tuple[str, ...]) -> bool:
+            nonlocal remaining, chars
+            fresh = set(unit) - selected
+            text_length = sum(len(self._records[eid]["text"]) for eid in fresh)
+            if len(fresh) > remaining or text_length > chars:
+                return False
+            selected.update(fresh)
+            remaining -= len(fresh)
+            chars -= text_length
+            return True
+
+        cores = [window for window in windows if reserve(window.evidence_ids)]
+        units = [window.expanded_ids if reserve(window.expanded_ids) else window.evidence_ids for window in cores]
+        groups = []
+        for unit in units:
+            fresh = [eid for eid in unit if eid not in primary]
+            if fresh:
+                groups.append({"evidence_ids": list(unit), "new_evidence_ids": fresh})
+                primary.update(fresh)
+        return groups
 
     def _query_rank(
         self, query: str, active: set[str], *, passage_query: bool = False, limit: int = _MAX_BODY_PASSAGE,

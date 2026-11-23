@@ -597,6 +597,10 @@ def review_claim(
     prioritized = []
     follow_up_evidence_ids = []
     sent_candidate_ids = []
+    sent_body_context = []
+    sent_passages = []
+    sent_table_context = []
+    inspected_body_windows = []
     output = None
     stop = None
 
@@ -613,9 +617,15 @@ def review_claim(
             examined_scopes.append({**result["scope"], "mode": "ranked"})
             remember(result)
 
-    def inspect(targets: Sequence[dict], previous: list[str], known: set[str]) -> bool:
-        results = targeted_evidence(index, targets, documents=documents, prior_ids=sorted(known))
+    def inspect(targets: Sequence[dict], previous: list[str], known: set[str], *, context_ids=()) -> bool:
+        results = targeted_evidence(index, targets, documents=documents, prior_ids=sorted(known - set(context_ids)))
         examined_scopes.extend(results["scopes"])
+        for scope in results["scopes"]:
+            if scope["mode"] == "direct" and scope["matching_count"] and scope["table_label"] is None:
+                inspected_body_windows.extend(index.ranked_body_context(
+                    [scope["query"]], doc_id=scope["doc_id"], doc_version_id=scope["doc_version_id"],
+                    page_index=scope["page_index"], section=scope["section"],
+                ))
         remember(results)
         selected = [item["evidence_id"] for item in results["evidence"]]
         if previous and len(selected) == 8 and previous[0] not in selected:
@@ -630,7 +640,17 @@ def review_claim(
                     break
         prioritized.extend(selected)
         follow_up_evidence_ids.extend(eid for eid in selected if eid not in known)
-        return bool(follow_up_evidence_ids) or any(scope.get("complete") for scope in results["scopes"])
+        if follow_up_evidence_ids or any(scope.get("complete") for scope in results["scopes"]):
+            return True
+        if not inspected_body_windows:
+            return False
+        primary = candidate_order()
+        table_ids = [item["evidence_id"] for item in index.table_context(primary)["evidence"]]
+        return any(not known.issuperset(group["new_evidence_ids"])
+                   for group in index.pack_body_context(context_windows(), [*primary, *table_ids]))
+
+    def context_windows():
+        return list(dict.fromkeys(inspected_body_windows or body_windows))[:2]
 
     def candidate_order() -> list[str]:
         # Keep context from each lane together when combining support and counter searches.
@@ -641,6 +661,9 @@ def review_claim(
         return list(ordered)
 
     gather([claim["support_query"], claim["counter_query"]])
+    body_windows = []
+    if model is None or claim["kind"] not in {"background", "purpose"}:
+        body_windows = index.ranked_body_context([claim["support_query"], claim["counter_query"]])
     if additional_evidence:
         supplements = index.get(item["evidence_id"] for item in additional_evidence)
         prioritized.extend(item["evidence_id"] for item in supplements)
@@ -665,9 +688,16 @@ def review_claim(
             claim["proposition"], with_method_scope(scoped.values(), paths)
         )
         calculation = comparison[0] if comparison else None
+        body_context = index.pack_body_context(context_windows(), scoped)
+        body_ids = [eid for group in body_context for eid in group["new_evidence_ids"]]
+        body_rows = {row["evidence_id"]: row for row in index.get(body_ids)}
+        scoped.update(body_rows)
         if model is None:
-            finding = _offline(claim, candidates, comparison)
+            finding = _offline(claim, [*candidates, *body_rows.values()], comparison)
             sent_candidate_ids = list(scoped)
+            sent_body_context = body_context
+            sent_passages = passages
+            sent_table_context = table_context
             break
         if claim["kind"] in {"background", "purpose"}:
             finding = _pending(claim, "This sentence is outside original-paper result verification.")
@@ -703,6 +733,20 @@ def review_claim(
             )
         if passages:
             material["body_passages"] = sorted(passages, key=lambda group: group["evidence_ids"][0])
+        if body_context:
+            material["body_context"] = []
+            for group in body_context:
+                first = scoped[group["evidence_ids"][0]]
+                material["body_context"].append({
+                    "doc_id": first["doc_id"], "page_index": first["locator"]["page_index"],
+                    "section": first["locator"].get("section"),
+                    "lines": [[eid, body_rows[eid]["text"]] if eid in group["new_evidence_ids"] else [eid]
+                              for eid in group["evidence_ids"]],
+                })
+            material["coverage_instructions"] += (
+                " Read body_context in line order. Each entry has an evidence ID and its source text when new. "
+                "For a bare ID, read the text already supplied under evidence, table_context or an earlier range."
+            )
         if claim.get("logic_review_required"):
             material["logic_review_required"] = True
             material["coverage_instructions"] += (
@@ -712,11 +756,14 @@ def review_claim(
         material.update(figure_material(candidates, documents, data_dir))
         try:
             output = model.call("judge", material, ScopedJudgement)
-            sent_candidate_ids = list(dict.fromkeys(
-                item["evidence_id"] for item in [
-                    *material["evidence"], *(item for group in table_context for item in group["evidence"])
-                ]
-            ))
+            sent_candidate_ids = list(dict.fromkeys([
+                *(item["evidence_id"] for item in material["evidence"]),
+                *(item["evidence_id"] for group in table_context for item in group["evidence"]),
+                *body_ids,
+            ]))
+            sent_body_context = body_context
+            sent_passages = passages
+            sent_table_context = table_context
             ids = list(dict.fromkeys(eid for group in output.evidence_groups for eid in group.evidence_ids))
             try:
                 validate_ids(ids, scoped.values())
@@ -742,7 +789,8 @@ def review_claim(
                 followup = True
                 if save_targets is not None:
                     save_targets(targets)
-                if inspect(targets, [item["evidence_id"] for item in candidates], set(sent_candidate_ids)):
+                if inspect(targets, [item["evidence_id"] for item in candidates], set(sent_candidate_ids),
+                           context_ids=body_ids):
                     continue
                 stop = "no_progress"
             else:
@@ -791,14 +839,16 @@ def review_claim(
     finding["sent_candidate_ids"] = sent_candidate_ids
     finding["searched_scope"] = examined_scopes
     finding["retrieval_paths"] = _sent_paths([*paths, *context["paths"]], sent_candidate_ids)
-    if table_context and sent_candidate_ids:
+    if sent_table_context:
         finding["table_context"] = [
             {"cell_evidence_id": group["cell_evidence_id"],
              "evidence_ids": [item["evidence_id"] for item in group["evidence"]]}
-            for group in table_context
+            for group in sent_table_context
         ]
-    if passages and sent_candidate_ids:
-        finding["body_passages"] = passages
+    if sent_passages:
+        finding["body_passages"] = sent_passages
+    if sent_body_context:
+        finding["body_context"] = sent_body_context
     finding["follow_up_performed"] = followup
     if follow_up_evidence_ids:
         finding["follow_up_evidence_ids"] = list(dict.fromkeys(follow_up_evidence_ids))
