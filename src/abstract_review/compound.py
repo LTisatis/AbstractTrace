@@ -30,6 +30,34 @@ _EN_CLAUSE = re.compile(
     r"rais\w*|fell|remain\w*|reach\w*|achiev\w*|report\w*|yield\w*)\b", re.I,
 )
 _CN_CLAUSE = re.compile(r"^[^，；。！？]{2,35}(?:准确率|召回率|精确率|误差率|延迟|吞吐量|覆盖率|性能).{0,8}(?:为|是|提高|增加|下降|降低|达到|保持)")
+_PROCEDURE_SENTENCE = re.compile(
+    r"(?P<subject>we)[ \t]+(?P<left>[^,.!?;:]+?)(?P<comma>[ \t]*,)?[ \t]+and[ \t]+"
+    r"(?P<right>[^,.!?;:]+)(?P<terminal>\.?)", re.I,
+)
+_PROCEDURE_ACTION = re.compile(
+    r"(?P<adverb>(?:automatically|manually)[ \t]+)?"
+    r"(?P<verb>accepted|applied|approved|classified|collected|corrected|counted|excluded|extracted|"
+    r"inspected|measured|recorded|recruited|rejected|reviewed|screened|selected|tested|trained|used)"
+    r"[ \t]+(?P<object>[^\W_][\w \t'’–-]*)", re.I,
+)
+_PROCEDURE_SCOPE = re.compile(
+    r"\b(?:after|although|and|assuming|before|because|both|but|can|could|either|except|if|jointly|"
+    r"may|might|must|neither|nor|once|only|or|provided|respectively|shall|should|since|than|that|then|"
+    r"together|unless|until|how|when|where|whereas|whether|which|while|who|whom|whose|will|would)\b", re.I,
+)
+_TRAILING_PROCEDURE_SCOPE = re.compile(
+    r"\b(?:as|at|automatically|by|during|for|from|in|into|manually|on|over|through|to|under|using|via|"
+    r"with|within|without)\b", re.I,
+)
+_REVIEWLESS_ADJUDICATION = re.compile(
+    r"(?P<action>(?:accepted|approved|rejected)[ \t]+.+)[ \t]+without[ \t]+manual[ \t]+review", re.I,
+)
+_PROCEDURE_COMPLEMENT_VERBS = {"accepted", "measured", "recorded", "reviewed", "tested"}
+_DETERMINED_PROCEDURE_OBJECT = re.compile(
+    r"(?:a|an|the|all|each|every|any|my|our|its|their|these|those|multiple|several|\d+)[ \t]+\S", re.I,
+)
+_APPLIED_DETECTOR = re.compile(r"[\w-]+[ \t]+(?:to detect|for (?:the )?detection of)\b", re.I)
+_MANUAL_CORRECTION = re.compile(r"manually[ \t]+corrected[ \t]+false[ \t]+positives", re.I)
 
 
 def _dataset_names(value: str, name_pattern: str) -> tuple[list[tuple[int, int, str]], str] | None:
@@ -111,9 +139,43 @@ def _clause_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
     return None
 
 
+def shared_procedure_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
+    """Ground two explicit procedural actions with one first-person subject."""
+    match = _PROCEDURE_SENTENCE.fullmatch(text)
+    if match is None or _NEGATED_SHARED.search(text):
+        return None
+
+    left, right = match["left"], match["right"]
+    if _PROCEDURE_SCOPE.search(left) or _PROCEDURE_SCOPE.search(right):
+        return None
+
+    # With an adjudication verb, the absence of manual review describes that decision.
+    adjudication = _REVIEWLESS_ADJUDICATION.fullmatch(right)
+    right_action = adjudication["action"] if adjudication else right
+    left_match = _PROCEDURE_ACTION.fullmatch(left)
+    right_match = _PROCEDURE_ACTION.fullmatch(right_action)
+    if not left_match or left_match["adverb"] or not right_match:
+        return None
+    left_verb = left_match["verb"].casefold()
+    if left_verb in _PROCEDURE_COMPLEMENT_VERBS:
+        return None
+    if _TRAILING_PROCEDURE_SCOPE.search(right_match["object"]):
+        return None
+    if not (match["comma"] or _DETERMINED_PROCEDURE_OBJECT.match(right_match["object"])):
+        # A bare phrase such as "selected controls" could be a second object.
+        detects_errors = left_verb == "applied" and _APPLIED_DETECTOR.match(left_match["object"])
+        if not detects_errors or not _MANUAL_CORRECTION.fullmatch(right):
+            return None
+
+    return [
+        (match.start("subject"), match.end("left"), text[:match.end("left")]),
+        (*match.span("right"), f"{match['subject']} {right}{match['terminal']}"),
+    ], "and"
+
+
 def offline_compound_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
     """Return exact operand ranges plus self-contained propositions for conservative patterns."""
-    return _dataset_parts(text) or _clause_parts(text)
+    return _dataset_parts(text) or shared_procedure_parts(text) or _clause_parts(text)
 
 
 def requires_whole_sentence(text: str) -> bool:

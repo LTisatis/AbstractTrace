@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from abstract_review.scoring import semantic_manifest_sha256
+
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "d01"
 
@@ -54,6 +56,36 @@ def cli(tmp_path):
         return result
 
     return invoke, workspace, inputs
+
+
+def test_cli_scores_independent_conjunct_diagnostic(cli):
+    run, workspace, _ = cli
+    claim = {"sample_id": "s", "claim_id": "whole", "review_status": "completed", "verdict": "refuted",
+             "claim_anchor": {"sentence_id": "s1", "start": 0, "end": 37, "proposition": "We screened and accepted all records."},
+             "evidence_ids": ["p1"], "candidate_ids": ["p1"]}
+    operand = {"sentence_id": "s1", "start": 16, "end": 36, "proposition": "We accepted all records."}
+    predictions = {"schema_version": 1, "predictions": [claim]}
+    gold = {"schema_version": 1, "extraction_samples": ["s"], "labels": [
+        {"sample_id": "s", "claim_id": "accepted", "verdict": "refuted",
+         "accepted_evidence_groups": [["p1"]], "claim_anchor": operand},
+    ]}
+    projections = {
+        "schema_version": 1, "annotation_id": "local-review", "annotator_type": "human",
+        "predictions_sha256": semantic_manifest_sha256(predictions), "gold_sha256": semantic_manifest_sha256(gold),
+        "projections": [{"sample_id": "s", "predicted_claim_id": "whole", "gold_claim_id": "accepted",
+                         "relation": "conjunct", "operand_anchor": operand, "evidence_ids": ["p1"],
+                         "review_note": "The cited records show that screening excluded some records."}],
+    }
+    for name, document in (("predictions", predictions), ("gold", gold), ("projections", projections)):
+        (workspace / f"{name}.json").write_text(json.dumps(document), encoding="utf-8")
+    args = ("bench", "score", "--predictions", "predictions.json", "--gold-manifest", "gold.json",
+            "--verdict-projections", "projections.json")
+    result = json.loads(run(*args, "--output", "scores.json").stdout)
+    assert result["joint_accuracy"]["numerator"] == 0
+    assert result["verdict_projection"]["credited_count"] == 1
+    assert result == json.loads((workspace / "scores.json").read_text(encoding="utf-8"))
+    rejected = run(*args, "--output", "projections.json", success=False)
+    assert "score output must differ from scoring input files" in rejected.stderr
 
 
 def test_cli_reviews_and_exports_after_restart(cli):

@@ -85,3 +85,50 @@ def test_passage_ambiguity_never_chooses_a_duplicate_layout_line():
         ranked = index.search("counterdriver", followup=True)
         assert _ids(ranked) == ["a"]
         assert index.body_passages(["opening", "a", "b"]) == []
+
+
+def test_passage_query_prefers_local_constructive_witness_and_keeps_complete_anchors():
+    witness = [_line(f"positive-{i}", text, 100 + 12 * i) for i, text in enumerate((
+        "The calibration signal consists of paired pulses",
+        "with no intervening drops and is processed",
+        "by the fixed detector; the detector can",
+        "recognize this by using a single threshold",
+        "and one memory register that identifies",
+        "a subsequent pulse. Next,",
+    ))]
+    next_example = _line("next-claim", "A different sensor detects pulse frequency.", 172)
+    negative = [_line(f"negative-{i}", text, 260 + 12 * i) for i, text in enumerate((
+        "The detector cannot recognize the paired calibration",
+        "pulses by using its standard threshold.",
+    ))]
+    distractors = [_line(f"topic-{i}", "Fixed detector threshold calibration pulse measurements.", 350 + i * 25)
+                   for i in range(12)]
+    foreign = [_line(f"foreign-{i}", row["text"], 100 + i * 12, document="other") for i, row in enumerate(witness)]
+    expected = [row["evidence_id"] for row in witness]
+    query = "Constructive counterexample: fixed detector threshold calibration pulse measurements"
+    with closing(EvidenceIndex([*foreign, *negative, *witness, next_example, *distractors])) as index:
+        baseline = index.search(query, doc_id="paper", followup=True)
+        assert not set(expected).issubset(_ids(baseline))
+        result = index.search(query, doc_id="paper", passage_query=True)
+        assert _ids(result)[:6] == expected
+        assert len(result["evidence"]) <= 8
+        assert {row["doc_id"] for row in result["evidence"]} == {"paper"}
+        assert index.body_passages(_ids(result))[0] == {"evidence_ids": expected}
+        assert "passage" in result["scope"]["channels"]
+
+
+def test_passage_query_matches_wrapped_word_without_rewriting_citable_text():
+    lines = [_line("begin", "The trials recorded an electro-", 100),
+             _line("end", "cardiogram while the subject slept.", 112)]
+    other_version = [_line("old-begin", "An electro-", 100, version="v0"),
+                     _line("old-end", "cardiogram is available.", 112, version="v0")]
+    unrelated = [_line(f"p{i}", f"Control condition {i} was measured.", 200 + 24 * i) for i in range(5)]
+    with closing(EvidenceIndex([*other_version, *unrelated, *lines])) as index:
+        assert index.search("electrocardiogram")["evidence"] == []
+        result = index.inspect(doc_id="paper", doc_version_id="v1", page_index=0, query="electrocardiogram",
+                               passage_query=True, limit=3)
+        assert result["evidence"][:2] == lines
+        assert len(result["evidence"]) == 3
+        assert result["scope"]["matching_count"] == 7
+        assert result["scope"]["complete"] is False
+        assert {row["doc_version_id"] for row in result["evidence"]} == {"v1"}

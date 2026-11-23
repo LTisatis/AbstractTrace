@@ -46,8 +46,29 @@ _UNIT = r"%|百分点|percentage\s+points?|p\.?p\.?\b"
 _NUMBER = re.compile(rf"(?<![a-z0-9_.])([+-]?(?:\d+(?:\.\d+)?|\.\d+))(?:\s*({_UNIT}))?")
 _MAX_CANDIDATES = 24
 _MAX_BODY_PASSAGE = 8
+_PASSAGE_SEEDS = 2
 _LINE_END = re.compile(r"[.!?。！？][\"'”’）)】\]]*$")
 _ABBREVIATION_END = re.compile(r"\b(?:e\.g|i\.e|et al|fig|eq|ref|no|vs|pp|vol|dr|prof)\.$", re.IGNORECASE)
+_TRAILING_TRANSITION = re.compile(
+    r"[.!?。！？]\s*(?:first|second|third|fourth|finally|alternatively|next|however|moreover|for example|"
+    r"首先|其次|然后|最后|另外|例如|第[一二三四])[，,]$", re.IGNORECASE,
+)
+_WRAPPED_WORD = re.compile(r"(?<=[^\W\d_])[-\u00ad]\n\s*(?=[^\W\d_])")
+_WITNESS_QUERY = re.compile(r"\b(?:counter[\s-]?examples?|witness(?:es)?|constructive|examples?)\b|反例|构造性")
+_WITNESS_TEXT = re.compile(
+    r"\b(?:can|could)\s+(?:(?:also|directly|exactly|successfully|always|still)\s+){0,2}"
+    r"(?:(?:recognize|represent|express|simulate|separate|implement|compute|model|solve|realize|accept|classify|"
+    r"generate|emulate|achieve)|be\s+(?:recognized|represented|expressed|simulated|implemented|computed|"
+    r"modeled|solved|realized|accepted|generated))\b[^.!?;]{0,140}\b"
+    r"(?:by\s+(?:having|using|taking|applying|choosing|adding|replacing|setting|one|the|a|an)|"
+    r"using\s+(?:a|an|one|two|the))\b|\b(?:we|one)\s+(?:can\s+)?(?:construct|build|design|exhibit)\s+(?:a|an|the)\b|"
+    r"(?:可以|能够|可)(?:通过|使用|利用)[^。！？]{1,65}(?:实现|识别|计算|表示|构造)",
+)
+_PASSAGE_QUERY_NOISE = frozenset(
+    "a an and or both under by between can could same any whether as at be been for from in is it of on that the "
+    "their this these to was were will with would which theorem proof construction paper field assumption assumptions "
+    "constructive example examples witness witnesses counterexample counterexamples result results supported observed".split()
+)
 _SECTION_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*|[ivx]+)[.)]?\s+")
 _METHOD_NAMES = frozenset(("method", "methods", "materials and methods", "material and methods", "methodology",
                            "方法", "材料与方法"))
@@ -122,6 +143,11 @@ def _exact_terms(text: str, *, header: str = "") -> tuple[set[str], str]:
 def _text_field(record: dict, key: str) -> str:
     value = record.get(key)
     return value if isinstance(value, str) else ""
+
+
+def _fts_expression(tokens: set[str]) -> str:
+    # Quote generated words so operators such as OR are searched literally.
+    return " OR ".join(f'"{token}"' for token in sorted(tokens)[:96])
 
 
 def _document_key(record: dict) -> tuple[str, str]:
@@ -252,6 +278,8 @@ class EvidenceIndex:
         self._body_lines: dict[tuple, list[tuple[str, tuple]]] = defaultdict(list)
         self._body_neighbors: dict[tuple[str, int], str | None] = {}
         self._body_windows: dict[str, tuple[str, ...]] = {}
+        self._passage_index: dict[str, tuple[str, ...]] | None = None
+        self._witness_passages: set[str] = set()
         self._embedder = embedder
         self._reranker = reranker
         texts = []
@@ -638,14 +666,66 @@ class EvidenceIndex:
     def _lexical_rank(self, tokens: set[str], active: set[str]) -> list[str]:
         if not tokens or not active:
             return []
-        # Quote the generated tokens so words such as OR are searched literally.
-        query = " OR ".join(f'"{token}"' for token in sorted(tokens)[:96])
         rows = self._fts.execute(
-            "SELECT evidence_id FROM lexical WHERE lexical MATCH ? ORDER BY bm25(lexical), evidence_id", (query,),
+            "SELECT evidence_id FROM lexical WHERE lexical MATCH ? ORDER BY bm25(lexical), evidence_id",
+            (_fts_expression(tokens),),
         )
         return [eid for (eid,) in rows if eid in active]
 
-    def _query_rank(self, query: str, active: set[str]) -> tuple[list[str], list[str]]:
+    def _index_passages(self) -> dict[str, tuple[str, ...]]:
+        if self._passage_index is not None:
+            return self._passage_index
+        passages = {}
+        lexical_rows = []
+        for eid in self._records:
+            unit = self._body_passage(eid)
+            if len(unit) < 2 or unit[0] in passages:
+                continue
+            passages[unit[0]] = unit
+            text = "\n".join(self._records[anchor]["text"] for anchor in unit)
+            joined = _WRAPPED_WORD.sub("", text)
+            tokens = _terms(text, index=True) | _terms(joined, index=True)
+            lexical_rows.append((unit[0], " ".join(sorted(tokens))))
+            if _WITNESS_TEXT.search(" ".join(_normalize(joined).split())):
+                self._witness_passages.add(unit[0])
+        self._fts.execute("CREATE VIRTUAL TABLE passages USING fts5(evidence_id UNINDEXED, text, tokenize='unicode61')")
+        self._fts.executemany("INSERT INTO passages(evidence_id, text) VALUES (?, ?)", lexical_rows)
+        self._passage_index = passages
+        return passages
+
+    def _passage_seeds(self, query: str, active: set[str], limit: int) -> list[str]:
+        if limit < 2 or not active:
+            return []
+        tokens = _terms(query)
+        if not tokens:
+            return []
+        passages = self._index_passages()
+        if not passages:
+            return []
+        # Keep the assembled context small enough to leave room for a different source hit.
+        complete_cap = min(limit, max(3, limit - 2))
+        rows = self._fts.execute(
+            "SELECT evidence_id FROM passages WHERE passages MATCH ? ORDER BY bm25(passages), evidence_id",
+            (_fts_expression(tokens - _PASSAGE_QUERY_NOISE or tokens),),
+        )
+        seek_witness = bool(_WITNESS_QUERY.search(_normalize(query)))
+        matched, witnesses = [], []
+        for eid, in rows:
+            if len(passages[eid]) > complete_cap or not active.issuperset(passages[eid]):
+                continue
+            if seek_witness and eid in self._witness_passages:
+                witnesses.append(eid)
+                if len(witnesses) >= _PASSAGE_SEEDS:
+                    break
+            elif len(matched) < _PASSAGE_SEEDS:
+                matched.append(eid)
+                if not seek_witness and len(matched) >= _PASSAGE_SEEDS:
+                    break
+        return [*witnesses, *matched][:_PASSAGE_SEEDS]
+
+    def _query_rank(
+        self, query: str, active: set[str], *, passage_query: bool = False, limit: int = _MAX_BODY_PASSAGE,
+    ) -> tuple[list[str], list[str]]:
         exact, query_without_exact = _exact_terms(query)
         lexical = _terms(query_without_exact if exact else query)
         ranks = {
@@ -660,8 +740,12 @@ class EvidenceIndex:
                 scores[eid] += 1 / (60 + rank)
         shortlist = sorted(scores, key=lambda eid: (-scores[eid], eid))[:_MAX_CANDIDATES]
         channels = list(ranks)
+        passage_seeds = self._passage_seeds(query, active, limit) if passage_query else []
+        if passage_seeds:
+            shortlist = list(dict.fromkeys((*passage_seeds, *shortlist)))[:_MAX_CANDIDATES]
+            channels.append("passage")
         if self._reranker is not None and shortlist:
-            shortlist = self._rerank(query, shortlist, active, set(ranks["exact"]))
+            shortlist = self._rerank(query, shortlist, active, set(ranks["exact"]) | set(passage_seeds))
             channels.append("reranker")
         return shortlist, channels
 
@@ -731,6 +815,7 @@ class EvidenceIndex:
     def _wrap_to_next(self, first: str, second: str) -> bool:
         text = self._records[first]["text"].rstrip()
         return (self._adjacent_line(second, -1) == first
+                and not _TRAILING_TRANSITION.search(text)
                 and (not _LINE_END.search(text) or bool(_ABBREVIATION_END.search(text))))
 
     def _body_passage(self, eid: str) -> tuple[str, ...]:
@@ -935,7 +1020,7 @@ class EvidenceIndex:
     def search(
         self, query: str, *, limit: int = 8, section: str | None = None, expand: bool = True,
         doc_id: str | None = None, doc_version_id: str | None = None,
-        followup: bool = False, prior_ids: Iterable[str] = (),
+        followup: bool = False, prior_ids: Iterable[str] = (), passage_query: bool = False,
     ) -> dict:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("evidence query must be nonempty text")
@@ -951,11 +1036,12 @@ class EvidenceIndex:
             and (doc_version_id is None or _document_key(record)[1] == doc_version_id)
             and (section_key is None or section_key in _normalize(_text_field(record["locator"], "section")))
         }
-        ranked, channels = self._query_rank(query, active)
-        if followup:
+        ranked, channels = self._query_rank(query, active, passage_query=passage_query, limit=limit)
+        preserve_passages = followup or passage_query
+        if preserve_passages:
             cap = _MAX_CANDIDATES if expand else limit
             ranked = self._followup_order(ranked, active, cap, set(prior_ids), passage_limit=limit)
-        chosen, paths = self._expand(ranked, limit, active, preserve_passages=followup) if expand else (ranked[:limit], [])
+        chosen, paths = self._expand(ranked, limit, active, preserve_passages=preserve_passages) if expand else (ranked[:limit], [])
         locations = {
             (self._records[eid]["doc_id"], self._records[eid]["locator"]["page_index"],
              _text_field(self._records[eid]["locator"], "section"))
@@ -984,7 +1070,7 @@ class EvidenceIndex:
     def inspect(
         self, *, section: str | None = None, table_label: str | None = None,
         page_index: int | None = None, doc_id: str | None = None, doc_version_id: str | None = None,
-        limit: int = 8, query: str | None = None, prior_ids: Iterable[str] = (),
+        limit: int = 8, query: str | None = None, prior_ids: Iterable[str] = (), passage_query: bool = False,
     ) -> dict:
         """Read a named source, ranking partial results only when a query is provided."""
         if section is None and table_label is None and page_index is None:
@@ -1014,7 +1100,7 @@ class EvidenceIndex:
         ordered = ids
         if query and len(ids) > limit:
             active = set(ids)
-            ranked, _ = self._query_rank(query, active)
+            ranked, _ = self._query_rank(query, active, passage_query=passage_query, limit=limit)
             focused = self._followup_order(ranked, active, limit, set(prior_ids), passage_limit=limit)
             selected = dict.fromkeys(focused)
             for unit in self._evidence_units(ids):

@@ -2,7 +2,7 @@ from contextlib import closing
 
 import pytest
 
-from abstract_review.audit import audit_version, review_claim, targeted_evidence
+from abstract_review.audit import audit_version, extract_claims, review_claim, targeted_evidence
 from abstract_review.evidence import EvidenceIndex
 from abstract_review.models import ModelPaused
 
@@ -82,6 +82,104 @@ def test_direct_refutation_requires_same_scope_and_only_supplementary_missing_fi
     assert result["verdict"] == expected
     assert ("direct_contradiction" in result) == (expected == "refuted")
     assert len(model.calls) == 1
+
+
+@pytest.mark.parametrize(("proof_mode", "blocker"), [
+    ("complete", None),
+    ("missing", "missing_direct_contradiction"),
+    ("different_experiment", "unconfirmed_contradiction_scope"),
+    ("scope_in_another_group", "ungrounded_contradiction"),
+    ("scope_not_sent", "ungrounded_contradiction"),
+    ("scope_coverage_missing", "missing_scope_coverage"),
+    ("condition_only_in_another_experiment", "missing_scope_coverage"),
+    ("unknown_decisive_condition", "unchecked_decisive_requirement"),
+    ("conflicting_support", "conflicting_support"),
+    ("full_coverage_wrong_scope", "missing_scope_coverage"),
+    ("full_coverage_conflicting_support", "conflicting_support"),
+    ("complex_logic", "unresolved_sentence_logic"),
+])
+def test_direct_refutation_oracle_separates_scope_from_the_opposite_result(proof_mode, blocker):
+    claim = {**CLAIM, "proposition": "Removing a filter from the coastal sensor suppressed noise.",
+             "requirements": ["coastal sensor", "filter removal", "noise calibration"],
+             "support_query": "coastal sensor filter", "counter_query": "filter removal increased noise"}
+    sources = [
+        _source("scope", "We ablated the filter in the coastal sensor arm."),
+        _source("result", "It produced more, rather than less, measurement noise."),
+        _source("other", "The dry-lab configuration had lower noise."),
+    ]
+    group_ids = ["scope", "result"]
+    proof = {"evidence_ids": ["result"], "scope_evidence_ids": ["scope"],
+             "subject_and_conditions": "same", "relation": "opposite_result",
+             "scope_reason": "The ablation and the resulting increase concern the same coastal sensor arm.",
+             "supplementary_fields": ["noise calibration"]}
+    coverage = [
+        {"requirement": field, "status": "found", "evidence_ids": ["scope"]}
+        for field in ("coastal sensor", "filter removal")
+    ]
+    if proof_mode == "different_experiment":
+        proof["subject_and_conditions"] = "different"
+    elif proof_mode == "scope_in_another_group":
+        group_ids = ["result"]
+    elif proof_mode == "scope_not_sent":
+        proof["scope_evidence_ids"] = ["unknown"]
+    elif proof_mode in {"scope_coverage_missing", "full_coverage_wrong_scope"}:
+        proof["scope_evidence_ids"] = []
+    elif proof_mode == "unknown_decisive_condition":
+        coverage.pop()
+    elif proof_mode == "condition_only_in_another_experiment":
+        coverage[1]["evidence_ids"] = ["other"]
+    elif proof_mode == "complex_logic":
+        claim["logic_review_required"] = True
+    groups = [{"role": "refute", "evidence_ids": group_ids}]
+    if proof_mode == "scope_in_another_group":
+        groups.append({"role": "refute", "evidence_ids": ["scope"]})
+    if proof_mode in {"conflicting_support", "full_coverage_conflicting_support"}:
+        groups.append({"role": "support", "evidence_ids": ["other"]})
+    missing = ["noise calibration"]
+    if proof_mode.startswith("full_coverage"):
+        coverage.append({"requirement": "noise calibration", "status": "found", "evidence_ids": ["other"]})
+        proof["supplementary_fields"] = []
+        missing = []
+    model = Model({
+        **_judgement(verdict="refuted", groups=groups, observations=coverage, missing=missing),
+        "direct_contradiction": None if proof_mode == "missing" else proof,
+        "reason": "Removing the filter raised noise in the coastal ablation.",
+    })
+    with closing(EvidenceIndex(sources)) as index:
+        finding, _ = review_claim(claim, index, model)
+    assert {"scope", "result"} <= set(finding["sent_candidate_ids"])
+    assert len(model.calls) == 1
+    assert finding.get("refutation_blocker") == blocker
+    assert finding["verdict"] == ("refuted" if blocker is None else None)
+    if blocker is None:
+        assert finding["direct_contradiction"] == proof
+        assert finding["coverage"][-1]["status"] == "unchecked"
+
+
+@pytest.mark.parametrize("malformed_group", [False, True])
+def test_extraction_recovers_a_procedural_conjunction_without_an_extra_model_call(malformed_group):
+    text = "We applied an automated filter for screening and accepted every hit without manual review."
+    group = {"sentence_id": "s1", "operator": "and", "claim_indexes": [0, 1]}
+
+    class UnsplitExtractor:
+        def call(self, stage, material, schema):
+            assert stage == "extract"
+            return schema.model_validate({"claims": [
+                {"sentence_id": "s1", "quote": text, "proposition": text, "kind": "result",
+                 "requirements": ["screening workflow"], "support_query": text, "counter_query": text},
+            ], "compounds": [group] if malformed_group else []})
+
+    left, right = extract_claims(text, UnsplitExtractor())
+    assert right["quote"] == "accepted every hit without manual review"
+    assert right["proposition"] == "We accepted every hit without manual review."
+    assert right["support_query"] == right["proposition"]
+    assert left["compound"] == right["compound"]
+    assert "logic_review_required" not in right
+    model = Model(_judgement(verdict="pending", missing=[]))
+    with closing(EvidenceIndex([_source("e1", "The filter had hits.")])) as index:
+        review_claim(right, index, model)
+    assert model.calls[0]["claim"] == right["proposition"]
+    assert model.calls[0]["sentence_context"] == text
 
 
 def test_methods_hint_prefers_alias_in_current_document_without_claiming_complete_inspection():

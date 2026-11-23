@@ -3,7 +3,7 @@ import hashlib
 import pytest
 
 from abstract_review.audit import extract_claims, refresh_compound_findings, supplied_claims
-from abstract_review.compound import aggregate_compound_findings
+from abstract_review.compound import aggregate_compound_findings, shared_procedure_parts
 
 
 CONJUNCTION = "Against the same baseline, accuracy increased by 10 percentage points on datasets A, B, and C."
@@ -60,6 +60,61 @@ def test_simple_independent_conjunction_and_real_alternative_have_different_oper
     assert [claim["compound"]["operator"] for claim in and_claims] == ["and", "and"]
     assert [claim["compound"]["operator"] for claim in or_claims] == ["or", "or"]
     assert [claim["text"] for claim in or_claims] == ["the model reduced errors", "recall increased."]
+
+
+@pytest.mark.parametrize(("first", "connector", "second"), [
+    ("We applied statcheck for the detection of consistency errors in all included papers",
+     " and ", "manually corrected false positives"),
+    ("We applied statcheck for the detection of consistency errors in all included papers",
+     " and ", "accepted every flag without manual review"),
+    ("We collected identifiers", ", and ", "selected controls"),
+    ("We collected identifiers", " and ", "recorded the sample sizes"),
+])
+def test_shared_first_person_subject_leaves_each_procedure_anchored(first, connector, second):
+    sentence = f"{first}{connector}{second}."
+    atoms, operator = shared_procedure_parts(sentence)
+    assert operator == "and"
+    assert atoms == [
+        (0, len(first), first),
+        (len(first + connector), len(sentence) - 1, f"We {second}."),
+    ]
+
+    source = f"Background information. {sentence}"
+    _, *claims = extract_claims(source)
+    assert [claim["text"] for claim in claims] == [first, second]
+    assert [claim["proposition"] for claim in claims] == [first, f"We {second}."]
+    assert all(source[claim["start"]:claim["end"]] == claim["quote"] for claim in claims)
+    assert all(claim["compound"]["operator"] == "and" for claim in claims)
+
+
+@pytest.mark.parametrize("sentence", [
+    "We did not collect measurements and record observations.",
+    "We could collect measurements and record observations.",
+    "We collected no measurements and recorded observations.",
+    "We screened participants and must record observations.",
+    "We automatically screened participants and recorded observations.",
+    "We screened participants and recorded observations automatically.",
+    "Before the trial, we screened participants and recorded observations.",
+    "We screened participants and recorded observations before the trial.",
+    "We screened participants and recorded observations if approved.",
+    "We reported clinicians screened participants and recorded observations.",
+    "We accepted clinicians screened participants and recorded the observations.",
+    "We recorded she screened participants and selected the controls.",
+    "We screened participants who selected controls and recorded observations.",
+    "We screened and recorded clinical observations.",
+    "We screened participants or recorded observations.",
+    "We screened participants and recorded observations or excluded outliers.",
+    "We screened participants, recorded observations, and excluded outliers.",
+    "We recorded observations and response times.",
+    "We screened patients and selected controls.",
+    "We reviewed false negatives and manually corrected false positives.",
+    "We screened patients and recorded outcomes in the pilot.",
+    "We screened patients and recorded outcomes without replacement.",
+])
+def test_shared_procedure_refuses_ambiguous_or_dependent_conjuncts(sentence):
+    assert shared_procedure_parts(sentence) is None
+    claim, = extract_claims(sentence)
+    assert claim["quote"] == sentence and "compound" not in claim
 
 
 def test_conjunction_uses_only_refuting_operands_for_its_decisive_evidence():

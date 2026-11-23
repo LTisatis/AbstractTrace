@@ -40,9 +40,9 @@ class _GoldLabel:
 
 def score_predictions(
     predictions: object, gold: object, *, rank_cutoffs: tuple[int, ...] = _DEFAULT_RANK_CUTOFFS,
-    semantic_matches: object = None,
+    semantic_matches: object = None, verdict_projections: object = None,
 ) -> dict[str, object]:
-    """Score stored predictions and optionally add independently annotated semantic scores."""
+    """Score stored predictions, with optional independent alignment and projection reviews."""
     if not rank_cutoffs or any(type(k) is not int or k <= 0 for k in rank_cutoffs):
         raise ValueError("rank cutoffs must be positive integers")
     cutoffs = tuple(sorted(set(rank_cutoffs)))
@@ -56,6 +56,7 @@ def score_predictions(
         raise ValueError(f"Prediction has no gold label for {sample_id}/{claim_id}")
 
     result = _score_aligned(predicted, gold_labels, extraction_samples, matches, cutoffs)
+    combined = matches
     if semantic_matches is not None:
         annotations, provenance = _parse_semantic_matches(
             semantic_matches, predictions, gold, predicted, gold_labels, extraction_samples, matches,
@@ -71,6 +72,10 @@ def score_predictions(
             "provenance": provenance,
         }
         result["semantic_scoring"] = _score_aligned(predicted, gold_labels, extraction_samples, combined, cutoffs)
+    if verdict_projections is not None:
+        result["verdict_projection"] = _review_verdict_projections(
+            verdict_projections, predictions, gold, predicted, gold_labels, extraction_samples, combined,
+        )
     return result
 
 
@@ -331,17 +336,7 @@ def semantic_manifest_sha256(document: object) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _parse_semantic_matches(
-    document: object, predictions: object, gold: object, predicted: dict[_CaseKey, _Prediction],
-    labels: dict[_CaseKey, _GoldLabel], samples: frozenset[str], exact: dict[_CaseKey, _CaseKey],
-) -> tuple[dict[_CaseKey, _CaseKey], dict[str, str]]:
-    fields = {"schema_version", "annotation_id", "annotator_type", "predictions_sha256", "gold_sha256", "matches"}
-    if not isinstance(document, dict) or document.keys() != fields:
-        raise ValueError(f"Semantic matches must contain exactly {', '.join(sorted(fields))}")
-    if type(document["schema_version"]) is not int or document["schema_version"] != 1:
-        raise ValueError("Unsupported semantic matches schema_version")
-    if not samples:
-        raise ValueError("Semantic matches require gold extraction samples")
+def _review_provenance(document: dict, predictions: object, gold: object, description: str) -> dict[str, str]:
     annotation_id = _identifier(document["annotation_id"], "annotation_id")
     annotator_type = document["annotator_type"]
     if annotator_type not in ("human", "ai"):
@@ -355,7 +350,22 @@ def _parse_semantic_matches(
     }
     for field in ("predictions_sha256", "gold_sha256"):
         if document[field] != provenance[field]:
-            raise ValueError(f"Semantic matches {field} does not match the supplied manifest")
+            raise ValueError(f"{description} {field} does not match the supplied manifest")
+    return provenance
+
+
+def _parse_semantic_matches(
+    document: object, predictions: object, gold: object, predicted: dict[_CaseKey, _Prediction],
+    labels: dict[_CaseKey, _GoldLabel], samples: frozenset[str], exact: dict[_CaseKey, _CaseKey],
+) -> tuple[dict[_CaseKey, _CaseKey], dict[str, str]]:
+    fields = {"schema_version", "annotation_id", "annotator_type", "predictions_sha256", "gold_sha256", "matches"}
+    if not isinstance(document, dict) or document.keys() != fields:
+        raise ValueError(f"Semantic matches must contain exactly {', '.join(sorted(fields))}")
+    if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+        raise ValueError("Unsupported semantic matches schema_version")
+    if not samples:
+        raise ValueError("Semantic matches require gold extraction samples")
+    provenance = _review_provenance(document, predictions, gold, "Semantic matches")
     rows = document["matches"]
     if not isinstance(rows, list):
         raise ValueError("Semantic matches must be a list")
@@ -383,6 +393,72 @@ def _parse_semantic_matches(
         matches[gold_key] = prediction_key
         used_predictions.add(prediction_key)
     return matches, provenance
+
+
+def _review_verdict_projections(
+    document: object, predictions: object, gold: object, predicted: dict[_CaseKey, _Prediction],
+    labels: dict[_CaseKey, _GoldLabel], samples: frozenset[str], aligned: dict[_CaseKey, _CaseKey],
+) -> dict[str, object]:
+    """Validate evidence and provenance for each independently reviewed conjunct."""
+    fields = {"schema_version", "annotation_id", "annotator_type", "predictions_sha256", "gold_sha256", "projections"}
+    if not isinstance(document, dict) or document.keys() != fields:
+        raise ValueError(f"Verdict projections must contain exactly {', '.join(sorted(fields))}")
+    if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+        raise ValueError("Unsupported verdict projections schema_version")
+    if not samples:
+        raise ValueError("Verdict projections require gold extraction samples")
+    provenance = _review_provenance(document, predictions, gold, "Verdict projections")
+    rows = document["projections"]
+    if not isinstance(rows, list):
+        raise ValueError("Verdict projections must be a list")
+
+    row_fields = {"sample_id", "predicted_claim_id", "gold_claim_id", "relation", "operand_anchor",
+                  "evidence_ids", "review_note"}
+    used_predictions = set(aligned.values())
+    used_labels = set(aligned)
+    reviewed = []
+    for index, row in enumerate(rows):
+        location = f"projections[{index}]"
+        if not isinstance(row, dict) or row.keys() != row_fields:
+            raise ValueError(f"{location} must contain exactly {', '.join(sorted(row_fields))}")
+        sample = _identifier(row["sample_id"], f"{location}.sample_id")
+        gold_key = sample, _identifier(row["gold_claim_id"], f"{location}.gold_claim_id")
+        prediction_key = sample, _identifier(row["predicted_claim_id"], f"{location}.predicted_claim_id")
+        if sample not in samples or gold_key not in labels or prediction_key not in predicted:
+            raise ValueError(f"{location} must reference an existing prediction and gold claim in one extraction sample")
+        if gold_key in used_labels or prediction_key in used_predictions:
+            raise ValueError(f"{location} conflicts with an existing alignment or projection")
+        if row["relation"] != "conjunct":
+            raise ValueError(f"{location}.relation must be conjunct")
+        note = row["review_note"]
+        if not isinstance(note, str) or not note.strip():
+            raise ValueError(f"{location}.review_note must explain why the evidence refutes this operand")
+
+        prediction, label = predicted[prediction_key], labels[gold_key]
+        source = prediction.anchor
+        operand = _anchor(row["operand_anchor"], f"{location}.operand_anchor")
+        if operand != label.anchor:
+            raise ValueError(f"{location}.operand_anchor must identify the exact gold operand")
+        if (source is None or source.sentence_id != operand.sentence_id
+                or not source.start <= operand.start < operand.end <= source.end
+                or (source.start, source.end) == (operand.start, operand.end)
+                or source.proposition == operand.proposition):
+            raise ValueError(f"{location} must link a distinct, strictly contained operand in the same sentence")
+        if prediction.status != "completed" or prediction.verdict != "refuted" or label.verdict != "refuted":
+            raise ValueError(f"{location} requires a completed refutation and a refuted gold operand")
+
+        ids = _evidence_ids(row["evidence_ids"], f"{location}.evidence_ids")
+        if (not ids or prediction.candidate_ids is None or not ids <= prediction.evidence_ids
+                or not ids <= set(prediction.candidate_ids)):
+            raise ValueError(f"{location}.evidence_ids must be both cited and present in the prediction's candidates")
+        if not any(group <= ids for group in label.evidence_groups):
+            raise ValueError(f"{location}.evidence_ids must include a complete accepted evidence group for this operand")
+        used_labels.add(gold_key)
+        used_predictions.add(prediction_key)
+        reviewed.append({**row, "operand_anchor": dict(row["operand_anchor"]), "evidence_ids": sorted(ids)})
+
+    reviewed.sort(key=lambda row: (row["sample_id"], row["gold_claim_id"], row["predicted_claim_id"]))
+    return {"provenance": provenance, "credited_count": len(reviewed), "projections": reviewed}
 
 
 def _same_source_span(left: _Anchor, right: _Anchor) -> bool:
