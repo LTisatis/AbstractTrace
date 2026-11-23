@@ -17,7 +17,7 @@ from .compound import (
     aggregate_compound_findings, attach_compound, offline_compound_parts, requires_whole_sentence,
     shared_procedure_parts,
 )
-from .evidence import EvidenceIndex, with_method_scope
+from .evidence import EvidenceIndex, _terms, with_method_scope
 from .models import Extraction, Judgement, ModelPaused, ModelUnavailable, Schema
 
 
@@ -73,9 +73,10 @@ def _text_target(query: str) -> dict:
     return target
 
 
-def normalize_targets(queries: Iterable[str | dict], documents=()) -> list[dict]:
+def normalize_targets(queries: Iterable[str | dict], documents=(), *, initial_queries: Iterable[str] = ()) -> list[dict]:
     targets = []
     known_docs = {document["doc_id"] for document in documents}
+    repeated = {_field_key(query) for query in initial_queries}
     for raw in queries:
         item = _text_target(raw) if isinstance(raw, str) else raw
         if not isinstance(item, dict) or not isinstance(item.get("query"), str):
@@ -98,6 +99,9 @@ def normalize_targets(queries: Iterable[str | dict], documents=()) -> list[dict]
             if type(page) is not int or page < 0:
                 continue
             target["page_index"] = page
+        if (_field_key(query) in repeated and not target.keys() & {"section", "table_label", "page_index", "source_kind"}
+                and ("doc_id" not in target or known_docs == {target["doc_id"]})):
+            continue
         if target not in targets:
             targets.append(target)
         if len(targets) == 2:
@@ -118,6 +122,39 @@ def _page_failures(scope: dict, documents) -> list[dict]:
                 failures.append({"doc_id": doc_id, "page_index": page["page_index"],
                                  "status": page.get("table_status") or page["status"]})
     return failures
+
+
+def _source_hints(documents: Iterable[dict], queries: Iterable[str]) -> list[dict]:
+    """Select printed navigation labels by query relevance, keeping physical page numbers."""
+    terms = _terms(" ".join(queries))
+    candidates = []
+    seen = set()
+    for doc_order, document in enumerate(documents):
+        if not isinstance(document, dict):
+            continue
+        doc_id, pages = document.get("doc_id"), document.get("pages")
+        if (not isinstance(doc_id, str) or not 0 < len(doc_id) <= 250 or doc_id != doc_id.strip()
+                or not isinstance(pages, list)):
+            continue
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            page_index, titles = page.get("page_index"), page.get("source_headings")
+            if type(page_index) is not int or not 0 <= page_index < 2**32 or not isinstance(titles, list):
+                continue
+            key = doc_id, page_index
+            if key in seen:
+                continue
+            headings = dict.fromkeys(" ".join(title.split()) for title in titles if isinstance(title, str))
+            scored = {title: len(terms & _terms(title)) for title in headings if 0 < len(title) <= 100}
+            if not scored:
+                continue
+            chosen = set(sorted(scored, key=scored.__getitem__, reverse=True)[:2])
+            hint = {"doc_id": doc_id, "page_index": page_index, "headings": [title for title in scored if title in chosen]}
+            candidates.append((-max(scored.values()), doc_order, page_index, hint))
+            seen.add(key)
+    selected = sorted(candidates, key=lambda item: item[:3])[:6]
+    return [hint for _, _, _, hint in sorted(selected, key=lambda item: item[1:3])]
 
 
 def _interleave_units(index: EvidenceIndex, lanes: Iterable[Iterable[str]]) -> Iterable[tuple[str, ...]]:
@@ -208,7 +245,7 @@ def _field_key(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
-def _pending_targets(output, requirements: list[str], documents) -> list[dict]:
+def _pending_targets(output, requirements: list[str], documents, *, initial_queries: Iterable[str] = ()) -> list[dict]:
     proposals = [target.model_dump() for target in getattr(output, "follow_up_targets", [])]
     proposals.extend(output.follow_up_queries)
     # If the model calls the field missing, an explicitly named source in its original requirement
@@ -218,7 +255,7 @@ def _pending_targets(output, requirements: list[str], documents) -> list[dict]:
         target = _text_target(field)
         if _field_key(field) in missing and any(target.get(key) is not None for key in _SCOPE_KEYS):
             proposals.append({**target, "requirement": field})
-    targets = normalize_targets(proposals, documents)
+    targets = normalize_targets(proposals, documents, initial_queries=initial_queries)
     if len(missing) == 1:
         requirement = next(iter(missing))
         for target in targets:
@@ -660,19 +697,21 @@ def review_claim(
                 ordered.update(dict.fromkeys(unit))
         return list(ordered)
 
-    gather([claim["support_query"], claim["counter_query"]])
+    initial_queries = (claim["support_query"], claim["counter_query"])
+    gather(initial_queries)
     body_windows = []
     if model is None or claim["kind"] not in {"background", "purpose"}:
-        body_windows = index.ranked_body_context([claim["support_query"], claim["counter_query"]])
+        body_windows = index.ranked_body_context(initial_queries)
     if additional_evidence:
         supplements = index.get(item["evidence_id"] for item in additional_evidence)
         prioritized.extend(item["evidence_id"] for item in supplements)
         by_id.update((item["evidence_id"], item) for item in supplements)
     followup = bool(saved_targets or additional_evidence)
-    if saved_targets:
+    saved = normalize_targets(saved_targets, documents, initial_queries=initial_queries)
+    if saved:
         previous = candidate_order()
         context = index.table_context(previous)
-        inspect(saved_targets, previous, set(previous) | {item["evidence_id"] for item in context["evidence"]})
+        inspect(saved, previous, set(previous) | {item["evidence_id"] for item in context["evidence"]})
     calculation = None
     while True:
         candidates = [by_id[eid] for eid in candidate_order()]
@@ -718,11 +757,19 @@ def review_claim(
                         "An unreported instrument or operational detail can be optional for a directly stated qualitative "
                         "contradiction. An explicit population, model, intervention, comparator, or claim condition is essential. "
                         "If scope or another decisive condition is unresolved, request up to two follow_up_targets. "
-                        "Use the exact missing field and concise source terms. For universal negatives, search for a "
+                        "Name the exact missing field and target the outcome, comparator, setup, or failure mechanism "
+                        "using source terms. Specify a source or refine the initial query to trigger a fresh search. "
+                        "For universal negatives, search for a "
                         "constructive witness using the same architecture and assumptions. Prefer source_kind methods, "
                         "results or proof when relevant. Name a section, table or page when known. Ordinary ranked "
                         "search is not a complete inspection."
                     )}
+        if not followup and (hints := _source_hints(documents, (claim["proposition"], *initial_queries))):
+            material["source_hints"] = hints
+            material["coverage_instructions"] += (
+                " Source hints are navigation labels only. To follow a hint, use its doc_id and zero-based page_index "
+                "in a typed follow_up_target and leave section empty. Base judgments on the returned source anchors."
+            )
         if table_context:
             material["table_context"] = table_context
         if compound := claim.get("compound"):
@@ -783,18 +830,21 @@ def review_claim(
             proof_error = _contradiction_error(output, sent_candidate_ids)
             proof_blocker = proof_error or _direct_refutation_blocker(claim, output, coverage)
         direct_proof = verdict == "refuted" and proof_blocker is None
-        targets = [] if direct_proof else _pending_targets(output, requirements, documents)
-        if targets and not followup:
-            if reserve_followup is None or reserve_followup():
-                followup = True
-                if save_targets is not None:
-                    save_targets(targets)
-                if inspect(targets, [item["evidence_id"] for item in candidates], set(sent_candidate_ids),
-                           context_ids=body_ids):
-                    continue
+        if not direct_proof and not followup:
+            targets = _pending_targets(output, requirements, documents, initial_queries=initial_queries)
+            if targets:
+                if reserve_followup is None or reserve_followup():
+                    followup = True
+                    if save_targets is not None:
+                        save_targets(targets)
+                    if inspect(targets, [item["evidence_id"] for item in candidates], set(sent_candidate_ids),
+                               context_ids=body_ids):
+                        continue
+                    stop = "no_progress"
+                else:
+                    stop = "follow_up_budget"
+            elif _pending_targets(output, requirements, documents):
                 stop = "no_progress"
-            else:
-                stop = "follow_up_budget"
         if stop == "no_progress":
             coverage = _coverage(requirements, output, examined_scopes, sent_candidate_ids)
             if verdict == "refuted" and proof_error is None:

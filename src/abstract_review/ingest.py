@@ -69,6 +69,12 @@ _SECTION_HEADING = re.compile(
     r"讨论|局限性|结论|致谢|参考文献|附录(?:\s*[A-Z0-9]+)?)[:：]?$",
     re.IGNORECASE,
 )
+_SOURCE_SECTION_NUMBER = r"[1-9]\d?(?:\.[1-9]\d?){0,3}[.)]?"
+_SOURCE_NUMBER_ONLY = re.compile(_SOURCE_SECTION_NUMBER)
+_SOURCE_NUMBERED_TITLE = re.compile(rf"({_SOURCE_SECTION_NUMBER})\s+(.+)")
+_SOURCE_CONTENTS_TITLE = re.compile(r"(?:table of contents|contents|目录)[:：]?", re.I)
+_SOURCE_BODY_OPENING = re.compile(r"(?:we|our|this|these|they|it|there)\b", re.I)
+_SOURCE_LEADER = re.compile(r"(?:\.\s*){2,}|[…⋯]")
 
 type BBox = tuple[float, float, float, float]
 
@@ -140,6 +146,16 @@ class _Caption:
     bbox: BBox
     evidence: dict
     continued: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _HeadingFragment:
+    text: str
+    bbox: BBox
+    baseline: float
+    size: float
+    font: str
+    bold: bool
 
 
 def _bounded_box(rect, width: float, height: float) -> BBox | None:
@@ -318,6 +334,83 @@ def _image_boxes(page: pymupdf.Page, width: float, height: float) -> list[BBox]:
     return sorted(boxes, key=lambda box: (box[1], box[0], box[3], box[2]))
 
 
+def _heading_fragments(page: pymupdf.Page, width: float, height: float, excluded: list[BBox]) -> list[_HeadingFragment]:
+    flags = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
+    fragments = []
+    for block in page.get_text("dict", flags=flags)["blocks"]:
+        for line in block.get("lines", ()):
+            if line["dir"][0] < 0.99 or abs(line["dir"][1]) > 0.01:
+                continue
+            spans = [span for span in line["spans"] if span["text"].strip()]
+            bbox = _bounded_box(line["bbox"], width, height)
+            if not spans or bbox is None:
+                continue
+            x0, y0, x1, y1 = bbox
+            if any(x0 < right and left < x1 and y0 < bottom and top < y1 for left, top, right, bottom in excluded):
+                continue
+            text = " ".join(unicodedata.normalize("NFKC", " ".join(span["text"] for span in spans)).split())
+            first = spans[0]
+            bold = all(span["flags"] & pymupdf.TEXT_FONT_BOLD for span in spans)
+            fragments.append(_HeadingFragment(text, bbox, first["origin"][1], first["size"], first["font"], bold))
+    return sorted(fragments, key=lambda fragment: (fragment.baseline, fragment.bbox[0]))
+
+
+def _source_title(text: str) -> bool:
+    words = text.split()
+    return bool(
+        words and len(words) <= 12 and len(text) <= 100 and text[0].isalpha() and not words[-1].isdigit()
+        and text[-1] not in ".!?。！？:：;；" and not _SOURCE_LEADER.search(text)
+        and not _SOURCE_BODY_OPENING.match(text) and not _TABLE_CAPTION.match(text) and not _FIGURE_CAPTION.match(text)
+    )
+
+
+def _source_headings(page: pymupdf.Page, width: float, height: float, excluded: list[BBox]) -> list[str]:
+    fragments = _heading_fragments(page, width, height, excluded)
+    if any(_SOURCE_CONTENTS_TITLE.fullmatch(fragment.text) for fragment in fragments):
+        return []
+
+    headings = []
+    consumed = set()
+    for fragment in fragments:
+        if fragment in consumed or not fragment.bold or "\ufffd" in fragment.text:
+            continue
+        same_line = [other for other in fragments if other.bbox[0] >= fragment.bbox[2] - 0.5
+                     and abs(other.baseline - fragment.baseline) <= 0.15 * fragment.size]
+        right = fragment
+        if numbered := _SOURCE_NUMBERED_TITLE.fullmatch(fragment.text):
+            number, title = numbered.groups()
+        elif _SOURCE_NUMBER_ONLY.fullmatch(fragment.text):
+            if not same_line:
+                continue
+            right = min(same_line, key=lambda other: other.bbox[0])
+            if (not right.bold or fragment.font != right.font or abs(fragment.size - right.size) > 0.5
+                    or right.bbox[0] - fragment.bbox[2] > 3.5 * fragment.size):
+                continue
+            number, title = fragment.text, right.text
+        elif _SECTION_HEADING.fullmatch(fragment.text):
+            number, title = "", fragment.text.rstrip(":：")
+        else:
+            continue
+        if not _source_title(title) or "\ufffd" in title:
+            continue
+        if any(other.bbox[0] > right.bbox[2] + fragment.size and other.text.isdigit() for other in same_line):
+            # A separately positioned page number is common in contents entries.
+            continue
+        if right is not fragment:
+            consumed.add(right)
+            continuations = [other for other in fragments if other.bold and other.font == right.font
+                             and abs(other.size - right.size) <= 0.5
+                             and abs(other.bbox[0] - right.bbox[0]) <= 0.25 * right.size
+                             and 0.9 * right.size <= other.baseline - right.baseline <= 1.4 * right.size
+                             and _source_title(f"{title} {other.text}") and other.text[0].isalpha()]
+            if len(continuations) == 1 and len(title) >= 30:
+                (continuation,) = continuations
+                title = f"{title} {continuation.text}"
+                consumed.add(continuation)
+        headings.append(f"{number} {title}".strip())
+    return list(dict.fromkeys(headings))
+
+
 def _read_page(
     pdf: pymupdf.Document, page_index: int, ocr_language: str | None,
 ) -> tuple[dict, list[_Line], list[_Cell], list[BBox]]:
@@ -368,6 +461,13 @@ def _read_page(
         except _PDF_ERRORS:
             details["figure_status"] = "unreadable"
     details["status"] = ("ocr" if ocr_words else "parsed") if lines or cells else "unreadable"
+    if details["status"] == "parsed":
+        try:
+            if headings := _source_headings(page, width, height, [*table_boxes, *images]):
+                details["source_headings"] = headings
+        except _PDF_ERRORS:
+            # Page clues are optional when the native font metadata cannot be read.
+            pass
     return details, lines, cells, images
 
 

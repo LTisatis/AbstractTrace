@@ -132,3 +132,32 @@ def test_passage_query_matches_wrapped_word_without_rewriting_citable_text():
         assert result["scope"]["matching_count"] == 7
         assert result["scope"]["complete"] is False
         assert {row["doc_version_id"] for row in result["evidence"]} == {"v1"}
+
+
+def test_context_uses_an_alternative_when_two_queries_rank_the_same_range_first():
+    first = [_line(f"a{i}", text, 100 + 12 * i) for i, text in enumerate((
+        "Coastal calibration results included the measured threshold.",
+        "Temperatures remained within the planned bounds.",
+        "Initial conditions were consistent.",
+    ))]
+    second = [_line(f"b{i}", text, 100 + 12 * i, page=1) for i, text in enumerate((
+        "A separate coastal test measured vibration under load.",
+        "The direction of the effect changed.",
+        "The control configuration stayed fixed.",
+    ))]
+
+    class Ranker:
+        def score(self, query, texts):
+            return [1.0 if "Initial conditions" in text else 0.0 for text in texts]
+
+    queries = ["coastal calibration", "coastal threshold"]
+    with closing(EvidenceIndex([*first, *second], reranker=Ranker())) as index:
+        windows = index.ranked_body_context(queries)
+        first_group, second_group = index.pack_body_context(windows, [])
+        assert first_group["new_evidence_ids"] == ["a0", "a1", "a2"]
+        assert second_group["new_evidence_ids"] == ["b0", "b1", "b2"]
+        named = index.ranked_body_context(queries, page_index=0)
+        assert index.pack_body_context(named, []) == [first_group]
+    with closing(EvidenceIndex([*first, *second])) as index:
+        lexical = index.ranked_body_context(queries)
+        assert index.pack_body_context(lexical, []) == [first_group]
