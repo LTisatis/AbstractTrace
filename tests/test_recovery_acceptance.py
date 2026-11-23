@@ -41,6 +41,8 @@ def test_response_lost_before_checkpoint_consumes_budget_and_recovers_once(tmp_p
             parsed = schema(
                 verdict="supported", reason="The aligned cells give eight percentage points.",
                 evidence_groups=[{"role": "support", "evidence_ids": ids}],
+                empirical_support={"result_source": "direct_result", "result_evidence_ids": ids,
+                                   "scope_evidence_ids": ids, "same_study_and_scope": "same"},
                 missing_fields=[], follow_up_queries=[], coverage=[
                     {"requirement": field, "status": "found", "evidence_ids": ids}
                     for field in context["requirements"]

@@ -17,8 +17,8 @@ from .compound import (
     aggregate_compound_findings, attach_compound, offline_compound_parts, requires_whole_sentence,
     shared_procedure_parts,
 )
-from .evidence import EvidenceIndex, _terms, with_method_scope
-from .models import Extraction, Judgement, ModelPaused, ModelUnavailable, Schema
+from .evidence import EvidenceIndex, _document_key, _terms, with_method_scope
+from .models import EvidenceGroup, Extraction, InvalidJudgeReference, Judgement, ModelPaused, ModelUnavailable, Schema
 
 
 class FieldCheck(Schema):
@@ -46,14 +46,45 @@ class DirectContradiction(Schema):
     supplementary_fields: list[str]
 
 
+class EmpiricalSupport(Schema):
+    result_source: Literal["direct_result", "summary", "uncertain"]
+    result_evidence_ids: list[str]
+    scope_evidence_ids: list[str]
+    same_study_and_scope: Literal["same", "different", "uncertain"]
+
+
+class CitationRange(Schema):
+    role: Literal["support", "refute", "limit"]
+    start_evidence_id: str
+    end_evidence_id: str
+
+
 class ScopedJudgement(Judgement):
     coverage: list[FieldCheck] = Field(default_factory=list)
     follow_up_targets: list[FollowUpTarget] = Field(default_factory=list)
     direct_contradiction: DirectContradiction | None = None
+    empirical_support: EmpiricalSupport | None = None
+    evidence_ranges: list[CitationRange] = Field(default_factory=list)
 
 
 _SCOPE_KEYS = ("section", "table_label", "page_index", "doc_id")
 _SOURCE_SECTIONS = {"methods": "Methods", "results": "Results"}
+_EMPIRICAL_RESULT = re.compile(
+    r"\b(?:evaluation results?|experimental results?|experiment(?:s)? show|measured (?:effect|performance)|"
+    r"observed (?:effect|outcome|failure)|performance (?:gains?|improvement|drop)|outperform\w*|"
+    r"(?:accuracy|recall|error rate|latency)\s+(?:increas\w*|decreas\w*|improv\w*|fell|rose))\b"
+    r"|评估结果|实验结果|实测|性能增益|优于基线|准确率(?:提高|下降)|误差率(?:提高|下降)", re.I,
+)
+_FAILURE_SUBJECT = re.compile(r"\b(?:limitations?|failures?|errors?)\b|局限|错误|失败", re.I)
+_FAILURE_HEADING = re.compile(r"\b(?:errors?|failures?)\b|错误|失败", re.I)
+_FAILURE_QUERY = "evaluation failure cases and error categories"
+_MAIN_RESULT_QUERY = re.compile(r"\b(?:main|primary|overall)\b|主要|总体", re.I)
+_MAIN_RESULT_HEADING = re.compile(
+    r"^(?:\d+(?:\.\d+)*[.)]?\s+)?(?P<title>(?:(?:main|experimental) )?results(?: and discussion)?"
+    r"|(?:主要|实验)?结果(?:与讨论)?)[：:]?$", re.I,
+)
+_RESULT_HEADING = re.compile(r"\b(?:results?|evaluation|experiments?|ablation|analysis)\b|结果|评估|实验|分析", re.I)
+_SCOPE_HEADING = re.compile(r"\b(?:methods?|setup|datasets?|participants?|tasks?)\b|方法|设置|数据集|任务", re.I)
 _TABLE_QUERY = re.compile(r"(?<![A-Za-z0-9])(?:table|tab\.)\s*([A-Za-z]*\d+)|表\s*([A-Za-z]*\d+)", re.I)
 _PAGE_QUERY = re.compile(r"(?:\b(?:page|p\.)\s*(\d+)|第\s*(\d+)\s*页)", re.I)
 _SECTION_QUERY = re.compile(
@@ -213,6 +244,8 @@ def targeted_evidence(
             result = index.search(query, limit=limit, doc_id=target["doc_id"],
                                   followup=True, prior_ids=prior_ids, passage_query=proof_query)
             scope = {**result["scope"], "mode": "ranked"}
+        if source.get("source_kind"):
+            scope["source_kind"] = source["source_kind"]
         scopes.append({**scope, "query": source["query"], "requirement": source.get("requirement")})
         paths.extend(result.get("paths", []))
         primary.append(result["evidence"])
@@ -247,7 +280,9 @@ def _field_key(value: str) -> str:
 
 def _pending_targets(output, requirements: list[str], documents, *, initial_queries: Iterable[str] = ()) -> list[dict]:
     proposals = [target.model_dump() for target in getattr(output, "follow_up_targets", [])]
-    proposals.extend(output.follow_up_queries)
+    typed = normalize_targets(proposals, documents, initial_queries=initial_queries)
+    represented = {_field_key(target["query"]) for target in typed}
+    proposals = [*typed, *(query for query in output.follow_up_queries if _field_key(query) not in represented)]
     # If the model calls the field missing, an explicitly named source in its original requirement
     # gives the controller a direct review path even without a proposed retrieval query.
     missing = {_field_key(field) for field in output.missing_fields}
@@ -291,6 +326,89 @@ def _coverage(requirements: list[str], output, scopes: list[dict], sent: list[st
                         "checked_sources": [scope["locations"] for scope in direct],
                         "unreadable_locations": unreadable})
     return covered
+
+
+def _requires_empirical_support(claim: dict) -> bool:
+    if claim["kind"] in {"quantitative", "causal"}:
+        return True
+    if claim["kind"] not in {"result", "scope"}:
+        return False
+    typed = claim.get("empirical_result")
+    return typed if type(typed) is bool else bool(_EMPIRICAL_RESULT.search(claim["proposition"]))
+
+
+def _empirical_support_blocker(
+    output: ScopedJudgement, sent: list[str], scoped: dict[str, dict], documents: Iterable[dict],
+) -> str | None:
+    proof = output.empirical_support
+    if proof is None:
+        return "missing_empirical_support"
+    if proof.result_source == "summary":
+        return "summary_only_result"
+    result = set(proof.result_evidence_ids)
+    scope = set(proof.scope_evidence_ids)
+    if proof.result_source != "direct_result" or not result:
+        return "missing_observed_result"
+    if proof.same_study_and_scope != "same" or not scope:
+        return "unconfirmed_tested_scope"
+    anchors = result | scope
+    if not set(sent).issuperset(anchors):
+        return "ungrounded_empirical_support"
+    used = {_document_key(scoped[eid]) for eid in anchors}
+    if len(used) > 1:
+        doc_ids = {doc_id for doc_id, _ in used}
+        primary = {doc["doc_id"] for doc in documents if doc.get("role") == "main"}
+        supplements = {doc["doc_id"] for doc in documents if doc.get("role") == "supplement"}
+        if (len(used) != len(doc_ids) or len(primary) != 1 or not primary <= doc_ids
+                or not doc_ids <= primary | supplements):
+            return "unconfirmed_tested_scope"
+    if not any(group.role == "support" and set(group.evidence_ids).issuperset(anchors)
+               for group in output.evidence_groups):
+        return "unlinked_result_and_scope"
+    return None
+
+
+def _empirical_followup(claim: dict, blocker: str, hints: list[dict]) -> dict | None:
+    """Use real printed headings for one bounded check if the judge stops early."""
+    if blocker == "unconfirmed_tested_scope":
+        choices = ((_SCOPE_HEADING, "tested models tasks comparator and study conditions", "methods"),)
+    elif blocker in {"missing_empirical_support", "summary_only_result", "missing_observed_result"}:
+        choices = ((_RESULT_HEADING, "observed outcomes and measured comparisons", "results"),)
+        if _FAILURE_SUBJECT.search(claim["proposition"]):
+            choices = ((_FAILURE_HEADING, _FAILURE_QUERY, "results"), *choices)
+    else:
+        return None
+    for pattern, focus, kind in choices:
+        for hint in hints:
+            matching = next((title for title in hint["headings"] if pattern.search(title)), None)
+            if matching:
+                field = "Tested study scope" if kind == "methods" else "Observed empirical result"
+                return {"query": f"{matching} {focus}", "requirement": field, "source_kind": kind,
+                        "doc_id": hint["doc_id"], "page_index": hint["page_index"]}
+    return None
+
+
+def _empirical_context_query(claim: dict, scope: dict, documents: Iterable[dict]) -> str | None:
+    """Use a printed heading as a second retrieval cue within the requested results page."""
+    if scope.get("source_kind") != "results" or scope.get("section") or scope.get("page_index") is None:
+        return None
+    for document in documents:
+        if document["doc_id"] != scope["doc_id"]:
+            continue
+        for page in document.get("pages", ()):
+            if page["page_index"] != scope["page_index"]:
+                continue
+            headings = [title for title in page.get("source_headings", ())
+                        if isinstance(title, str) and 0 < len(title) <= 100]
+            if _FAILURE_SUBJECT.search(claim["proposition"]):
+                failure_heading = next((title for title in headings if _FAILURE_HEADING.search(title)), None)
+                if failure_heading:
+                    return f"{failure_heading} {_FAILURE_QUERY}"
+            if _MAIN_RESULT_QUERY.search(scope["query"]):
+                for title in headings:
+                    if match := _MAIN_RESULT_HEADING.fullmatch(title):
+                        return match["title"]
+    return None
 
 
 def _contradiction_error(output: ScopedJudgement, sent: list[str]) -> str | None:
@@ -500,7 +618,49 @@ def blind_evidence(evidence: list[dict]) -> list[dict]:
 def validate_ids(ids: list[str], evidence: Iterable[dict]) -> None:
     allowed = {item["evidence_id"] for item in evidence}
     if not allowed.issuperset(ids):
-        raise ModelUnavailable("model cited evidence outside the supplied scope")
+        raise InvalidJudgeReference("model cited evidence outside the supplied scope")
+
+
+def _checked_judgement(
+    output: ScopedJudgement, material: dict, sent_ids: list[str], scoped: dict[str, dict],
+) -> tuple[ScopedJudgement, list[str], list[dict]]:
+    """Resolve explicit inclusive citations within a single displayed body span."""
+    allowed = {eid: scoped[eid] for eid in sent_ids}
+    resolved = []
+    if output.evidence_ranges:
+        spans = [tuple(group["evidence_ids"]) for group in material.get("body_passages", ())]
+        spans.extend(tuple(line[0] for line in group["lines"]) for group in material.get("body_context", ()))
+        windows = []
+        for span in spans:
+            unique = set(span)
+            if len(unique) != len(span) or not unique <= allowed.keys():
+                continue
+            records = [allowed[eid] for eid in span]
+            if (all(record.get("kind") == "body_text" for record in records)
+                    and len({EvidenceIndex._line_location(record) for record in records}) == 1):
+                windows.append(span)
+        groups = list(output.evidence_groups)
+        for request in output.evidence_ranges:
+            first, last = request.start_evidence_id, request.end_evidence_id
+            matches = set()
+            for span in windows:
+                if first in span and last in span:
+                    start, end = span.index(first), span.index(last)
+                    if start <= end:
+                        matches.add(span[start:end + 1])
+            if len(matches) != 1:
+                raise InvalidJudgeReference("model selected an invalid or ambiguous citation range in the supplied body spans")
+            ids = list(matches.pop())
+            group = EvidenceGroup(role=request.role, evidence_ids=ids)
+            if group not in groups:
+                groups.append(group)
+            trace = {**request.model_dump(), "evidence_ids": ids}
+            if trace not in resolved:
+                resolved.append(trace)
+        output = output.model_copy(update={"evidence_groups": groups})
+    ids = list(dict.fromkeys(eid for group in output.evidence_groups for eid in group.evidence_ids))
+    validate_ids(ids, allowed.values())
+    return output, ids, resolved
 
 
 def _sent_paths(paths: list[dict], sent_ids: list[str]) -> list[dict]:
@@ -659,8 +819,11 @@ def review_claim(
         examined_scopes.extend(results["scopes"])
         for scope in results["scopes"]:
             if scope["mode"] == "direct" and scope["matching_count"] and scope["table_label"] is None:
+                query = _empirical_context_query(claim, scope, documents) if empirical else None
+                if query and query != scope["query"]:
+                    scope["body_context_query"] = query
                 inspected_body_windows.extend(index.ranked_body_context(
-                    [scope["query"]], doc_id=scope["doc_id"], doc_version_id=scope["doc_version_id"],
+                    [query or scope["query"]], doc_id=scope["doc_id"], doc_version_id=scope["doc_version_id"],
                     page_index=scope["page_index"], section=scope["section"],
                 ))
         remember(results)
@@ -698,6 +861,7 @@ def review_claim(
         return list(ordered)
 
     initial_queries = (claim["support_query"], claim["counter_query"])
+    empirical = _requires_empirical_support(claim)
     gather(initial_queries)
     body_windows = []
     if model is None or claim["kind"] not in {"background", "purpose"}:
@@ -757,6 +921,7 @@ def review_claim(
                         "An unreported instrument or operational detail can be optional for a directly stated qualitative "
                         "contradiction. An explicit population, model, intervention, comparator, or claim condition is essential. "
                         "If scope or another decisive condition is unresolved, request up to two follow_up_targets. "
+                        "Use an empty follow_up_queries list when supplying structured targets. "
                         "Name the exact missing field and target the outcome, comparator, setup, or failure mechanism "
                         "using source terms. Specify a source or refine the initial query to trigger a fresh search. "
                         "For universal negatives, search for a "
@@ -764,7 +929,21 @@ def review_claim(
                         "results or proof when relevant. Name a section, table or page when known. Ordinary ranked "
                         "search is not a complete inspection."
                     )}
-        if not followup and (hints := _source_hints(documents, (claim["proposition"], *initial_queries))):
+        if empirical:
+            material["empirical_support_required"] = True
+            material["coverage_instructions"] += (
+                " To support an empirical claim, supply empirical_support. Identify the observed outcome or comparison "
+                "in result_evidence_ids, and the tested population, models, tasks, comparator or conditions in "
+                "scope_evidence_ids. Cite both in one support group. Classify result_source as direct_result only when "
+                "the anchors give a concrete original observation, analysis or measurement for the claimed effect. "
+                "A restatement of the claim or a summary of the authors' conclusions is summary. Use "
+                "same_study_and_scope=same when the cited tests cover the asserted scope. If a result or scope is missing, "
+                "request a targeted check of the actual results, error analysis or methods, naming the missing item. "
+                "For qualitative claims, match the tested scope and direction; an unstated effect size or unit is "
+                "supplementary if it cannot change either."
+            )
+        hints = _source_hints(documents, (claim["proposition"], *initial_queries)) if not followup else []
+        if hints:
             material["source_hints"] = hints
             material["coverage_instructions"] += (
                 " Source hints are navigation labels only. To follow a hint, use its doc_id and zero-based page_index "
@@ -794,6 +973,12 @@ def review_claim(
                 " Read body_context in line order. Each entry has an evidence ID and its source text when new. "
                 "For a bare ID, read the text already supplied under evidence, table_context or an earlier range."
             )
+        if passages or body_context:
+            material["coverage_instructions"] += (
+                " For one continuous citation, use evidence_ranges with a role and the inclusive start_evidence_id "
+                "and end_evidence_id in one displayed body passage or context span. Cite separate evidence in "
+                "individual evidence_groups."
+            )
         if claim.get("logic_review_required"):
             material["logic_review_required"] = True
             material["coverage_instructions"] += (
@@ -802,7 +987,10 @@ def review_claim(
             )
         material.update(figure_material(candidates, documents, data_dir))
         try:
-            output = model.call("judge", material, ScopedJudgement)
+            try:
+                output = model.call("judge", material, ScopedJudgement)
+            except InvalidJudgeReference:
+                output = None
             sent_candidate_ids = list(dict.fromkeys([
                 *(item["evidence_id"] for item in material["evidence"]),
                 *(item["evidence_id"] for group in table_context for item in group["evidence"]),
@@ -811,13 +999,14 @@ def review_claim(
             sent_body_context = body_context
             sent_passages = passages
             sent_table_context = table_context
-            ids = list(dict.fromkeys(eid for group in output.evidence_groups for eid in group.evidence_ids))
             try:
-                validate_ids(ids, scoped.values())
-            except ModelUnavailable:
-                output = model.call("judge", {**material, "retry": "Review the supplied IDs carefully."}, ScopedJudgement)
-                ids = list(dict.fromkeys(eid for group in output.evidence_groups for eid in group.evidence_ids))
-                validate_ids(ids, scoped.values())
+                if output is None:
+                    raise InvalidJudgeReference("model cited evidence outside the supplied scope")
+                output, ids, citation_ranges = _checked_judgement(output, material, sent_candidate_ids, scoped)
+            except InvalidJudgeReference:
+                output = model.call("judge", {**material, "retry": "Review the supplied IDs and citation ranges carefully."},
+                                    ScopedJudgement)
+                output, ids, citation_ranges = _checked_judgement(output, material, sent_candidate_ids, scoped)
         except ModelUnavailable as exc:
             finding = _pending(claim, str(exc))
             finding["retryable"] = isinstance(exc, ModelPaused)
@@ -825,6 +1014,9 @@ def review_claim(
 
         coverage = _coverage(requirements, output, examined_scopes, sent_candidate_ids)
         verdict = output.verdict
+        empirical_blocker = None
+        if empirical and (verdict == "supported" or (verdict == "pending" and output.empirical_support is not None)):
+            empirical_blocker = _empirical_support_blocker(output, sent_candidate_ids, scoped, documents)
         proof_error = proof_blocker = None
         if verdict == "refuted":
             proof_error = _contradiction_error(output, sent_candidate_ids)
@@ -832,6 +1024,10 @@ def review_claim(
         direct_proof = verdict == "refuted" and proof_blocker is None
         if not direct_proof and not followup:
             targets = _pending_targets(output, requirements, documents, initial_queries=initial_queries)
+            if not targets and empirical_blocker:
+                fallback = _empirical_followup(claim, empirical_blocker, hints)
+                if fallback is not None:
+                    targets = [fallback]
             if targets:
                 if reserve_followup is None or reserve_followup():
                     followup = True
@@ -864,13 +1060,16 @@ def review_claim(
             "searched_missing" in checked and checked <= {"found", "searched_missing"}
             and not follow_up_requested
         )
-        if (invalid_contradiction or (role and not (has_evidence and (decisive_fields_checked or direct_proof)))
+        if ((verdict == "supported" and empirical_blocker) or invalid_contradiction
+                or (role and not (has_evidence and (decisive_fields_checked or direct_proof)))
                 or (verdict == "insufficient" and not can_call_insufficient)
                 or (verdict == "manual_conflict" and not {"support", "refute"} <= conflicting)):
             verdict = "pending"
         status = verdict if verdict in {"pending", "manual_conflict"} else "completed"
         if invalid_contradiction:
             reason = f"The proposed refutation did not pass the evidence checks. Proposed assessment: {output.reason}"
+        elif empirical_blocker and output.verdict == "supported":
+            reason = f"The observed result and tested scope need further verification. Proposed assessment: {output.reason}"
         elif (output.verdict == "insufficient" or (role and not decisive_fields_checked)) and verdict == "pending":
             reason = f"Required sources have not been fully checked. Proposed assessment: {output.reason}"
         else:
@@ -879,10 +1078,16 @@ def review_claim(
                    "reason": reason, "evidence_ids": ids,
                    "evidence_groups": [group.model_dump() for group in output.evidence_groups],
                    "missing_fields": output.missing_fields, "coverage": coverage}
+        if citation_ranges:
+            finding["evidence_ranges"] = citation_ranges
         if direct_proof:
             finding["direct_contradiction"] = output.direct_contradiction.model_dump()
         elif output.verdict == "refuted" and status == "pending":
             finding["refutation_blocker"] = proof_blocker if has_evidence else "missing_refutation_evidence"
+        if empirical_blocker:
+            finding["empirical_support_blocker"] = empirical_blocker
+        elif empirical and verdict == "supported":
+            finding["empirical_support"] = output.empirical_support.model_dump()
         break
     candidate_ids = [item["evidence_id"] for item in candidates]
     finding["candidate_ids"] = candidate_ids
