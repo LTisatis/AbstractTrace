@@ -173,7 +173,7 @@
       {% if record.doc_id and loc.bbox %}
       <a class="anchor"{% if selected and selected.evidence_id == id %} aria-current="true"{% endif %}
          href="{{ request.url_for('view_run', run_id=run_id).include_query_params(version_id=version_id, evidence_id=id) }}#pdf-preview">
-        第 {{ loc.page_label or loc.page_number }} 页{% if record.kind == 'table_cell' %} · 表格{% elif loc.section %} · {{ loc.section }}{% endif %}
+        第 {{ loc.page_label or loc.page_number }} 页{% if record.kind == 'table_note' %} · 表注{% elif record.kind == 'table_cell' %} · {{ '表头' if record.cell_role in ['column_header', 'row_header'] else '表格' }}{% elif loc.section %} · {{ loc.section }}{% endif %}
       </a>
       {% else %}<span class="meta">{{ loc.section }} · 第 {{ loc.page_index + 1 }} 页</span>{% endif %}
     {% endif %}
@@ -243,7 +243,16 @@
               {% if finding.retrieval_paths %}
                 <details class="group"><summary>取证路径</summary>
                   <ul class="compact">
-                    {% for path in finding.retrieval_paths %}<li>{{ evidence_links(path.evidence_ids) }}</li>{% endfor %}
+                    {% for path in finding.retrieval_paths %}
+                    <li>
+                      {{ evidence_links(path.evidence_ids) }}
+                      {% for edge in path.edges %}
+                        <p class="meta">{{ {'row_header': '行表头', 'column_header': '列表头', 'table_note': '表注',
+                          'same_experiment': '同一实验', 'table_reference': '正文引用表格'}.get(edge.relation, edge.relation) }}</p>
+                        {{ evidence_links(edge.anchors|map(attribute='evidence_id')|list) }}
+                      {% endfor %}
+                    </li>
+                    {% endfor %}
                   </ul>
                 </details>
               {% endif %}
@@ -269,6 +278,7 @@
               {% if calculation.formula %}<code>{{ calculation.formula }}</code> = <strong>{{ calculation.result }}</strong> {{ {'percentage_points': '个百分点', 'percent': '%'}.get(calculation.unit, calculation.unit) }}
               {% else %}{{ calculation.reason|default(calculation.status) }}{% endif %}
               {{ evidence_links(calculation.evidence_ids|default([])) }}
+              {{ evidence_links(calculation.scope_evidence_ids|default([])) }}
             </li>
             {% endfor %}
           </ul>
@@ -394,6 +404,15 @@
             <div class="pdf"><img src="{{ preview_url }}" alt="第 {{ preview_page + 1 }} 页原文{% if selected %}，已高亮所选证据{% endif %}"></div>
             {% if selected %}<figcaption class="excerpt">{{ selected.text }}</figcaption>{% endif %}
           </figure>
+          {% if selected and (selected.row_header_evidence_id or selected.column_header_evidence_ids) %}
+            <p class="meta">表头</p>
+            {% if selected.row_header_evidence_id %}{{ evidence_link(selected.row_header_evidence_id) }}{% endif %}
+            {{ evidence_links(selected.column_header_evidence_ids|default([])) }}
+          {% endif %}
+          {% if selected and selected.note_evidence_ids %}
+            <p class="meta">表注</p>
+            {{ evidence_links(selected.note_evidence_ids) }}
+          {% endif %}
         {% else %}<p class="muted">当前报告没有可打开的 PDF 页。</p>{% endif %}
       </aside>
     </div>

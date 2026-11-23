@@ -38,6 +38,21 @@ _OBJECT_MENTION = re.compile(
     r"^\s*(?:(?:shows?|summari[sz]es?|illustrates?|presents?|reports?|lists?|gives?|contains?)\b|所示|显示|列出|给出)",
     re.I,
 )
+_NUMERIC_START = re.compile(r"^[+−-]?(?:\d|\.\d)")
+_DATA_NUMBER = re.compile(r"[+−-]?(?:\d+(?:\.\d+)?|\.\d+)\s*%?")
+_EXPERIMENT_REF = re.compile(
+    r"(?:(?<![a-z0-9])(?:experiment\s+|exp\.\s*)|实验(?:编号|号)?\s*)"
+    r"[:：#]?\s*([a-z]*\d+(?:[-.]\d+)*[a-z]?)(?![a-z0-9])", re.I,
+)
+_SHORT_MARKER = r"(?:[a-z]|\d{1,2})"
+_MARKER = rf"\({_SHORT_MARKER}\)|\[{_SHORT_MARKER}\]|\*{{1,3}}|†|‡|[⁰¹²³⁴⁵⁶⁷⁸⁹ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ]"
+_NOTE_MARKER = re.compile(rf"^\s*(?P<marker>{_MARKER})\s*(?:[:：.]\s*)?(?P<body>\S.*)$", re.I)
+_MARKED_VALUE = re.compile(rf"(?P<base>.*?)\s*(?P<marker>{_MARKER})\s*$", re.I)
+_NOTE_PREFIX = re.compile(r"^\s*(?:notes?|注释?|说明)\s*[:：.]\s*", re.I)
+_NAMED_NOTE = re.compile(
+    rf"^\s*(?:notes?\s+(?:for|to)\s+(?:table\s+|表\s*)(?P<first>{_OBJECT_LABEL})"
+    rf"|(?:table\s+|表\s*)(?P<second>{_OBJECT_LABEL})\s*(?:notes?\b|注释?))\s*[:：.]\s*", re.I,
+)
 _SECTION_HEADING = re.compile(
     r"^(?:(?:\d+(?:\.\d+)*|[IVX]+)[.)]?\s+)?"
     r"(?:introduction|background|related work|"
@@ -97,6 +112,9 @@ class _Cell:
     text: str
     row_header: str | None
     column_header: str | None
+    column_header_path: tuple[str, ...] = ()
+    column_header_cells: tuple[tuple[int, int], ...] = ()
+    role: str = "value"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +148,44 @@ def _bounded_box(rect, width: float, height: float) -> BBox | None:
     return x0, y0, x1, y1
 
 
+def _covers_column(outer: BBox, inner: BBox) -> bool:
+    return outer[0] <= inner[0] + 0.5 and outer[2] >= inner[2] - 0.5
+
+
+def _column_headers(
+    values: list[list[str | None]], grid: dict[tuple[int, int], BBox], width: int,
+) -> tuple[int, dict[int, tuple[tuple[int, int], ...]]]:
+    ordinary = {col: ((0, col),) for col in range(1, width) if (0, col) in grid and values[0][col]}
+    depth = next((row for row in range(1, min(5, len(values))) if any(
+        _NUMERIC_START.match(text.strip()) for text in values[row][1:] if text
+    )), 1)
+    if depth < 2 or any((depth, col) not in grid for col in range(1, width)):
+        return 1, ordinary
+
+    columns: dict[int, list[tuple[int, int]]] = {col: [] for col in range(1, width)}
+    merged = False
+    for level in range(depth):
+        anchors = [(level, col) for col in range(1, width) if (level, col) in grid and values[level][col]]
+        assigned = []
+        for col in columns:
+            options = [anchor for anchor in anchors if _covers_column(grid[anchor], grid[depth, col])]
+            if len(options) != 1:
+                return 1, ordinary
+            anchor = options[0]
+            if level:
+                upper = grid[columns[col][-1]]
+                lower = grid[anchor]
+                if not _covers_column(upper, lower) or upper[3] > lower[1] + 0.5:
+                    return 1, ordinary
+            columns[col].append(anchor)
+            assigned.append(anchor)
+        shared = len(set(assigned)) != len(assigned)
+        if level == depth - 1 and shared:
+            return 1, ordinary
+        merged = merged or shared
+    return (depth, {col: tuple(path) for col, path in columns.items()}) if merged else (1, ordinary)
+
+
 def _table_cells(page: pymupdf.Page, width: float, height: float) -> tuple[list[_Cell], list[BBox]]:
     rotation = page.rotation
     try:
@@ -146,22 +202,28 @@ def _table_cells(page: pymupdf.Page, width: float, height: float) -> tuple[list[
             table_box = _bounded_box(table.bbox, width, height)
             if table_box is None:
                 continue
+            grid = {
+                (row_index, column_index): box for row_index, row in enumerate(table.rows)
+                for column_index, rect in enumerate(row.cells)
+                if rect is not None and (box := _bounded_box(rect, width, height)) is not None
+            }
+            depth, columns = _column_headers(values, grid, table.col_count)
             previous_cell_count = len(cells)
-            for row_index, row in enumerate(table.rows):
-                for column_index, rect in enumerate(row.cells):
-                    value = values[row_index][column_index]
-                    if rect is None or value is None or not value.strip():
-                        continue
-                    bbox = _bounded_box(rect, width, height)
-                    if bbox is None:
-                        continue
-                    row_header = values[row_index][0] if row_index and column_index else None
-                    column_header = values[0][column_index] if row_index else None
-                    cells.append(_Cell(
-                        table_index, row_index, column_index, table.col_count, bbox, value.strip(),
-                        row_header.strip() if row_header else None,
-                        column_header.strip() if column_header else None,
-                    ))
+            for (row_index, column_index), bbox in grid.items():
+                value = values[row_index][column_index]
+                if value is None or not value.strip():
+                    continue
+                role = "column_header" if row_index < depth else "row_header" if column_index == 0 else "value"
+                row_header = values[row_index][0] if role == "value" else None
+                anchors = columns.get(column_index, ()) if role == "value" else ()
+                if anchors and not _covers_column(grid[anchors[-1]], bbox):
+                    anchors = ()
+                header_path = tuple(values[row][col].strip() for row, col in anchors)
+                cells.append(_Cell(
+                    table_index, row_index, column_index, table.col_count, bbox, value.strip(),
+                    row_header.strip() if row_header else None, header_path[-1] if header_path else None,
+                    header_path, anchors, role,
+                ))
             if len(cells) > previous_cell_count:
                 table_boxes.append(table_box)
         return cells, table_boxes
@@ -355,6 +417,14 @@ def _table_boxes(tables: dict[int, list[_Cell]]) -> dict[int, BBox]:
 
 
 def _header_signature(cells: list[_Cell]) -> tuple[str, ...] | None:
+    layered = {cell.column_index: " / ".join(cell.column_header_path)
+               for cell in cells if len(cell.column_header_path) > 1}
+    if layered:
+        stub = next((cell.text for cell in cells if cell.row_index == 0 and cell.column_index == 0), None)
+        if stub is None or len(layered) != cells[0].column_count - 1:
+            return None
+        paths = [stub, *(layered[col] for col in range(1, cells[0].column_count))]
+        return tuple(" ".join(unicodedata.normalize("NFKC", item).casefold().split()) for item in paths)
     headers = {
         cell.column_index: " ".join(unicodedata.normalize("NFKC", cell.text).casefold().split())
         for cell in cells if cell.row_index == 0
@@ -405,6 +475,106 @@ def _locate_table(entry: dict, label: _TableLabel) -> None:
         }
     if entry["evidence_id"] != label.caption_id:
         entry["caption_evidence_id"] = label.caption_id
+
+
+def _union_box(boxes: list[BBox]) -> BBox:
+    return (min(box[0] for box in boxes), min(box[1] for box in boxes),
+            max(box[2] for box in boxes), max(box[3] for box in boxes))
+
+
+def _experiment_refs(entry: dict, line: _Line | None = None) -> None:
+    if not (matches := list(_EXPERIMENT_REF.finditer(entry["text"]))):
+        return
+    spans = []
+    if line is not None:
+        offset = 0
+        for word in line.words:
+            end = offset + len(word.text)
+            spans.append((offset, end, word.bbox))
+            offset = end + 1
+    refs = []
+    for match in matches:
+        boxes = [box for start, end, box in spans if start < match.end() and end > match.start()]
+        refs.append({"experiment_id": match[1].casefold(), "text": match[0],
+                     "bbox": list(_union_box(boxes)) if boxes else entry["locator"]["bbox"]})
+    entry["experiment_refs"] = refs
+
+
+def _marker_key(marker: str) -> str:
+    return unicodedata.normalize("NFKC", marker).strip("()[]").casefold()
+
+
+def _parse_note(text: str) -> tuple[str | None, str | None] | None:
+    named = _NAMED_NOTE.match(text)
+    prefix = named or _NOTE_PREFIX.match(text)
+    body = text[prefix.end():] if prefix else text
+    label = (named["first"] or named["second"]).casefold() if named else None
+    if marked := _NOTE_MARKER.match(body):
+        return label, _marker_key(marked["marker"])
+    return (label, None) if prefix and body.strip() else None
+
+
+def _suffix(text: str) -> tuple[str, str] | None:
+    match = _MARKED_VALUE.fullmatch(text)
+    if not match or not (base := match["base"].strip()):
+        return None
+    return base, _marker_key(match["marker"])
+
+
+def _near_table_footer(note: dict, box: BBox) -> bool:
+    left, top, right, _ = note["locator"]["bbox"]
+    horizontal = min(right, box[2]) - max(left, box[0])
+    return horizontal >= 6 and 0 <= top - box[3] <= 32
+
+
+def _attach_notes(notes: list[tuple[dict, str | None, str | None]], cells: list[_Cell],
+                  entries: dict[tuple[int, int, int], dict], labels: dict[int, _TableLabel]) -> None:
+    by_table: dict[int, list[_Cell]] = defaultdict(list)
+    for cell in cells:
+        by_table[cell.table_index].append(cell)
+    boxes = _table_boxes(by_table)
+    bindings = []
+    for note, declared, marker in notes:
+        if declared is not None:
+            choices = [table for table, label in labels.items() if label.group_id and label.label.casefold() == declared]
+        else:
+            choices = [table for table, box in boxes.items() if _near_table_footer(note, box)]
+        if len(choices) == 1:
+            bindings.append((choices[0], note, marker))
+
+    duplicates = Counter((table, marker) for table, _, marker in bindings if marker is not None)
+    for table, note, marker in bindings:
+        table_cells = by_table[table]
+        marks = {(cell.row_index, cell.column_index): parsed for cell in table_cells
+                 if (parsed := _suffix(cell.text)) is not None and parsed[1] == marker}
+        if marker is not None and (not marks or duplicates[(table, marker)] > 1):
+            continue
+        note["kind"] = "table_note"
+        note["note_marker"] = marker
+        note["note_scope"] = "marked_cells" if marker is not None else "table"
+        note["locator"]["table_index"] = table
+        label = labels.get(table)
+        if label is not None:
+            _locate_table(note, label)
+        first = table_cells[0]
+        table_anchor = label.caption_id if label else entries[(table, first.row_index, first.column_index)]["evidence_id"]
+        for cell in table_cells:
+            if cell.role != "value":
+                continue
+            row, col = cell.row_index, cell.column_index
+            entry = entries[(table, row, col)]
+            anchor_id = table_anchor
+            if marker is not None:
+                anchored = next((position for position in ((row, col), (row, 0), *cell.column_header_cells)
+                                 if position in marks), None)
+                if anchored is None:
+                    continue
+                anchor_id = entries[(table, *anchored)]["evidence_id"]
+                if anchored == (row, col) and _DATA_NUMBER.fullmatch(marks[anchored][0]):
+                    entry["numeric_text"] = marks[anchored][0]
+            entry.setdefault("note_evidence_ids", []).append(note["evidence_id"])
+            entry.setdefault("note_links", []).append({"note_evidence_id": note["evidence_id"],
+                                                        "anchor_evidence_id": anchor_id, "marker": marker})
 
 
 def _panel_near_corner(marker: BBox, image: BBox) -> bool:
@@ -498,6 +668,7 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
         headings = []
         table_captions = []
         figure_captions = []
+        table_notes = []
         for line in lines:
             text = line.text
             if page_index < 2 and section is None and not collecting_abstract and not abstract_parts:
@@ -524,8 +695,11 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
             entry["word_spans"] = [{"text": word.text, "bbox": list(word.bbox)} for word in line.words]
             if page["status"] == "ocr":
                 entry["text_source"] = "ocr"
+            _experiment_refs(entry, line)
             evidence.append(entry)
-            if match := _caption(_TABLE_CAPTION, text):
+            if note := _parse_note(text):
+                table_notes.append((entry, *note))
+            elif match := _caption(_TABLE_CAPTION, text):
                 continued = match.group("prefix").startswith("续表") or bool(_TABLE_CONTINUED.search(text[match.end():]))
                 table_captions.append(_Caption(match.group("label"), line.bbox, entry, continued))
             if match := _caption(_FIGURE_CAPTION, text):
@@ -537,6 +711,7 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
             label.label.casefold(): label for label in table_labels.values()
             if label.group_id and counts[label.label.casefold()] == 1
         }
+        cell_entries = {}
         for cell in cells:
             cell_section = next(
                 (title for top, title in reversed(headings) if top <= cell.bbox[1]), page_start_section,
@@ -548,13 +723,26 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
             entry["locator"].update(
                 table_index=cell.table_index, row_index=cell.row_index, column_index=cell.column_index,
             )
+            entry["cell_role"] = cell.role
             if cell.row_header:
                 entry["row_header"] = cell.row_header
             if cell.column_header:
                 entry["column_header"] = cell.column_header
+            if cell.column_header_path:
+                entry["column_header_path"] = list(cell.column_header_path)
             if cell.table_index in table_labels:
                 _locate_table(entry, table_labels[cell.table_index])
+            _experiment_refs(entry)
+            cell_entries[(cell.table_index, cell.row_index, cell.column_index)] = entry
             evidence.append(entry)
+        for cell in cells:
+            entry = cell_entries[(cell.table_index, cell.row_index, cell.column_index)]
+            if cell.row_header and (header := cell_entries.get((cell.table_index, cell.row_index, 0))):
+                entry["row_header_evidence_id"] = header["evidence_id"]
+            if cell.column_header_cells:
+                entry["column_header_evidence_ids"] = [cell_entries[(cell.table_index, *position)]["evidence_id"]
+                                                       for position in cell.column_header_cells]
+        _attach_notes(table_notes, cells, cell_entries, table_labels)
         evidence.extend(_figures(doc_id, page, images, figure_captions, lines))
 
     return pages, " ".join(abstract_parts) or None, evidence
