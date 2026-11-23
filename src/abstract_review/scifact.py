@@ -34,6 +34,12 @@ def _positive_id(value: object, location: str) -> int:
     return value
 
 
+def _claim_id(value: object, location: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{location} must be a non-negative integer ID")
+    return value
+
+
 def _evidence_id(doc_id: int, index: int) -> str:
     return f"scifact:{doc_id}:{index}"
 
@@ -89,7 +95,7 @@ def prepare_scifact(corpus: Path, claims: Path, *, split: str, dataset_version: 
 
         selected, samples, labels, seen_claims = {}, [], [], set()
         for row in _jsonl(claims, raw_claims):
-            claim_id = _positive_id(row.get("id"), "claim id")
+            claim_id = _claim_id(row.get("id"), "claim id")
             text, cited, evidence = row.get("claim"), row.get("cited_doc_ids"), row.get("evidence")
             if claim_id in seen_claims:
                 raise ValueError(f"duplicate SciFact claim id {claim_id}")
@@ -140,7 +146,7 @@ def _load_inputs(manifest: object) -> tuple[dict, list[dict]]:
     for row in manifest["samples"]:
         if not isinstance(row, dict) or row.keys() != {"sample_id", "claim_id", "doc_id", "text"}:
             raise ValueError("a SciFact input sample may contain only sample_id, claim_id, doc_id, and text")
-        claim_id = _positive_id(row["claim_id"], "claim_id")
+        claim_id = _claim_id(row["claim_id"], "claim_id")
         doc_id = _positive_id(row["doc_id"], "doc_id")
         sample_id = row["sample_id"]
         if (sample_id != _sample_id(claim_id, doc_id) or sample_id in seen or doc_id not in documents

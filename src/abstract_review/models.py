@@ -101,6 +101,7 @@ class _JudgeWire:
             *(item["evidence_id"] for item in material.get("evidence", ())),
             *(item["evidence_id"] for group in material.get("table_context", ()) for item in group["evidence"]),
             *(line[0] for group in material.get("body_context", ()) for line in group["lines"] if len(line) == 2),
+            *(item["evidence_id"] for item in material.get("table_region", {}).get("evidence", ())),
         ))
         evidence = {eid: f"E{number}" for number, eid in enumerate(citable, 1)}
         documents = {}

@@ -183,3 +183,30 @@ def test_typed_target_replaces_legacy_duplicate_without_losing_second_check():
     targets = _pending_targets(output, claim["requirements"], ())
     assert [target["query"] for target in targets] == ["detector diagnostics", "deployment setup"]
     assert targets[0]["page_index"] == 2
+
+
+@pytest.mark.parametrize("comparable", [None, "uncertain", "same"])
+def test_comparative_emphasis_requires_verified_outcomes_under_two_conditions(comparable):
+    claim = empirical_claim(
+        proposition="Evaluation results show the detector's failures are especially frequent under high load.",
+        support_query="detector pulse failures", counter_query="detector pulse baseline", empirical_result=False,
+    )
+    proof = {"result_source": "direct_result", "result_evidence_ids": ["a", "b"],
+             "scope_evidence_ids": ["a"], "same_study_and_scope": "same"}
+    if comparable is not None:
+        proof["comparison"] = {
+            "focal_condition": "High load", "comparator_condition": "Normal load", "shared_outcome": "Missed pulses",
+            "focal_evidence_ids": ["a"], "comparator_evidence_ids": ["b"], "comparable": comparable,
+        }
+    model = Model(supported(claim, proof, ["a", "b"]))
+    records = [evidence("a", "The detector missed 12 pulses under high load."),
+               evidence("b", "The detector missed one pulse under normal load.")]
+    with closing(EvidenceIndex(records)) as index:
+        finding, _ = review_claim(claim, index, model, reserve_followup=lambda: False)
+    assert "empirical_support.comparison" in model.materials[0]["coverage_instructions"]
+    if comparable == "same":
+        assert finding["verdict"] == "supported"
+    else:
+        assert finding["review_status"] == "pending"
+        assert finding["stop_reason"] == "follow_up_budget"
+        assert finding["empirical_support_blocker"] == "unconfirmed_matched_comparison"

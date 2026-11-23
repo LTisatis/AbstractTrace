@@ -161,3 +161,18 @@ def test_context_uses_an_alternative_when_two_queries_rank_the_same_range_first(
     with closing(EvidenceIndex([*first, *second])) as index:
         lexical = index.ranked_body_context(queries)
         assert index.pack_body_context(lexical, []) == [first_group]
+
+
+def test_context_expands_contiguous_ranges_when_both_full_windows_do_not_fit():
+    lines = [_line(f"{topic}-{offset}", f"The {topic} source line is recorded.", 100 + 12 * offset, page=page)
+             for page, topic in enumerate(("vibration", "acoustic")) for offset in range(18)]
+    with closing(EvidenceIndex(lines)) as index:
+        windows = index.ranked_body_context(["vibration", "acoustic"])
+        groups = index.pack_body_context(windows, [])
+        assert len(groups) == 2
+        assert sum(len(group["new_evidence_ids"]) for group in groups) == 24
+        for group, window in zip(groups, windows, strict=True):
+            ids = group["evidence_ids"]
+            anchor = window.expanded_ids.index(ids[0])
+            assert tuple(ids) == window.expanded_ids[anchor:anchor + len(ids)]
+            assert set(ids).issuperset(window.evidence_ids)

@@ -51,6 +51,8 @@ _CONTEXT_WINDOW_LINES = 8
 _CONTEXT_MAX_LINES = 24
 _CONTEXT_MAX_CHARS = 1800
 _CONTEXT_SHORTLIST = 12
+_TABLE_REGION_CELLS = 12
+_TABLE_REGION_CHARS = 800
 _SUMMARY_SECTION = re.compile(r"^(?:abstract|introduction|conclusions?|摘要|引言|结论)(?:\b|$)")
 _LINE_END = re.compile(r"[.!?。！？][\"'”’）)】\]]*$")
 _ABBREVIATION_END = re.compile(r"\b(?:e\.g|i\.e|et al|fig|eq|ref|no|vs|pp|vol|dr|prof)\.$", re.IGNORECASE)
@@ -860,8 +862,22 @@ class EvidenceIndex:
             chars -= text_length
             return True
 
+        def expand(window: _ContextWindow) -> tuple[str, ...]:
+            expanded = window.expanded_ids
+            start = expanded.index(window.evidence_ids[0])
+            stop = start + len(window.evidence_ids)
+            left, right = 0, len(expanded)
+            while left < start or right > stop:
+                if reserve(expanded[left:right]):
+                    return expanded[left:right]
+                if start - left >= right - stop:
+                    left += 1
+                else:
+                    right -= 1
+            return window.evidence_ids
+
         cores = [window for window in windows if reserve(window.evidence_ids)]
-        units = [window.expanded_ids if reserve(window.expanded_ids) else window.evidence_ids for window in cores]
+        units = [expand(window) for window in cores]
         groups = []
         for unit in units:
             fresh = [eid for eid in unit if eid not in primary]
@@ -875,6 +891,10 @@ class EvidenceIndex:
     ) -> tuple[list[str], list[str]]:
         exact, query_without_exact = _exact_terms(query)
         lexical = _terms(query_without_exact if exact else query)
+        table_labels = {term for term in exact if term.startswith("table:")}
+        focus = self._table_focus(table_labels, lexical, exact - table_labels, active)
+        if focus:
+            exact -= table_labels
         ranks = {
             "lexical": self._lexical_rank(lexical, active),
             "exact": self._rank(self._exact, exact, active),
@@ -887,14 +907,30 @@ class EvidenceIndex:
                 scores[eid] += 1 / (60 + rank)
         shortlist = sorted(scores, key=lambda eid: (-scores[eid], eid))[:_MAX_CANDIDATES]
         channels = list(ranks)
+        if focus:
+            shortlist = list(dict.fromkeys((*focus, *shortlist)))[:_MAX_CANDIDATES]
+            channels.append("table_region")
         passage_seeds = self._passage_seeds(query, active, limit) if passage_query else []
         if passage_seeds:
             shortlist = list(dict.fromkeys((*passage_seeds, *shortlist)))[:_MAX_CANDIDATES]
             channels.append("passage")
         if self._reranker is not None and shortlist:
-            shortlist = self._rerank(query, shortlist, active, set(ranks["exact"]) | set(passage_seeds))
+            protected = set(ranks["exact"]) | set(passage_seeds) | set(focus)
+            shortlist = self._rerank(query, shortlist, active, protected)
             channels.append("reranker")
         return shortlist, channels
+
+    def _table_focus(self, labels: set[str], lexical: set[str], exact: set[str], active: set[str]) -> list[str]:
+        """Use a named table as a region, then rank the cells by the rest of the query."""
+        if len(labels) != 1 or not (lexical or exact):
+            return []
+        label, = labels
+        region = active & self._named_tables.get(label.removeprefix("table:"), set())
+        if not region:
+            return []
+        exact_hits = self._rank(self._exact, exact, region)
+        lexical_hits = self._lexical_rank(lexical, region)
+        return list(dict.fromkeys((*exact_hits, *lexical_hits)))[:4]
 
     def _rerank(self, query: str, ranked: list[str], active: set[str], exact: set[str]) -> list[str]:
         if self._reranker is None:
@@ -1163,6 +1199,62 @@ class EvidenceIndex:
                 by_seed[seed_id] = list(ids)
                 all_ids.update(ids)
         return {"evidence": self.get(all_ids), "paths": paths, "by_seed": by_seed}
+
+    def referenced_table_region(self, query: str, source_ids: Iterable[str], known_ids: Iterable[str]) -> dict | None:
+        """Retrieve a bounded region of one verified same-page table referenced in the source text."""
+        known = set(known_ids)
+        for source_id in dict.fromkeys(source_ids):
+            source = self._records[source_id]
+            if source.get("kind") != "body_text" or not _TABLE_REFERENCE.search(_normalize(source["text"])):
+                continue
+            tables = self._referenced_page_tables(source_id)
+            if len(tables) != 1:
+                continue
+            table, = tables
+            cells = self._ranked_table_rows(query, self._table_indexes[table], known)
+            if cells:
+                return {"reference_evidence_id": source_id, "evidence": self.get(cells)}
+        return None
+
+    def _referenced_page_tables(self, source_id: str) -> set[tuple]:
+        source = self._records[source_id]
+        page_key = _document_key(source), source["locator"]["page_index"]
+        targets = [edge.target_id for edge in self._graph[source_id]
+                   if edge.relation == "table_reference" and edge.anchors[0] == source_id]
+        tables = set()
+        for target in targets:
+            record = self._records[target]
+            if record.get("kind") == "table_cell":
+                neighbors = [target]
+            else:
+                neighbors = [edge.target_id for edge in self._graph[target] if edge.relation == "table_caption"
+                             and self._records[edge.target_id].get("kind") == "table_cell"]
+            tables.update(table for eid in neighbors if (table := _table_key(self._records[eid])) and table[:2] == page_key)
+        return tables
+
+    def _ranked_table_rows(self, query: str, cell_ids: list[str], known: set[str]) -> list[str]:
+        coordinates = {eid: position for eid in cell_ids if (position := _cell_position(self._records[eid])) is not None}
+        if len(set(coordinates.values())) != len(coordinates):
+            return []
+        ranked, _ = self._query_rank(query, set(coordinates))
+        rows = defaultdict(list)
+        for eid, (row, _) in sorted(coordinates.items(), key=lambda entry: entry[1]):
+            rows[row].append(eid)
+        selected = {}
+        remaining = _TABLE_REGION_CHARS
+        for seed in ranked:
+            row, _ = coordinates[seed]
+            related = [edge.target_id for edge in sorted(self._graph[seed], key=self._edge_order)
+                       if edge.relation in _TABLE_CONTEXT]
+            unit = dict.fromkeys([*rows[row], *related])
+            for group in (unit, dict.fromkeys([seed, *related])):
+                fresh = [eid for eid in group if eid not in known and eid not in selected]
+                size = sum(len(self._records[eid]["text"]) for eid in fresh)
+                if len(selected) + len(fresh) <= _TABLE_REGION_CELLS and size <= remaining:
+                    selected.update(dict.fromkeys(fresh))
+                    remaining -= size
+                    break
+        return list(selected)
 
     def search(
         self, query: str, *, limit: int = 8, section: str | None = None, expand: bool = True,

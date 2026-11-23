@@ -58,6 +58,40 @@ _DETERMINED_PROCEDURE_OBJECT = re.compile(
 )
 _APPLIED_DETECTOR = re.compile(r"[\w-]+[ \t]+(?:to detect|for (?:the )?detection of)\b", re.I)
 _MANUAL_CORRECTION = re.compile(r"manually[ \t]+corrected[ \t]+false[ \t]+positives", re.I)
+_REPORTING_PREFIX = re.compile(
+    r"(?P<prefix>we\s+(?:also\s+)?(?:demonstrate|(?:fi|ﬁ)nd|observe|report|show)"
+    r"(?:\s+|\s*—[^—.!?]+—\s*)that\s+)", re.I,
+)
+_REPORTED_PREDICATE = re.compile(
+    r"(?P<subject>[\w’'-]+(?:\s+[\w’'-]+){0,7}?)\s+"
+    r"(?:(?:also|better|further|significantly)\s+)?"
+    r"(?:acts?|aligns?|changes?|causes?|decreases?|functions?|improves?|increases?|leads?|prevents?|reduces?|regularizes?|"
+    r"results?|serves?|worsens?)\s+\S", re.I,
+)
+_LOCAL_ROLE = re.compile(r"(?P<subject>[\w-]+)\s+(?:acts|functions|serves)\s+as\s+(?:an?\s+)?[\w-]+(?:\s+[\w-]+){0,3}", re.I)
+_ROLE_LINK = re.compile(r"\b(?:against|at|by|for|from|in|of|on|to|via|with)\b", re.I)
+_REMOVAL = re.compile(r"^(?P<action>ablating|disabling|omitting|removing)\s+it\b", re.I)
+_REPORT_JOIN = re.compile(r",\s+and\s+|\s+and\s+", re.I)
+_LIMITED_REPORTED_SCOPE = re.compile(r"\b(?:although|and|because|but|either|if|neither|nor|or|since|unless|whereas|while)\b", re.I)
+_NON_ASSERTED_REPORT = re.compile(r"\b(?:deny|doubt|if|question|whether)\b", re.I)
+_TRAILING_CLAUSE_SCOPE = re.compile(r",\s*(?:when|where|provided|unless|under)\b", re.I)
+_MEASUREMENT = r"\d+(?:\.\d+)?\s*%"
+_CHANGE = r"\d+(?:\.\d+)?\s*(?:%|percentage points?)"
+_ABSOLUTE_AND_RELATIVE = re.compile(
+    r"(?:(?P<evaluation>we\s+(?:assess|evaluate|test)\s+[^,;.!?]+),\s+and\s+)?"
+    r"(?P<absolute>(?P<subjects>[^,;.!?]+?)\s+(?P<verb>achieve|attain|obtain|record)\s+"
+    rf"(?:(?:an?\s+)?(?:average|mean)\s+of\s+)?{_MEASUREMENT}\s+and\s+{_MEASUREMENT}\s+"
+    r"(?P<metric>[\w’'-]+(?:\s+[\w’'-]+){0,5}?)\s+respectively),\s+"
+    rf"(?P<relative>(?P<delta>(?:an?\s+)?{_CHANGE}\s+and\s+{_CHANGE}\s+"
+    r"(?:gains?|improvements?|increases?))\s+(?P<baseline>(?:compared\s+(?:to|with)|over)\s+[^,;.!?]+))"
+    r"[.!?]?", re.I,
+)
+_SHARED_EXCEPTION = re.compile(
+    r"(?P<prefix>[^;!?]+?\bcannot\s+(?:capture|compute|detect|express|learn|model|predict|recognize|represent)\s+)"
+    r"(?P<left>[\w-]+(?:\s+[\w-]+){0,9}),\s+"
+    r"(?P<right_anchor>nor\s+(?P<right>[\w-]+(?:\s+[\w-]+){0,9})),\s+"
+    r"(?P<condition>unless\s+[^,;.!?]+)[.!?]?", re.I,
+)
 
 
 def _dataset_names(value: str, name_pattern: str) -> tuple[list[tuple[int, int, str]], str] | None:
@@ -115,7 +149,8 @@ def _dataset_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
 
 
 def _clause_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
-    if _UNSAFE_LOGIC.search(text) or re.search(r"\b(?:if|whether|because|than|whereas|with)\b|若|如果|因为", text, re.I):
+    if (_UNSAFE_LOGIC.search(text) or _TRAILING_CLAUSE_SCOPE.search(text)
+            or re.search(r"\b(?:if|whether|because|than|whereas|with)\b|若|如果|因为", text, re.I)):
         return None
     for match in _CLAUSE_JOIN.finditer(text):
         left = text[:match.start()].strip()
@@ -173,9 +208,69 @@ def shared_procedure_parts(text: str) -> tuple[list[tuple[int, int, str]], str] 
     ], "and"
 
 
+def _reported_conjunction_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
+    """Split two reported findings when both predicate boundaries are explicit."""
+    if not (report := _REPORTING_PREFIX.match(text)) or _UNSAFE_LOGIC.search(text):
+        return None
+    for connector in _REPORT_JOIN.finditer(text, report.end()):
+        left = text[report.end():connector.start()]
+        right = text[connector.end():]
+        if ("," in right or not _REPORTED_PREDICATE.match(left) or not _REPORTED_PREDICATE.match(right)
+                or _LIMITED_REPORTED_SCOPE.search(left) or _LIMITED_REPORTED_SCOPE.search(right)):
+            continue
+        if removal := _REMOVAL.match(right):
+            role = _LOCAL_ROLE.fullmatch(left)
+            if role is None or _ROLE_LINK.search(left):
+                return None
+            right = f"{removal['action']} {role['subject']}{right[removal.end():]}"
+        elif not connector[0].startswith(","):
+            # Without a clause delimiter the second noun may be part of the left object.
+            continue
+        return [
+            (report.end(), connector.start(), f"{report['prefix']}{left}"),
+            (connector.end(), len(text), f"{report['prefix']}{right}"),
+        ], "and"
+    return None
+
+
+def _absolute_and_relative_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
+    """Separate a matched pair of absolute measurements from its appositive comparison."""
+    match = _ABSOLUTE_AND_RELATIVE.fullmatch(text)
+    if not match or len(re.findall(r"\band\b", match["subjects"], re.I)) != 1:
+        return None
+    subjects = re.sub(r"\band\b", "", match["subjects"], flags=re.I)
+    if _UNSAFE_LOGIC.search(text) or _LIMITED_REPORTED_SCOPE.search(subjects) or _NEGATED_SHARED.search(subjects):
+        return None
+    evaluation = f"{match['evaluation']}, and " if match["evaluation"] else ""
+    return [
+        (*match.span("absolute"), f"{evaluation}{match['absolute']}"),
+        (*match.span("relative"),
+         f"{evaluation}{match['subjects']} {match['verb']} {match['delta']} in {match['metric']} {match['baseline']}"),
+    ], "and"
+
+
+def _shared_exception_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
+    """Keep a terminal exception on both simple objects of one negated verb."""
+    match = _SHARED_EXCEPTION.fullmatch(text)
+    if not match or any(_LIMITED_REPORTED_SCOPE.search(match[part]) for part in ("left", "right")):
+        return None
+    prefix = match["prefix"]
+    if (_UNSAFE_LOGIC.search(prefix) or _NEGATED_SHARED.search(prefix) or _NON_ASSERTED_REPORT.search(prefix)
+            or _UNSAFE_LOGIC.search(match["condition"][len("unless "):])):
+        return None
+    return [
+        (0, match.end("left"), f"{match['prefix']}{match['left']}, {match['condition']}"),
+        (*match.span("right_anchor"), f"{match['prefix']}{match['right']}, {match['condition']}"),
+    ], "and"
+
+
+def reported_compound_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
+    return _reported_conjunction_parts(text) or _absolute_and_relative_parts(text) or _shared_exception_parts(text)
+
+
 def offline_compound_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
     """Return exact operand ranges plus self-contained propositions for conservative patterns."""
-    return _dataset_parts(text) or shared_procedure_parts(text) or _clause_parts(text)
+    return _dataset_parts(text) or shared_procedure_parts(text) or reported_compound_parts(text) or _clause_parts(text)
 
 
 def requires_whole_sentence(text: str) -> bool:
@@ -188,15 +283,23 @@ def requires_whole_sentence(text: str) -> bool:
 
 
 def attach_compound(part: dict, atoms: list[dict], operator: str) -> None:
-    if operator not in {"and", "or"} or len(atoms) < 2 or _UNSAFE_LOGIC.search(part["text"]):
+    if operator not in {"and", "or"} or len(atoms) < 2:
         return
     atoms = sorted(atoms, key=lambda atom: (atom["start"], atom["end"]))
     if any(atom.get("compound") for atom in atoms) or len({atom["claim_id"] for atom in atoms}) != len(atoms):
         return
-    if (_POOLED.search(part["text"]) or _NEGATED_SHARED.search(part["text"])) and any(
-        not (_EN_CLAUSE.match(atom["text"]) or _CN_CLAUSE.match(atom["text"])) for atom in atoms
-    ):
-        return
+    text = part["text"]
+    unsafe = _UNSAFE_LOGIC.search(text)
+    pooled_or_negated = _POOLED.search(text) or _NEGATED_SHARED.search(text)
+    if unsafe or (pooled_or_negated and not all(
+        _EN_CLAUSE.match(atom["text"]) or _CN_CLAUSE.match(atom["text"]) for atom in atoms
+    )):
+        expected = _shared_exception_parts(text) if unsafe else _absolute_and_relative_parts(text)
+        observed = [
+            (atom["start"] - part["start"], atom["end"] - part["start"], atom["proposition"]) for atom in atoms
+        ]
+        if expected != (observed, operator):
+            return
     gaps = []
     for left, right in zip(atoms, atoms[1:]):
         if left["end"] > right["start"]:

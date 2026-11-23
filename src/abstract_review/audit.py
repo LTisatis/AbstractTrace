@@ -14,7 +14,7 @@ from pydantic import Field
 
 from .calculations import comparison_for_claim
 from .compound import (
-    aggregate_compound_findings, attach_compound, offline_compound_parts, requires_whole_sentence,
+    aggregate_compound_findings, attach_compound, offline_compound_parts, reported_compound_parts, requires_whole_sentence,
     shared_procedure_parts,
 )
 from .evidence import EvidenceIndex, _document_key, _terms, with_method_scope
@@ -46,11 +46,21 @@ class DirectContradiction(Schema):
     supplementary_fields: list[str]
 
 
+class MatchedComparison(Schema):
+    focal_condition: str
+    comparator_condition: str
+    shared_outcome: str
+    focal_evidence_ids: list[str]
+    comparator_evidence_ids: list[str]
+    comparable: Literal["same", "different", "uncertain"]
+
+
 class EmpiricalSupport(Schema):
     result_source: Literal["direct_result", "summary", "uncertain"]
     result_evidence_ids: list[str]
     scope_evidence_ids: list[str]
     same_study_and_scope: Literal["same", "different", "uncertain"]
+    comparison: MatchedComparison | None = None
 
 
 class CitationRange(Schema):
@@ -76,6 +86,12 @@ _EMPIRICAL_RESULT = re.compile(
     r"|评估结果|实验结果|实测|性能增益|优于基线|准确率(?:提高|下降)|误差率(?:提高|下降)", re.I,
 )
 _FAILURE_SUBJECT = re.compile(r"\b(?:limitations?|failures?|errors?)\b|局限|错误|失败", re.I)
+_COMPARATIVE_EMPHASIS = re.compile(
+    r"\b(?:especially|particularly|most pronounced)\s+(?:(?:so|pronounced|frequent|common|severe|strong|large|"
+    r"high|low|marked|clear)\s+)?(?:in|at|for|under|on|among|with|when)\b"
+    r"|(?:尤其|特别)(?:是|在|当|对于)", re.I,
+)
+_ABSENCE_CONDITION = re.compile(r"\b(?:without|never|neither|no longer)\b|未经过|无需", re.I)
 _FAILURE_HEADING = re.compile(r"\b(?:errors?|failures?)\b|错误|失败", re.I)
 _FAILURE_QUERY = "evaluation failure cases and error categories"
 _MAIN_RESULT_QUERY = re.compile(r"\b(?:main|primary|overall)\b|主要|总体", re.I)
@@ -339,6 +355,7 @@ def _requires_empirical_support(claim: dict) -> bool:
 
 def _empirical_support_blocker(
     output: ScopedJudgement, sent: list[str], scoped: dict[str, dict], documents: Iterable[dict],
+    *, comparison_required: bool = False,
 ) -> str | None:
     proof = output.empirical_support
     if proof is None:
@@ -365,11 +382,23 @@ def _empirical_support_blocker(
     if not any(group.role == "support" and set(group.evidence_ids).issuperset(anchors)
                for group in output.evidence_groups):
         return "unlinked_result_and_scope"
+    if comparison_required:
+        paired = proof.comparison
+        if paired is None:
+            return "unconfirmed_matched_comparison"
+        focal, comparator = _field_key(paired.focal_condition), _field_key(paired.comparator_condition)
+        if (paired.comparable != "same" or not focal or not comparator or focal == comparator
+                or not paired.shared_outcome.strip() or not paired.focal_evidence_ids or not paired.comparator_evidence_ids
+                or not result.issuperset((*paired.focal_evidence_ids, *paired.comparator_evidence_ids))):
+            return "unconfirmed_matched_comparison"
     return None
 
 
 def _empirical_followup(claim: dict, blocker: str, hints: list[dict]) -> dict | None:
     """Use real printed headings for one bounded check if the judge stops early."""
+    if blocker == "unconfirmed_matched_comparison":
+        return {"query": f"Matched outcome comparison between tested conditions {claim['support_query']}",
+                "requirement": "Comparable observed outcomes under both conditions", "source_kind": "results"}
     if blocker == "unconfirmed_tested_scope":
         choices = ((_SCOPE_HEADING, "tested models tasks comparator and study conditions", "methods"),)
     elif blocker in {"missing_empirical_support", "summary_only_result", "missing_observed_result"}:
@@ -567,7 +596,7 @@ def extract_claims(text: str, model=None) -> list[dict]:
         unsplit = (counts[sentence_id] == 1 and atom["kind"] not in {"background", "purpose"}
                    and atom["quote"].rstrip(".?!") == part["text"].rstrip(".?!"))
         if whole or unsplit:
-            split = shared_procedure_parts(part["text"])
+            split = shared_procedure_parts(part["text"]) or reported_compound_parts(part["text"])
             recovered = _compound_claims(part, split) if split else []
             if recovered:
                 result.update((member["claim_id"], member) for member in recovered)
@@ -608,11 +637,11 @@ def supplied_claims(source: tuple[tuple[str, str], ...]) -> list[dict]:
     return results
 
 
-def blind_evidence(evidence: list[dict]) -> list[dict]:
+def blind_evidence(evidence: list[dict], *, preserve_order: bool = False) -> list[dict]:
     permitted = {"evidence_id", "doc_id", "kind", "text", "locator", "row_header", "column_header",
                  "column_header_path", "cell_role", "note_marker", "note_scope"}
-    return [{key: item[key] for key in sorted(item.keys() & permitted)}
-            for item in sorted(evidence, key=lambda item: item["evidence_id"])]
+    ordered = evidence if preserve_order else sorted(evidence, key=lambda item: item["evidence_id"])
+    return [{key: item[key] for key in sorted(item.keys() & permitted)} for item in ordered]
 
 
 def validate_ids(ids: list[str], evidence: Iterable[dict]) -> None:
@@ -797,6 +826,7 @@ def review_claim(
     sent_body_context = []
     sent_passages = []
     sent_table_context = []
+    sent_table_region = None
     inspected_body_windows = []
     output = None
     stop = None
@@ -806,11 +836,11 @@ def review_claim(
         breadth.append([item["evidence_id"] for item in result["evidence"]])
         by_id.update((item["evidence_id"], item) for item in result["evidence"])
 
-    def gather(queries: Sequence[str]) -> None:
-        for query in dict.fromkeys(queries):
+    def gather(queries: Sequence[str], *, prefer_passage: bool = False) -> None:
+        for position, query in enumerate(dict.fromkeys(queries)):
             if not query.strip():
                 continue
-            result = index.search(query, limit=8)
+            result = index.search(query, limit=8, passage_query=prefer_passage and position == 0)
             examined_scopes.append({**result["scope"], "mode": "ranked"})
             remember(result)
 
@@ -861,8 +891,15 @@ def review_claim(
         return list(ordered)
 
     initial_queries = (claim["support_query"], claim["counter_query"])
+    proposition = claim["proposition"]
     empirical = _requires_empirical_support(claim)
-    gather(initial_queries)
+    comparison_required = bool(_COMPARATIVE_EMPHASIS.search(proposition)) and (
+        empirical or (claim["kind"] in {"result", "scope"} and bool(_EMPIRICAL_RESULT.search(proposition)))
+    )
+    empirical = empirical or comparison_required
+    # An explicit absence is a scope condition. Keep the ordinary support and counter lanes for it.
+    gather(initial_queries, prefer_passage=bool(documents) and claim["kind"] in {"method", "result", "scope"}
+           and not (_TABLE_QUERY.search(proposition) or _ABSENCE_CONDITION.search(proposition)))
     body_windows = []
     if model is None or claim["kind"] not in {"background", "purpose"}:
         body_windows = index.ranked_body_context(initial_queries)
@@ -895,12 +932,19 @@ def review_claim(
         body_ids = [eid for group in body_context for eid in group["new_evidence_ids"]]
         body_rows = {row["evidence_id"]: row for row in index.get(body_ids)}
         scoped.update(body_rows)
+        table_region = None
+        if documents and claim["kind"] not in {"background", "purpose"}:
+            source_ids = [item["evidence_id"] for item in candidates]
+            table_region = index.referenced_table_region(claim["support_query"], [*source_ids, *body_ids], scoped)
+            if table_region:
+                scoped.update((row["evidence_id"], row) for row in table_region["evidence"])
         if model is None:
             finding = _offline(claim, [*candidates, *body_rows.values()], comparison)
             sent_candidate_ids = list(scoped)
             sent_body_context = body_context
             sent_passages = passages
             sent_table_context = table_context
+            sent_table_region = table_region
             break
         if claim["kind"] in {"background", "purpose"}:
             finding = _pending(claim, "This sentence is outside original-paper result verification.")
@@ -942,6 +986,13 @@ def review_claim(
                 "For qualitative claims, match the tested scope and direction; an unstated effect size or unit is "
                 "supplementary if it cannot change either."
             )
+        if comparison_required:
+            material["coverage_instructions"] += (
+                " The highlighted condition makes a comparative claim. To support it, include empirical_support.comparison. "
+                "Identify both tested conditions and their shared outcome. Cite measured results for each condition, "
+                "with comparable model, task and metric. A reported comparison can cover both conditions in one anchor. "
+                "If the evidence covers only one condition or changes the comparison setup, request the missing result."
+            )
         hints = _source_hints(documents, (claim["proposition"], *initial_queries)) if not followup else []
         if hints:
             material["source_hints"] = hints
@@ -951,6 +1002,12 @@ def review_claim(
             )
         if table_context:
             material["table_context"] = table_context
+        if table_region:
+            material["table_region"] = {**table_region, "evidence": blind_evidence(table_region["evidence"], preserve_order=True)}
+            material["coverage_instructions"] += (
+                " table_region contains selected rows from the same-page table named in its reference. "
+                "Use the cell locators, headers and notes to check scope. The rows may cover only part of the table."
+            )
         if compound := claim.get("compound"):
             material["sentence_context"] = compound["text"]
             material["coverage_instructions"] += (
@@ -995,10 +1052,12 @@ def review_claim(
                 *(item["evidence_id"] for item in material["evidence"]),
                 *(item["evidence_id"] for group in table_context for item in group["evidence"]),
                 *body_ids,
+                *(item["evidence_id"] for item in (table_region or {}).get("evidence", ())),
             ]))
             sent_body_context = body_context
             sent_passages = passages
             sent_table_context = table_context
+            sent_table_region = table_region
             try:
                 if output is None:
                     raise InvalidJudgeReference("model cited evidence outside the supplied scope")
@@ -1016,7 +1075,11 @@ def review_claim(
         verdict = output.verdict
         empirical_blocker = None
         if empirical and (verdict == "supported" or (verdict == "pending" and output.empirical_support is not None)):
-            empirical_blocker = _empirical_support_blocker(output, sent_candidate_ids, scoped, documents)
+            empirical_blocker = _empirical_support_blocker(
+                output, sent_candidate_ids, scoped, documents, comparison_required=comparison_required,
+            )
+        elif comparison_required and verdict == "pending":
+            empirical_blocker = "unconfirmed_matched_comparison"
         proof_error = proof_blocker = None
         if verdict == "refuted":
             proof_error = _contradiction_error(output, sent_candidate_ids)
@@ -1068,6 +1131,8 @@ def review_claim(
         status = verdict if verdict in {"pending", "manual_conflict"} else "completed"
         if invalid_contradiction:
             reason = f"The proposed refutation did not pass the evidence checks. Proposed assessment: {output.reason}"
+        elif empirical_blocker == "unconfirmed_matched_comparison" and output.verdict == "supported":
+            reason = f"The comparison between tested conditions needs further verification. Proposed assessment: {output.reason}"
         elif empirical_blocker and output.verdict == "supported":
             reason = f"The observed result and tested scope need further verification. Proposed assessment: {output.reason}"
         elif (output.verdict == "insufficient" or (role and not decisive_fields_checked)) and verdict == "pending":
@@ -1087,7 +1152,7 @@ def review_claim(
         if empirical_blocker:
             finding["empirical_support_blocker"] = empirical_blocker
         elif empirical and verdict == "supported":
-            finding["empirical_support"] = output.empirical_support.model_dump()
+            finding["empirical_support"] = output.empirical_support.model_dump(exclude_none=True)
         break
     candidate_ids = [item["evidence_id"] for item in candidates]
     finding["candidate_ids"] = candidate_ids
@@ -1100,6 +1165,11 @@ def review_claim(
              "evidence_ids": [item["evidence_id"] for item in group["evidence"]]}
             for group in sent_table_context
         ]
+    if sent_table_region:
+        finding["table_region"] = {
+            "reference_evidence_id": sent_table_region["reference_evidence_id"],
+            "evidence_ids": [row["evidence_id"] for row in sent_table_region["evidence"]],
+        }
     if sent_passages:
         finding["body_passages"] = sent_passages
     if sent_body_context:

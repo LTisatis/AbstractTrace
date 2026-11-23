@@ -100,7 +100,7 @@ uv run abstract-review bench run --engine offline --input-manifest .review-data/
 uv run abstract-review bench score --dataset claimbench --predictions .review-data/claimbench/out/predictions.json --gold-manifest .review-data/claimbench/gold.json --output .review-data/claimbench/out/scores.json
 ```
 
-SciTabAlign 适配器读取作者发布的表格和单元格标注。运行器在给定表格内排列单元格，评分输出固定 K 的精确率、召回率和 F1，并单列空标注和越界坐标的覆盖情况。这个指标适用于本项目的候选排序。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
+SciTabAlign 适配器读取作者发布的表格和单元格标注。运行器在给定表格内排列单元格，评分输出固定 K 的精确率、召回率和 F1，并单列空标注和越界坐标的覆盖情况。`rationale_capacity_at_k` 同时报告可以放入前 K 位的完整组数量、这些组的实际命中率，以及单元格召回率的理论上限。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
 
 ```powershell
 uv run abstract-review bench prepare-scitabalign --annotations data/data.json --dataset-version author-release --output-dir .review-data/scitabalign

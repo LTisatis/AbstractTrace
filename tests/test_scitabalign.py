@@ -75,6 +75,36 @@ def test_score_uses_macro_cutoffs_and_preserves_excluded_case_counts(tmp_path):
     assert result["cases"][3]["gold_cells"] == []
 
 
+def test_capacity_diagnostics_separate_oversize_groups_and_missing_predictions(tmp_path):
+    grid = [(row, col) for row in range(3) for col in range(3)]
+    _, gold = prepare(tmp_path, [
+        annotation("oversize", [[row + 1, col + 1] for row, col in grid]),
+        annotation("complete", [[1, 1], [1, 2]]),
+        annotation("missing", [[1, 1], [1, 2]]),
+        annotation("empty", []),
+    ])
+    predictions = {"schema_version": 1, "predictions": [
+        prediction("oversize", grid[:8]), prediction("complete", [(0, 0), (0, 1)]),
+    ]}
+
+    result = score_scitabalign(predictions, gold)
+    by_capacity = result["rationale_capacity_at_k"]
+    assert by_capacity["1"]["eligible_complete_rationale_recall"] == {
+        "numerator": 0, "denominator": 0, "value": None,
+    }
+    assert by_capacity["1"]["eligible_macro_recall"] is None
+    assert by_capacity["8"]["complete_rationale_ceiling"] == {
+        "numerator": 2, "denominator": 3, "value": 2 / 3,
+    }
+    assert by_capacity["8"]["eligible_complete_rationale_recall"] == {
+        "numerator": 1, "denominator": 2, "value": 0.5,
+    }
+    assert by_capacity["8"]["eligible_macro_recall"] == 0.5
+    assert by_capacity["8"]["over_capacity_macro_recall"] == 8 / 9
+    assert by_capacity["8"]["macro_recall_ceiling"] == pytest.approx((2 + 8 / 9) / 3)
+    assert result["cell_retrieval_at_k"]["8"]["macro_complete_rationale"] == 1 / 3
+
+
 @pytest.mark.parametrize("cell_id", ["scitabalign:other:cell:1:2", "scitabalign:first:cell:1:3"])
 def test_scoring_rejects_foreign_or_out_of_range_candidate(tmp_path, cell_id):
     _, gold = prepare(tmp_path, [annotation("first", [[1, 3]])])

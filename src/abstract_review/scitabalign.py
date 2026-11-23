@@ -216,7 +216,14 @@ def score_scitabalign(predictions: object, gold: object) -> dict:
             ranked_count += int(prediction is not None)
             per_case = {str(k): _cell_scores(ranked, expected, k) for k in metrics}
             for k, totals in metrics.items():
-                totals.update(per_case[str(k)])
+                scores = per_case[str(k)]
+                totals.update(scores)
+                totals["recall_ceiling"] += min(k, len(expected)) / len(expected)
+                if len(expected) <= k:
+                    totals["eligible"] += 1
+                    totals["eligible_recall"] += scores["recall"]
+                else:
+                    totals["over_capacity_recall"] += scores["recall"]
         cases.append({"sample_id": sample_id, "claim_id": claim_id, "alignment_status": status,
                       "gold_cells": cells, "ranked_cells": [list(cell) for cell in ranked], "scores_at_k": per_case})
     if predicted.keys() - seen:
@@ -224,10 +231,24 @@ def score_scitabalign(predictions: object, gold: object) -> dict:
     if not cases:
         raise ValueError("SciTabAlign gold manifest has no samples")
     aligned = alignment["aligned"]
+    capacity = {}
+    for k, totals in metrics.items():
+        eligible = totals["eligible"]
+        over_capacity = aligned - eligible
+        capacity[str(k)] = {
+            "complete_rationale_ceiling": _ratio(eligible, aligned),
+            "eligible_complete_rationale_recall": _ratio(totals["complete_rationale"], eligible),
+            "eligible_macro_recall": totals["eligible_recall"] / eligible if eligible else None,
+            "over_capacity_macro_recall": (
+                totals["over_capacity_recall"] / over_capacity if over_capacity else None
+            ),
+            "macro_recall_ceiling": totals["recall_ceiling"] / aligned if aligned else None,
+        }
     return {"schema_version": 1, "dataset": _DATASET, "dataset_version": gold["dataset_version"],
             "source_sha256": gold["source_sha256"], "task": "given_table_cell_ranking", "alignment": dict(alignment),
             "alignment_coverage": _ratio(aligned, len(cases)), "prediction_coverage": _ratio(ranked_count, aligned),
             "cell_retrieval_at_k": {str(k): {f"macro_{metric}": totals[metric] / aligned if aligned else None
                                              for metric in ("precision", "recall", "f1", "complete_rationale")}
                                     for k, totals in metrics.items()},
+            "rationale_capacity_at_k": capacity,
             "cases": cases}
