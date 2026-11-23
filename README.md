@@ -104,12 +104,19 @@ uv run abstract-review bench run --engine offline --input-manifest .review-data/
 uv run abstract-review bench score --dataset claimbench --predictions .review-data/claimbench/out/predictions.json --gold-manifest .review-data/claimbench/gold.json --output .review-data/claimbench/out/scores.json
 ```
 
-SciTabAlign 适配器读取作者发布的表格和单元格标注。运行器在给定表格内排列单元格，评分输出固定 K 的精确率、召回率和 F1，并单列空标注和越界坐标的覆盖情况。`rationale_capacity_at_k` 同时报告可以放入前 K 位的完整组数量、这些组的实际命中率，以及单元格召回率的理论上限。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
+SciTabAlign 适配器读取作者发布的表格和单元格标注。默认在给定表格内离线排列单元格。启用 `--engine openai` 时，模型从给定断言、表题和完整表格中选择最多 8 个原始坐标。两种模式使用同一套选证评分，输出固定 K 的精确率、召回率和 F1，并单列空标注和越界金标。`rationale_capacity_at_k` 同时报告可以放入前 K 位的完整组数量、实际命中率和单元格召回率上限。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
 
 ```powershell
 uv run abstract-review bench prepare-scitabalign --annotations data/data.json --dataset-version author-release --output-dir .review-data/scitabalign
 uv run abstract-review bench run --dataset scitabalign --input-manifest .review-data/scitabalign/inputs.json --output-dir .review-data/scitabalign/out
 uv run abstract-review bench score --dataset scitabalign --predictions .review-data/scitabalign/out/predictions.json --gold-manifest .review-data/scitabalign/gold.json --output .review-data/scitabalign/out/scores.json
+```
+
+在线模式按批次累计请求和时间，并在 `run.json` 中记录进度和用量。用同一输入、模型及输出目录加上 `--resume` 可继续已有批次。与离线结果做配对比较时，两组使用同一输入清单和金标，分别写入输出目录。
+
+```powershell
+uv run abstract-review bench run --dataset scitabalign --engine openai --input-manifest .review-data/scitabalign/inputs.json --output-dir .review-data/scitabalign/online --max-requests 8 --max-seconds 180
+uv run abstract-review bench score --dataset scitabalign --predictions .review-data/scitabalign/online/predictions.json --gold-manifest .review-data/scitabalign/gold.json --output .review-data/scitabalign/online/scores.json
 ```
 
 PDF 批跑的 `run.json` 保留每篇的版本、修订、复算和调用用量。恢复批跑时复用同配置下已保存的记录。人工复核后，可以把标注单独交给评分器。

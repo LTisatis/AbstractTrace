@@ -1,4 +1,4 @@
-"""Given-table cell ranking over a local SciTabAlign release.
+"""Given-table cell ranking and model selection over a local SciTabAlign release.
 
 Source: https://github.com/Alab-NII/SciTabAlign. The released explanation
 coordinates use one-based rows and columns, including the column-name row.
@@ -15,14 +15,27 @@ from collections import Counter
 from contextlib import closing
 from pathlib import Path
 
+from pydantic import StrictInt
+
 from .evidence import EvidenceIndex, _MAX_CANDIDATES
-from .scoring import _DEFAULT_RANK_CUTOFFS, _identifier, _parse_predictions, _ratio, _rows
+from .models import ModelPaused, ModelUnavailable, Schema
+from .scoring import _DEFAULT_RANK_CUTOFFS, _identifier, _parse_predictions, _ratio, _rows, semantic_manifest_sha256
 from .table_ranking import rank_table_cells
 
 
 _DATASET = "scitabalign-cells"
 _STATUSES = ("aligned", "empty_explanation", "invalid_coordinates")
 _COORDINATE = re.compile(r"(0|[1-9][0-9]*):(0|[1-9][0-9]*)")
+_SELECTION_LIMIT = max(_DEFAULT_RANK_CUTOFFS)
+
+
+class _CellCoordinate(Schema):
+    row: StrictInt
+    column: StrictInt
+
+
+class _CellSelection(Schema):
+    cells: list[_CellCoordinate]
 
 
 def _sample_id(claim_id: str) -> str:
@@ -135,33 +148,85 @@ def _metadata(document: object) -> None:
         raise ValueError("invalid SciTabAlign source SHA-256")
 
 
-def run_scitabalign(manifest: object) -> list[dict]:
-    """Rank given-table cells offline through the shared evidence index."""
+def _load_inputs(manifest: object) -> list[dict]:
     _metadata(manifest)
     fields = {"sample_id", "claim_id", "paper_id", "table_id", "claim", "caption", "grid"}
     metadata = {"dataset", "dataset_version", "source_sha256"}
-    predictions = []
+    samples = []
     for (sample_id, claim_id), sample, _ in _rows(manifest, "samples", fields, set(), metadata):
         if sample_id != _sample_id(claim_id):
             raise ValueError("invalid SciTabAlign sample ID")
         _identifier(sample["paper_id"], "SciTabAlign paper_id")
         _identifier(sample["table_id"], "SciTabAlign table_id")
         _text(sample["caption"], "caption")
-        claim, grid = _text(sample["claim"], "claim"), sample["grid"]
+        _text(sample["claim"], "claim")
+        grid = sample["grid"]
         _shape(grid)
         if any(not isinstance(cell, str) for row in grid for cell in row):
             raise ValueError("SciTabAlign input grid may contain only text")
-        cells = _table_cells(sample, grid)
-        with closing(EvidenceIndex(cells)) as index:
-            seeds = [item["evidence_id"] for item in index.search(claim, limit=_MAX_CANDIDATES)["evidence"]]
-        selected = rank_table_cells(claim, cells, seeds, limit=max(_DEFAULT_RANK_CUTOFFS))
-        predictions.append({
-            "sample_id": sample_id, "claim_id": claim_id, "review_status": "pending", "verdict": None,
-            "evidence_ids": [], "candidate_ids": selected,
-            "stop_reason": "ranking_only",
-        })
-    if not predictions:
+        samples.append(sample)
+    if not samples:
         raise ValueError("SciTabAlign input manifest has no samples")
+    return samples
+
+
+def _offline_selection(sample: dict) -> tuple[list[str], str]:
+    cells = _table_cells(sample, sample["grid"])
+    with closing(EvidenceIndex(cells)) as index:
+        seeds = [item["evidence_id"] for item in index.search(sample["claim"], limit=_MAX_CANDIDATES)["evidence"]]
+    return rank_table_cells(sample["claim"], cells, seeds, limit=_SELECTION_LIMIT), "ranking_only"
+
+
+def _model_selection(sample: dict, model) -> tuple[list[str], str]:
+    material = {key: sample[key] for key in ("claim", "caption", "grid")}
+    choice = model.call("select_table_cells", {**material, "selection_limit": _SELECTION_LIMIT}, _CellSelection)
+    if not isinstance(choice, _CellSelection):
+        return [], "invalid_model_cell_selection"
+    coordinates = [[cell.row, cell.column] for cell in choice.cells]
+    shape = _shape(sample["grid"])
+    if (len(coordinates) > _SELECTION_LIMIT or any(not _within(cell, shape, first=0) for cell in coordinates)
+            or len(set(map(tuple, coordinates))) != len(coordinates)):
+        return [], "invalid_model_cell_selection"
+    reason = "model_cell_selection" if coordinates else "model_cell_selection_empty"
+    return [_cell_id(sample["sample_id"], row, column) for row, column in coordinates], reason
+
+
+def run_scitabalign(manifest: object, *, model=None, batch=None) -> list[dict]:
+    """Select up to eight given-table cells through the offline ranker or a supplied model."""
+    if batch is not None and model is None:
+        raise ValueError("SciTabAlign batch checkpoints are for model selection")
+    samples = _load_inputs(manifest)
+    predictions = []
+    for sample in samples:
+        sample_id, claim_id = sample["sample_id"], sample["claim_id"]
+        if batch is not None:
+            input_digest = semantic_manifest_sha256([batch.identity, sample])
+            if previous := batch.saved(sample_id, input_digest):
+                predictions.append(previous)
+                continue
+            batch.stop_reason = batch.exhaustion()
+            if batch.stop_reason is not None:
+                break
+            before, event_offset = batch.requests_used, len(model.events)
+        try:
+            selected, stop_reason = _offline_selection(sample) if model is None else _model_selection(sample, model)
+        except ModelUnavailable as exc:
+            if batch is None and isinstance(exc, ModelPaused):
+                raise
+            events = model.events[event_offset:] if batch is not None else []
+            request_failed = events and type(events[-1].get("status")) is int
+            if batch is not None and (isinstance(exc, ModelPaused) or request_failed):
+                reason = "model_cell_selection_paused" if isinstance(exc, ModelPaused) else "model_cell_selection_failed"
+                batch.pause(sample_id, input_digest, batch.requests_used - before, events, finding={"stop_reason": reason})
+                break
+            selected, stop_reason = [], "model_cell_selection_failed"
+        prediction = {
+            "sample_id": sample_id, "claim_id": claim_id, "review_status": "pending", "verdict": None,
+            "evidence_ids": [], "candidate_ids": selected, "stop_reason": stop_reason,
+        }
+        if batch is not None:
+            batch.record(sample_id, input_digest, prediction, batch.requests_used - before, model.events[event_offset:])
+        predictions.append(prediction)
     return predictions
 
 

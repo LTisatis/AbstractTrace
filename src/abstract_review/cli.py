@@ -182,8 +182,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
     results = []
     output_path = args.output_dir / "predictions.json"
     record_path = args.output_dir / "run.json"
-    online_scifact = args.dataset == "scifact" and args.engine == "openai"
-    checkpoints = args.output_dir / ("sample-checkpoints.sqlite3" if online_scifact else "sample-checkpoints.json")
+    online_dataset = args.engine == "openai" and args.dataset in {"scifact", "scitabalign"}
+    checkpoints = args.output_dir / ("sample-checkpoints.sqlite3" if online_dataset else "sample-checkpoints.json")
     files = {output_path.resolve(), record_path.resolve(), checkpoints.resolve(), args.input_manifest.resolve()}
     if len(files) != 4:
         raise ValueError("benchmark outputs and input manifest must use distinct files")
@@ -198,8 +198,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
         raise ValueError("local retrieval models require a PDF benchmark engine without --dataset")
     batch_limits = {key: value for key, value in (("max_requests", args.max_requests), ("max_seconds", args.max_seconds))
                     if value is not None}
-    if batch_limits and not online_scifact:
-        raise ValueError("benchmark-wide limits are available for online SciFact")
+    if batch_limits and not online_dataset:
+        raise ValueError("benchmark-wide limits are available for online SciFact and SciTabAlign")
 
     def finish(predictions: list[dict], configuration: dict, batch: dict | None = None) -> None:
         if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
@@ -224,23 +224,42 @@ def run_benchmark(args: argparse.Namespace) -> None:
         engine = args.engine or "offline"
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scifact-cited-abstracts"
-        if online_scifact:
+        if online_dataset:
             with scifact_checkpoint(checkpoints, manifest_hash, configuration, resume=args.resume, **batch_limits) as batch:
                 predictions = run_scifact(manifest, engine, args.model, batch=batch)
                 results.extend(batch.results)
                 finish(predictions, configuration, batch.summary(len(manifest["samples"])))
             return
         if args.resume:
-            raise ValueError("--resume is available for PDF benchmarks and online SciFact")
+            raise ValueError("--resume is available for PDF benchmarks and online SciFact or SciTabAlign")
         predictions = run_scifact(manifest, engine, args.model)
     elif args.dataset == "scitabalign":
         from .benchmark import benchmark_configuration
         from .scitabalign import run_scitabalign
 
-        if args.resume or args.engine not in {None, "offline"}:
-            raise ValueError("SciTabAlign cell ranking uses the offline engine without --resume")
-        configuration = benchmark_configuration("offline", args.model)
+        engine = args.engine or "offline"
+        configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scitabalign-cells"
+        if online_dataset:
+            from .models import ModelUnavailable, ResponsesModel
+            from .scifact import benchmark_checkpoint
+
+            max_output_tokens = 2048
+            configuration["max_output_tokens"] = max_output_tokens
+            with benchmark_checkpoint(checkpoints, manifest_hash, configuration, dataset="SciTabAlign",
+                                      resume=args.resume, include_request_usage=True, **batch_limits) as batch:
+                try:
+                    model = ResponsesModel(args.model, max_requests=batch.max_requests,
+                                           max_seconds=batch.remaining_seconds, previous_attempts=batch.requests_used,
+                                           before_call=batch.reserve, max_output_tokens=max_output_tokens)
+                except ModelUnavailable as exc:
+                    raise ValueError(str(exc)) from exc
+                predictions = run_scitabalign(manifest, model=model, batch=batch)
+                results.extend(batch.results)
+                finish(predictions, configuration, batch.summary(len(manifest["samples"])))
+            return
+        if args.resume:
+            raise ValueError("--resume is available for PDF benchmarks and online SciFact or SciTabAlign")
         predictions = run_scitabalign(manifest)
     elif args.engine:
         from .benchmark import benchmark_configuration, run_pdf_samples
@@ -475,15 +494,17 @@ def build_parser() -> argparse.ArgumentParser:
     run = bench_commands.add_parser("run", help="predict from an input-only manifest")
     run.add_argument("--input-manifest", type=Path, required=True)
     run.add_argument("--output-dir", type=Path, required=True)
-    run.add_argument("--engine", choices=("offline", "openai"), help="review a PDF or SciFact benchmark manifest")
+    run.add_argument("--engine", choices=("offline", "openai"), help="benchmark engine for PDF, SciFact or SciTabAlign")
     run.add_argument("--dataset", choices=("scifact", "scitabalign"), help="select a public benchmark adapter")
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     run.add_argument("--embed-model", type=Path, help="path to an installed local Sentence Transformers model")
     run.add_argument("--rerank-model", type=Path, help="path to an installed local CrossEncoder")
     run.add_argument("--resume", action="store_true",
-                     help="reuse completed checkpoints and resume matching paused PDF or online SciFact runs")
-    run.add_argument("--max-requests", type=int, help="total online SciFact provider attempts, including resumed runs (default: 8)")
-    run.add_argument("--max-seconds", type=int, help="total online SciFact elapsed seconds, including resumed runs (default: 180)")
+                     help="reuse completed checkpoints and resume matching paused PDF or online dataset runs")
+    run.add_argument("--max-requests", type=int,
+                     help="total online SciFact or SciTabAlign provider attempts, including resumes (default: 8)")
+    run.add_argument("--max-seconds", type=int,
+                     help="total online SciFact or SciTabAlign elapsed seconds, including resumes (default: 180)")
     run.set_defaults(handler=run_benchmark)
 
     score = bench_commands.add_parser("score", help="score predictions independently of review")

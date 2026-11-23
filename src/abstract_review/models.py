@@ -128,6 +128,7 @@ class _JudgeWire:
 
 
 ROLE_PROMPTS = {
+    "select_table_cells": "Select table cells that are necessary to decide the supplied claim. Use only the given table and caption. Return cell coordinates in priority order, with the most decisive cells first and no duplicates. Both indices are zero-based, and row zero is the table header. Include values, comparison operands, and headers or labels when they are needed to interpret the values. Respect the supplied selection limit. Return an empty list when no cell helps decide the claim.",
     "extract": "Extract atomic verifiable claims from numbered abstract sentences. Quote exact substrings, preserve qualifications and quantifiers, and provide concise support and counter-evidence queries. Omit no verifiable material claim. Set empirical_result to true for measured experimental outcomes, comparisons, or observed failures, false for pure methods or definitions, and null when unclear. Use requirements for the facts and conditions needed to decide the claim as worded. Leave optional reporting details out of requirements. For a compound assertion, emit its independently verifiable operands with distinct, non-overlapping exact quotes and self-contained propositions preserving shared conditions. In compounds, give the source sentence ID, operator and/or, and zero-based indexes into claims. Use or only for an actual disjunction in the author's statement, not a list within one subject, contrast, alias, conditional, or a comparison with two operands. Do not flatten mixed or ambiguous logical structure. Each compound must cover the full asserted relationship in its sentence.",
     "judge": "Judge the claim against the supplied original paper evidence. Compare study conditions and units. Cite only supplied IDs. Distinguish refutation, evidence insufficiency after checks, and pending when potentially decisive evidence is not checked. Treat visually estimated or OCR-uncertain values as approximate. Identify conflicting evidence and bounded follow-up queries. Any calculation supplied is authoritative for the specified operands only.",
     "revise": "Propose a minimal revision of the supplied sentence based on cited paper evidence. Preserve supported facts and conditions, identify substantiated semantic changes, and leave unsupported changes unresolved.",
@@ -144,6 +145,7 @@ class ResponsesModel:
     def __init__(
         self, model: str = "gpt-6.2-sol", max_requests: int = 80, max_seconds: float = 900,
         *, client=None, previous_attempts: int = 0, previous_seconds: float = 0, before_call=None,
+        max_output_tokens: int | None = None,
     ) -> None:
         from openai import OpenAI
 
@@ -158,6 +160,7 @@ class ResponsesModel:
         self.previous_seconds = previous_seconds
         self.events: list[dict] = []
         self.before_call = before_call
+        self.max_output_tokens = max_output_tokens
 
     @property
     def elapsed_seconds(self) -> float:
@@ -184,6 +187,7 @@ class ResponsesModel:
                 ])
         else:
             payload = encoded
+        output_limit = {"max_output_tokens": self.max_output_tokens} if self.max_output_tokens is not None else {}
 
         for attempt in range(3):
             remaining = self.max_seconds - self.elapsed_seconds
@@ -206,6 +210,7 @@ class ResponsesModel:
                     reasoning={"effort": "medium"},
                     store=False,
                     timeout=min(45, remaining),
+                    **output_limit,
                 )
                 event.update(response_id=response.id, status=response.status, model=response.model)
                 if response.usage is not None:

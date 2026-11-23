@@ -176,15 +176,16 @@ def _token_totals(requests: int, events: list[dict]) -> dict:
     return tokens
 
 
-class _SciFactBatch:
+class _OnlineBenchmarkBatch:
     def __init__(self, db: sqlite3.Connection, identity: str, used: int, seconds: float,
-                 max_requests: int, max_seconds: int) -> None:
+                 max_requests: int, max_seconds: int, *, include_request_usage: bool) -> None:
         self.db = db
         self.identity = identity
         self.requests_used = used
         self.previous_seconds = seconds
         self.max_requests = max_requests
         self.max_seconds = max_seconds
+        self.include_request_usage = include_request_usage
         self.started = time.monotonic()
         self.stop_reason = None
         self.results = []
@@ -232,6 +233,8 @@ class _SciFactBatch:
     def record(self, sample_id: str, digest: str, prediction: dict, requests: int, events: list[dict]) -> None:
         result = {"sample_id": sample_id, "input_digest": digest, "model_requests": requests,
                   "tokens": _token_totals(requests, events), "cache_hit": False}
+        if self.include_request_usage:
+            result.update(stop_reason=prediction.get("stop_reason"), request_usage=events[:requests])
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO scifact_samples VALUES (?, ?, ?, ?)",
                             (sample_id, digest, json.dumps(prediction, ensure_ascii=False), json.dumps(result)))
@@ -242,6 +245,8 @@ class _SciFactBatch:
         self.stop_reason = self.exhaustion() or "model_paused"
         diagnostics = {"sample_id": sample_id, "input_digest": digest, "model_requests": requests,
                        "tokens": _token_totals(requests, events), "stop_reason": self.stop_reason}
+        if self.include_request_usage:
+            diagnostics["request_usage"] = events[:requests]
         if finding is not None:
             diagnostics["finding_stop_reason"] = finding["stop_reason"]
             if "decision_trace" in finding:
@@ -265,11 +270,12 @@ class _SciFactBatch:
 
 
 @contextmanager
-def scifact_checkpoint(path: Path, manifest_sha256: str, configuration: dict, *, resume: bool,
-                       max_requests: int = _BATCH_DEFAULT_REQUESTS, max_seconds: int = _BATCH_DEFAULT_SECONDS):
+def benchmark_checkpoint(path: Path, manifest_sha256: str, configuration: dict, *, dataset: str, resume: bool,
+                         max_requests: int = _BATCH_DEFAULT_REQUESTS, max_seconds: int = _BATCH_DEFAULT_SECONDS,
+                         include_request_usage: bool = False):
     """Open a single-writer checkpoint and its cumulative budget for this exact batch."""
     if any(type(value) is not int or value <= 0 for value in (max_requests, max_seconds)):
-        raise ValueError("SciFact batch limits must be positive integers")
+        raise ValueError(f"{dataset} batch limits must be positive integers")
     identity = _digest([1, manifest_sha256, configuration])
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path, timeout=0)) as db:
@@ -280,9 +286,10 @@ def scifact_checkpoint(path: Path, manifest_sha256: str, configuration: dict, *,
             db.execute("BEGIN EXCLUSIVE")
         except sqlite3.OperationalError as exc:
             if getattr(exc, "sqlite_errorcode", None) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
-                raise ValueError("this SciFact benchmark is already running in this output directory") from exc
+                raise ValueError(f"this {dataset} benchmark is already running in this output directory") from exc
             raise
         with db:
+            # Keep the original table names so SciFact output directories retain their checkpoint format.
             db.execute("CREATE TABLE IF NOT EXISTS scifact_batch (identity TEXT PRIMARY KEY, requests INTEGER NOT NULL, seconds REAL NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS scifact_samples (sample_id TEXT PRIMARY KEY, input_digest TEXT NOT NULL, prediction TEXT NOT NULL, result TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS scifact_pause (slot INTEGER PRIMARY KEY, diagnostics TEXT NOT NULL)")
@@ -291,14 +298,20 @@ def scifact_checkpoint(path: Path, manifest_sha256: str, configuration: dict, *,
                 db.execute("INSERT INTO scifact_batch VALUES (?, 0, 0)", (identity,))
                 stored = identity, 0, 0.0
             elif not resume:
-                raise ValueError("this output directory has SciFact checkpoints; use --resume or another output directory")
+                raise ValueError(f"this output directory has {dataset} checkpoints; use --resume or another output directory")
             elif stored[0] != identity:
-                raise ValueError("SciFact checkpoint inputs or configuration changed; use another output directory")
-        yield _SciFactBatch(db, *stored, max_requests, max_seconds)
+                raise ValueError(f"{dataset} checkpoint inputs or configuration changed; use another output directory")
+        yield _OnlineBenchmarkBatch(db, *stored, max_requests, max_seconds, include_request_usage=include_request_usage)
+
+
+def scifact_checkpoint(path: Path, manifest_sha256: str, configuration: dict, *, resume: bool,
+                       max_requests: int = _BATCH_DEFAULT_REQUESTS, max_seconds: int = _BATCH_DEFAULT_SECONDS):
+    return benchmark_checkpoint(path, manifest_sha256, configuration, dataset="SciFact", resume=resume,
+                                max_requests=max_requests, max_seconds=max_seconds)
 
 
 def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=ResponsesModel,
-                batch: _SciFactBatch | None = None) -> list[dict]:
+                batch: _OnlineBenchmarkBatch | None = None) -> list[dict]:
     """Apply the shared claim retrieval and judge to input-only cited abstracts."""
     if engine not in {"offline", "openai"}:
         raise ValueError("SciFact benchmark engine must be offline or openai")
