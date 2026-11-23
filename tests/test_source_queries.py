@@ -49,3 +49,28 @@ def test_probe_needs_a_main_document_and_matching_lexical_context():
         claim = "Removing the sensor guard prevents a signal failure."
         assert focused_source_context(index, claim, []) == (None, None)
         assert focused_source_context(index, claim, [{"doc_id": "paper", "role": "main"}]) == (None, None)
+
+
+def test_upper_bound_probe_preserves_original_nearby_source_under_the_context_budget():
+    claim = "The evaluation can contain up to 64k tokens."
+    result = ["Two datasets were evaluated.", "Long sequences were prepared using one shared protocol.",
+              "The varied lengths were 8k, 32k and 64 K tokens.", "Both datasets used this range.",
+              "The distractors were randomly assigned to positions.", "Additional diagnostics follow below."]
+    rows = [*_lines(0, ["A different protocol handled 64k words.", "The initial work has one dataset.",
+                        "It lists a vocabulary size of 64,000 tokens."]),
+            *_lines(1, result), *_lines(2, result, doc="supplement")]
+    with closing(EvidenceIndex(rows)) as index:
+        window, scope = focused_source_context(index, claim, [{"doc_id": "paper", "role": "main"}])
+        assert window.text == "\n".join(result[1:5])
+    assert scope["focus_anchor_id"] == "paper-1-2"
+    assert window.evidence_ids == window.expanded_ids == tuple(f"paper-1-{line}" for line in range(1, 5))
+
+
+def test_upper_bound_probe_requires_contiguous_number_and_supported_count_unit():
+    rows = _lines(0, ["The batch contains 64k distinct rows for token analysis.",
+                      "The abstract discusses tokens for both tasks.", "The protocol used random selection."])
+    with closing(EvidenceIndex(rows)) as index:
+        assert focused_source_context(index, "It handles up to 64k tokens.",
+                                      [{"doc_id": "paper", "role": "main"}]) == (None, None)
+    assert _probe("The intervention continues up to 64 hours.") is None
+    assert _probe("The dataset contains at least 64k tokens.") is None

@@ -174,7 +174,8 @@ def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=Re
         index = EvidenceIndex(evidence)
         try:
             model = None if engine == "offline" else make_model(model_name, max_requests=4, max_seconds=180)
-            finding, _ = review_claim(claim, index, model)
+            source_ids = None if model is None else [row["evidence_id"] for row in evidence]
+            finding, _ = review_claim(claim, index, model, cited_abstract_ids=source_ids)
         except ModelUnavailable as exc:
             raise ValueError(f"SciFact sample {sample['sample_id']}: {exc}") from exc
         finally:

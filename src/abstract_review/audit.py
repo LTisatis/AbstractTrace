@@ -80,6 +80,19 @@ class ScopedJudgement(Judgement):
 
 _SCOPE_KEYS = ("section", "table_label", "page_index", "doc_id")
 _SOURCE_SECTIONS = {"methods": "Methods", "results": "Results"}
+_CITED_ABSTRACT_MAX_SENTENCES = 16
+_CITED_ABSTRACT_MAX_CHARS = 5500
+_CITED_ABSTRACT_INSTRUCTIONS = (
+    "Judge whether this cited abstract supports or directly contradicts the claim as written. The cited abstract is "
+    "the entire task scope. Do not request the paper, external sources or follow-up queries. Use the exact supplied "
+    "requirement names in coverage and missing_fields. For support or refutation, cite the original sentences and "
+    "mark the decided requirements found. For refutation, provide direct_contradiction with the same outcome and "
+    "scope, and cite its anchors in one refute group. An association, a population burden estimate and a measure "
+    "of individual prediction establish different things. Match the outcome and relationship asserted. Treat "
+    "contradiction as requiring positive evidence of incompatibility. If evidence_boundary.complete is true and "
+    "the abstract does not settle the claim, return insufficient, mark each unresolved requirement searched_missing, "
+    "and explain what the abstract does not provide. For partial coverage that cannot settle the claim, return pending."
+)
 _EMPIRICAL_RESULT = re.compile(
     r"\b(?:evaluation results?|experimental results?|experiment(?:s)? show|measured (?:effect|performance)|"
     r"observed (?:effect|outcome|failure)|performance (?:gains?|improvement|drop)|outperform\w*|"
@@ -831,12 +844,25 @@ def review_claim(
     claim: dict, index: EvidenceIndex, model=None, *, documents=(), data_dir=None,
     reserve_followup: Callable[[], bool] | None = None, additional_evidence: Sequence[dict] = (),
     saved_targets: Sequence[dict] = (), save_targets: Callable[[list[dict]], None] | None = None,
+    cited_abstract_ids: Sequence[str] | None = None,
 ) -> tuple[dict, dict | None]:
     documents = tuple(documents)
     requirements = [field for field in claim["requirements"] if field.strip()]
     if not requirements:
         requirements = ["observed result and scope"]
         claim = {**claim, "requirements": requirements}
+    cited_abstract = cited_abstract_ids is not None
+    abstract_ids = set(cited_abstract_ids or ())
+    abstract_rows = index.get(cited_abstract_ids or ())
+    malformed_abstract = any(row.get("kind") != "body_text" or row["locator"].get("section") != "abstract"
+                             for row in abstract_rows)
+    if cited_abstract and (documents or additional_evidence or saved_targets or malformed_abstract
+                           or len(abstract_ids) != len(abstract_rows)
+                           or len({_document_key(row) for row in abstract_rows}) > 1):
+        raise ValueError("cited abstract mode requires sentences from a single abstract")
+    full_abstract = bool(abstract_rows) and (len(abstract_rows) <= _CITED_ABSTRACT_MAX_SENTENCES
+                                            and sum(len(row["text"]) for row in abstract_rows) <= _CITED_ABSTRACT_MAX_CHARS)
+    primary_limit = len(abstract_rows) if full_abstract else 8
     examined_scopes = []
     paths = []
     by_id = {}
@@ -859,10 +885,14 @@ def review_claim(
         by_id.update((item["evidence_id"], item) for item in result["evidence"])
 
     def gather(queries: Sequence[str], *, prefer_passage: bool = False) -> None:
+        scope = {}
+        if cited_abstract:
+            doc_id, version = _document_key(abstract_rows[0])
+            scope = {"section": "abstract", "doc_id": doc_id, "doc_version_id": version, "expand": False}
         for position, query in enumerate(dict.fromkeys(queries)):
             if not query.strip():
                 continue
-            result = index.search(query, limit=8, passage_query=prefer_passage and position == 0)
+            result = index.search(query, limit=8, passage_query=prefer_passage and position == 0, **scope)
             examined_scopes.append({**result["scope"], "mode": "ranked"})
             remember(result)
 
@@ -906,11 +936,23 @@ def review_claim(
 
     def candidate_order() -> list[str]:
         # Keep context from each lane together when combining support and counter searches.
-        ordered = dict.fromkeys(prioritized[:8])
+        ordered = dict.fromkeys(prioritized[:primary_limit])
         for unit in _interleave_units(index, breadth):
-            if len(ordered.keys() | set(unit)) <= 8:
+            if len(ordered.keys() | set(unit)) <= primary_limit:
                 ordered.update(dict.fromkeys(unit))
-        return list(ordered)
+        if not cited_abstract or full_abstract:
+            return list(ordered)
+        remaining = _CITED_ABSTRACT_MAX_CHARS
+        bounded = []
+        for eid in ordered:
+            if eid in abstract_ids and (size := len(by_id[eid]["text"])) <= remaining:
+                bounded.append(eid)
+                remaining -= size
+        return bounded
+
+    def evidence_boundary(sent_ids: list[str]) -> dict:
+        return {"kind": "cited_abstract", "complete": full_abstract and set(sent_ids) == abstract_ids,
+                "sentence_count": len(abstract_rows), "supplied_sentence_count": len(sent_ids)}
 
     initial_queries = (claim["support_query"], claim["counter_query"])
     proposition = claim["proposition"]
@@ -920,16 +962,26 @@ def review_claim(
     )
     empirical = empirical or comparison_required
     # An explicit absence is a scope condition. Keep the ordinary support and counter lanes for it.
-    gather(initial_queries, prefer_passage=bool(documents) and claim["kind"] in {"method", "result", "scope"}
-           and not (_TABLE_QUERY.search(proposition) or _ABSENCE_CONDITION.search(proposition)))
+    if not full_abstract and (not cited_abstract or abstract_rows):
+        gather(initial_queries, prefer_passage=bool(documents) and claim["kind"] in {"method", "result", "scope"}
+               and not (_TABLE_QUERY.search(proposition) or _ABSENCE_CONDITION.search(proposition)))
     body_windows = []
-    if model is None or claim["kind"] not in {"background", "purpose"}:
+    if not cited_abstract and (model is None or claim["kind"] not in {"background", "purpose"}):
         body_windows = index.ranked_body_context(initial_queries)
         if claim["kind"] not in {"background", "purpose"}:
             focused_window, scope = focused_source_context(index, proposition, documents)
             if focused_window is not None:
                 body_windows.insert(0, focused_window)
                 examined_scopes.append(scope)
+    if full_abstract:
+        doc_id = abstract_rows[0]["doc_id"]
+        prioritized.extend(cited_abstract_ids)
+        by_id.update((row["evidence_id"], row) for row in abstract_rows)
+        examined_scopes.extend({
+            "mode": "direct", "section": "abstract", "doc_id": doc_id, "requirement": field,
+            "complete": True, "examined_evidence_ids": list(cited_abstract_ids),
+            "locations": [{"doc_id": doc_id, "page_index": 0, "section": "abstract"}],
+        } for field in requirements)
     if additional_evidence:
         supplements = index.get(item["evidence_id"] for item in additional_evidence)
         prioritized.extend(item["evidence_id"] for item in supplements)
@@ -945,6 +997,9 @@ def review_claim(
         candidates = [by_id[eid] for eid in candidate_order()]
         passages = index.body_passages(item["evidence_id"] for item in candidates)
         context = index.table_context(item["evidence_id"] for item in candidates)
+        if cited_abstract and not candidates:
+            finding = _pending(claim, "No readable sentences fit the cited-abstract evidence packet.")
+            break
         context_by_id = {item["evidence_id"]: item for item in context["evidence"]}
         table_context = [
             {"cell_evidence_id": eid, "evidence": blind_evidence([context_by_id[related] for related in related_ids])}
@@ -982,7 +1037,8 @@ def review_claim(
             finding = _pending(claim, "This sentence is outside original-paper result verification.")
             break
         material = {"claim": claim["proposition"], "requirements": requirements,
-                    "evidence": blind_evidence(candidates, preserve_order=bool(documents)), "calculation": calculation,
+                    "evidence": blind_evidence(candidates, preserve_order=bool(documents) or full_abstract),
+                    "calculation": calculation,
                     "follow_up_already_performed": followup,
                     "direct_inspections": [scope for scope in examined_scopes if scope.get("mode") == "direct"],
                     "coverage_instructions": (
@@ -1080,6 +1136,18 @@ def review_claim(
                 " This sentence requires a full logic review. Use ordinary evidence groups and leave "
                 "direct_contradiction empty."
             )
+        if cited_abstract:
+            material["evidence_boundary"] = evidence_boundary(packet_order)
+            material["coverage_instructions"] = _CITED_ABSTRACT_INSTRUCTIONS
+            if empirical:
+                material["coverage_instructions"] += (
+                    " For empirical support, identify the directly reported result and its conditions in empirical_support, "
+                    "and put those citations together in a support group."
+                )
+            if comparison_required:
+                material["coverage_instructions"] += (
+                    " Supply empirical_support.comparison with matched outcomes under both conditions."
+                )
         material.update(figure_material(candidates, documents, data_dir))
         try:
             try:
@@ -1119,7 +1187,7 @@ def review_claim(
             proof_error = _contradiction_error(output, sent_candidate_ids)
             proof_blocker = proof_error or _direct_refutation_blocker(claim, output, coverage)
         direct_proof = verdict == "refuted" and proof_blocker is None
-        if not direct_proof and not followup:
+        if not cited_abstract and not direct_proof and not followup:
             targets = _pending_targets(output, requirements, documents, initial_queries=initial_queries)
             if not targets and empirical_blocker:
                 fallback = _empirical_followup(claim, empirical_blocker, hints)
@@ -1153,10 +1221,17 @@ def review_claim(
                                  and (proof_error is not None or proof_blocker in {
                                      "missing_scope_coverage", "conflicting_support",
                                  }))
+        invalid_contradiction = invalid_contradiction or (cited_abstract and verdict == "refuted" and not direct_proof)
         can_call_insufficient = (
             "searched_missing" in checked and checked <= {"found", "searched_missing"}
             and not follow_up_requested
         )
+        if cited_abstract:
+            required = {_field_key(field) for field in requirements}
+            marked_missing = any(check.status == "searched_missing" and _field_key(check.requirement) in required
+                                 and set(sent_candidate_ids).issuperset(check.evidence_ids) for check in output.coverage)
+            can_call_insufficient = (can_call_insufficient and full_abstract and marked_missing
+                                     and not conflicting & {"support", "refute"})
         if ((verdict == "supported" and empirical_blocker) or invalid_contradiction
                 or (role and not (has_evidence and (decisive_fields_checked or direct_proof)))
                 or (verdict == "insufficient" and not can_call_insufficient)
@@ -1169,6 +1244,8 @@ def review_claim(
             reason = f"The comparison between tested conditions needs further verification. Proposed assessment: {output.reason}"
         elif empirical_blocker and output.verdict == "supported":
             reason = f"The observed result and tested scope need further verification. Proposed assessment: {output.reason}"
+        elif cited_abstract and output.verdict == "insufficient" and verdict == "pending":
+            reason = f"The evidence-insufficiency checks did not pass for this cited abstract. Proposed assessment: {output.reason}"
         elif (output.verdict == "insufficient" or (role and not decisive_fields_checked)) and verdict == "pending":
             reason = f"Required sources have not been fully checked. Proposed assessment: {output.reason}"
         else:
@@ -1191,6 +1268,8 @@ def review_claim(
     candidate_ids = [item["evidence_id"] for item in candidates]
     finding["candidate_ids"] = candidate_ids
     finding["sent_candidate_ids"] = sent_candidate_ids
+    if cited_abstract:
+        finding["evidence_boundary"] = evidence_boundary(sent_candidate_ids)
     if documents:
         finding["retrieval_trace"] = {
             "retrieved_evidence_ids": list(dict.fromkeys(eid for lane in breadth for eid in lane)),
