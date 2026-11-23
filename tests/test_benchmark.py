@@ -273,6 +273,21 @@ def test_cost_prices_cache_writes_by_ttl_without_double_counting_input():
     assert score_costs(record, prices)["unpriced_requests"] == 2
 
 
+def test_cost_counts_explicit_zero_and_keeps_legacy_cache_write_usage_unknown():
+    prices = {"schema_version": 1, "pricing_id": "test", "models": {
+        "fixed": {"input_per_million": "2", "cached_input_per_million": "0.1",
+                  "output_per_million": "10", "cache_write_30m_per_million": "2.5"},
+    }}
+    event = {"model": "fixed", "input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 10}
+    record = {"samples": [{"sample_id": "live", "request_usage": [
+        event, {**event, "cache_write_input_tokens": 0},
+    ]}]}
+    result = score_costs(record, prices)
+    assert result["known_cost_usd"] == "0.0003"
+    assert (result["priced_requests"], result["unpriced_requests"]) == (1, 1)
+    assert result["complete"] is False
+
+
 def test_review_scoring_does_not_report_zero_cost_for_unmeasured_dataset(tmp_path, capsys):
     record = tmp_path / "run.json"
     record.write_text(json.dumps({"schema_version": 1, "prediction_count": 1, "samples": [],
