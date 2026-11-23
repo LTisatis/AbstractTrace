@@ -92,6 +92,8 @@ CLAIM-BENCH 适配器需要本地标注文件及其对应的 PDF。它把能在�
 
 重新解析原生 PDF 时，系统会提取能确认的章节标题，为首轮裁决提供物理页导航。裁决器可以按该页提出补查，再引用实际读到的原文。重复提交已跑过且没有缩小来源范围的全文查询时，系统保留首轮证据和待查状态。
 
+实证主张的支持裁决分别记录观察结果和实际测试范围，二者须来自同一研究并有送审引证。只有总结性表述时，系统可在原有补查轮次内检索原始结果。模型也可以引用一个实际送审正文段的首尾锚点，系统校验连续范围后展开原文引用。裁决请求中的简短编号在写报告前恢复成原始证据 ID。
+
 ```powershell
 uv run abstract-review bench prepare-claimbench --pdf paper.pdf --annotations annotations.json --paper-family-id paper --split dev --dataset-version local-release --output-dir .review-data/claimbench
 uv run abstract-review bench run --engine offline --input-manifest .review-data/claimbench/inputs.json --output-dir .review-data/claimbench/out

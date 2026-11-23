@@ -103,6 +103,9 @@ class _ReviewModel:
             ids = [*operands, method_id, note_id]
             return schema(verdict="supported", reason="The measured result uses the test split identified in Methods.",
                           evidence_groups=[{"role": "support", "evidence_ids": ids}], missing_fields=[],
+                          empirical_support={"result_source": "direct_result", "result_evidence_ids": operands,
+                                             "scope_evidence_ids": [method_id, note_id],
+                                             "same_study_and_scope": "same"},
                           follow_up_queries=[], coverage=[{"requirement": SCOPE, "status": "found", "evidence_ids": ids}])
         assert stage == "verify_abstract"
         assert material["original_abstract"] == material["revised_abstract"]
