@@ -8,9 +8,11 @@ def _ignore_checkpoint() -> None:
 
 
 class FollowUps:
-    def __init__(self, report: dict, checkpoint=_ignore_checkpoint) -> None:
+    def __init__(self, report: dict, checkpoint=_ignore_checkpoint, *, embedder=None, reranker=None) -> None:
         self.report = report
         self.checkpoint = checkpoint
+        self.embedder = embedder
+        self.reranker = reranker
         self.rounds = report.setdefault("follow_up_rounds", {})
         for finding in report.get("findings", []):
             if finding.get("follow_up_performed"):
@@ -46,7 +48,7 @@ class FollowUps:
     def _complete(self, record: dict) -> None:
         from .audit import targeted_evidence
 
-        index = EvidenceIndex(self.report["evidence"])
+        index = EvidenceIndex(self.report["evidence"], embedder=self.embedder, reranker=self.reranker)
         try:
             result = targeted_evidence(index, record["queries"], documents=self.report.get("documents", ()),
                                        prior_ids=record["prior_ids"])

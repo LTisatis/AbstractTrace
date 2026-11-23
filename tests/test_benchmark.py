@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from abstract_review.benchmark import run_pdf_samples, summarize_classification
+from abstract_review.benchmark import benchmark_configuration, run_pdf_samples, summarize_classification
 from abstract_review.benchmark_costs import score_costs
 from abstract_review.cli import main
 from abstract_review.review import ReviewService
@@ -78,6 +78,31 @@ def test_without_given_claims_uses_extracted_claims_even_when_review_paused(tmp_
     assert service.requests[0].provided_claims == ()
     assert [row["review_status"] for row in rows] == ["manual_conflict", "pending"]
     assert [row["verdict"] for row in rows] == [None, None]
+
+
+def test_pdf_benchmark_uses_and_binds_opt_in_local_models(tmp_path):
+    pdf = tmp_path / "test.pdf"
+    pdf.touch()
+    source = manifest(tmp_path / "inputs.json", [{"sample_id": "paper", "pdf": pdf.name}])
+    embed = tmp_path / "embed"
+    rerank = tmp_path / "rerank"
+    for path in (embed, rerank):
+        path.mkdir()
+        (path / "config.json").write_text("{}", encoding="utf-8")
+        (path / "model.safetensors").write_bytes(b"stub weights")
+    (embed / "modules.json").write_text("[]", encoding="utf-8")
+    configuration = benchmark_configuration("offline", "test", embed_model=embed, rerank_model=rerank)
+    service = ServiceStub({"findings": []})
+    run_pdf_samples(service, source, "offline", "test", configuration=configuration,
+                    embed_model=embed, rerank_model=rerank)
+    request, = service.requests
+    assert (request.embed_model, request.rerank_model) == (embed, rerank)
+    assert request.expected_retrieval_fingerprints == configuration["retrieval_model_sha256"]
+    (rerank / "model.safetensors").write_bytes(b"different defaults")
+    with pytest.raises(ValueError, match="does not match"):
+        run_pdf_samples(service, source, "offline", "test", configuration=configuration,
+                        embed_model=embed, rerank_model=rerank)
+    assert len(service.requests) == 1
 
 
 @pytest.mark.parametrize("invalid_claim", [{"claim_id": "a", "text": "claim", "verdict": "refuted"},

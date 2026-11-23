@@ -5,6 +5,7 @@ from contextlib import ExitStack, nullcontext
 from .audit import audit_version, refresh_compound_findings, review_claim
 from .evidence import EvidenceIndex, SentenceTransformerEmbedder
 from .followups import FollowUps
+from .local_ranking import LocalCrossEncoder
 from .models import ModelUnavailable
 from .run_store import RunBusy
 
@@ -51,12 +52,20 @@ def process(service, run_id: str, request_id: str | None, add_requests: int, add
         checkpoint()
         try:
             model = service._responses(report, before_call=checkpoint)
-            followups = FollowUps(report, checkpoint)
             version = report["reviewed_abstract"]
             embedding_path = configuration.get("embed_model")
+            reranking_path = configuration.get("rerank_model")
+            if expected := configuration.get("retrieval_model_sha256"):
+                from .review import retrieval_fingerprints
+                if retrieval_fingerprints(embedding_path, reranking_path) != expected:
+                    raise ValueError("local retrieval model changed since the run started")
             embedder = SentenceTransformerEmbedder(embedding_path) if embedding_path and (
                 version.get("kind") != "selected" or model is not None
             ) else None
+            reranker = LocalCrossEncoder(reranking_path) if reranking_path and (
+                version.get("kind") != "selected" or model is not None
+            ) else None
+            followups = FollowUps(report, checkpoint, embedder=embedder, reranker=reranker)
             data_dir = service.database.parent
             if version.get("kind") == "selected":
                 while True:
@@ -88,7 +97,8 @@ def process(service, run_id: str, request_id: str | None, add_requests: int, add
 
 def _review_original(report: dict, model, checkpoint, data_dir, followups: FollowUps, embedder, archive_pdf) -> None:
     configuration = report["configuration"]
-    audit_version(report, model, checkpoint, embedder=embedder, data_dir=data_dir, reserve_followup=followups.reserve)
+    audit_version(report, model, checkpoint, embedder=embedder, reranker=followups.reranker,
+                  data_dir=data_dir, reserve_followup=followups.reserve)
     if any(finding.get("retryable") for finding in report["findings"]):
         raise ModelUnavailable("some original findings require the model to resume")
     if configuration["check_omissions"] or configuration["check_external"]:
@@ -115,7 +125,7 @@ def _refresh_findings(report: dict, model, followups: FollowUps, embedder, data_
                and ledger.get("evidence_ids") and "original_recheck" not in ledger]
     if not targets:
         return False
-    index = EvidenceIndex(report["evidence"], embedder=embedder)
+    index = EvidenceIndex(report["evidence"], embedder=embedder, reranker=followups.reranker)
     changed = False
     try:
         for number, original, ledger in targets:

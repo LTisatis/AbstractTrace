@@ -242,6 +242,11 @@ def test_model_adapter_requires_an_explicit_local_snapshot(tmp_path, monkeypatch
         SentenceTransformerEmbedder(tmp_path / "remote-model")
     assert loads == []
     (tmp_path / "modules.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
     embedder = SentenceTransformerEmbedder(tmp_path)
-    assert loads == [(str(tmp_path.resolve()), {"local_files_only": True, "trust_remote_code": False, "device": "cpu"})]
+    assert loads == [(str(tmp_path.resolve()), {
+        "local_files_only": True, "trust_remote_code": False, "device": "cpu",
+        "token": False, "model_kwargs": {"use_safetensors": True},
+    })]
     assert list(embedder.encode(["paper"])) == [[1.0, 0.0]]

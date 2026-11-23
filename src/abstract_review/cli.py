@@ -109,12 +109,13 @@ def start_review(args: argparse.Namespace) -> None:
             resolved_source = read_json(pdf.with_suffix(".json"))
         request = PdfReviewInput(
             pdf, tuple(args.supplement), pasted, args.abstract_source, args.engine, args.model,
-            embed_model=args.embed_model, check_omissions=args.check_omissions,
+            embed_model=args.embed_model, rerank_model=args.rerank_model, check_omissions=args.check_omissions,
             check_external=args.check_external, remote_source=resolved_source, ocr_language=args.ocr_language,
         )
         emit(review_service(args.data_dir).start(request))
         return
-    if args.supplement or args.abstract_file or args.abstract_source != "pdf" or args.engine or args.embed_model or args.check_omissions or args.check_external or args.ocr_language:
+    if (args.supplement or args.abstract_file or args.abstract_source != "pdf" or args.engine or args.embed_model
+            or args.rerank_model or args.check_omissions or args.check_external or args.ocr_language):
         raise ValueError("PDF review options require --pdf or --source")
     samples = load_samples(args.fixture)
     sample_id = args.sample_id
@@ -184,6 +185,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
     if len(files) != 4:
         raise ValueError("benchmark outputs and input manifest must use distinct files")
     manifest_hash = hashlib.sha256(args.input_manifest.read_bytes()).hexdigest()
+    retrieval_options = {"embed_model": args.embed_model, "rerank_model": args.rerank_model}
+    if any(retrieval_options.values()) and (args.dataset or not args.engine):
+        raise ValueError("local retrieval models require a PDF benchmark engine without --dataset")
 
     if args.dataset == "scifact":
         from .benchmark import benchmark_configuration
@@ -208,7 +212,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         from .benchmark import benchmark_configuration, run_pdf_samples
 
         service = review_service(args.data_dir)
-        configuration = benchmark_configuration(args.engine, args.model)
+        configuration = benchmark_configuration(args.engine, args.model, **retrieval_options)
         recovered = read_json(checkpoints) if args.resume and checkpoints.is_file() else {}
         if not isinstance(recovered, dict):
             raise ValueError("invalid benchmark checkpoint file")
@@ -219,7 +223,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
         predictions = run_pdf_samples(service, args.input_manifest, args.engine, args.model,
                                       recovered=recovered, on_sample=save_sample, on_result=results.append,
-                                      configuration=configuration)
+                                      configuration=configuration, **retrieval_options)
     else:
         if args.resume:
             raise ValueError("--resume requires a PDF benchmark engine")
@@ -386,6 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--engine", choices=("offline", "openai"), help="perform a full evidence review after parsing")
     start.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     start.add_argument("--embed-model", type=Path, help="path to an installed local Sentence Transformers model")
+    start.add_argument("--rerank-model", type=Path, help="path to an installed local CrossEncoder")
     start.add_argument("--ocr-language", help="Tesseract language (for example eng or eng+chi_sim)")
     start.add_argument("--check-external", action="store_true")
     start.add_argument("--check-omissions", action="store_true")
@@ -427,6 +432,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--engine", choices=("offline", "openai"), help="review a PDF or SciFact benchmark manifest")
     run.add_argument("--dataset", choices=("scifact", "scitabalign"), help="select a public benchmark adapter")
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
+    run.add_argument("--embed-model", type=Path, help="path to an installed local Sentence Transformers model")
+    run.add_argument("--rerank-model", type=Path, help="path to an installed local CrossEncoder")
     run.add_argument("--resume", action="store_true", help="reuse matching persisted PDF sample checkpoints")
     run.set_defaults(handler=run_benchmark)
 
