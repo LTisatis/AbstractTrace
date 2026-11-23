@@ -42,6 +42,8 @@ def _event_cost(event: dict, rates: dict) -> Decimal | None:
     write_30m = event.get("cache_write_30m_input_tokens")
     write_12h = event.get("cache_write_12h_input_tokens")
     if total_write is None and write_30m is None and write_12h is None:
+        if any(field in prices for field in _WRITE_RATES):
+            return None
         total_write = write_30m = write_12h = 0
     elif type(total_write) is int and total_write == 0:
         write_30m = 0 if write_30m is None else write_30m
