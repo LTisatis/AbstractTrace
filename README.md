@@ -41,6 +41,8 @@ uv run abstract-review review export $run.run_id --version-id $run.report_versio
 
 下面的离线样例以同一 PDF 为证据，把初稿里的 `10` 复算并修订为 `8` 个百分点。离线判定适用于可核算的同表比较与能回查的原句。整篇一致性由模型或人工复核。
 
+对能明确拆分的复合断言，报告保留每个分项和整句的判定。每次改稿核验针对该版本重新计算可核实的数字，并在报告中保留复算值和原文证据。结果有歧义时，报告会标记需要确认的数值。
+
 ```powershell
 Set-Content .review-data/alternate.txt 'On dataset A, accuracy increased by 10 percentage points.' -Encoding utf8
 $run = uv run abstract-review review start --pdf .review-data/sample.pdf --abstract-file .review-data/alternate.txt --abstract-source pasted --engine offline | ConvertFrom-Json

@@ -225,10 +225,19 @@
 
         <section class="card">
           <h2>断言与证据</h2>
+          {% for group in report.compound_findings|default([]) %}
+            {% set verdict = group.verdict or group.review_status %}
+            <article class="finding">
+              <header><span class="pill pill-{{ verdict }}">{{ statuses.get(verdict, verdict) }}</span><h3>{{ group.text }}</h3></header>
+              <p class="muted">{{ {'and': '全部条件同时成立', 'or': '至少一个条件成立'}.get(group.operator, group.operator) }}</p>
+              {% if group.reason %}<p class="muted">{{ group.reason }}</p>{% endif %}
+              {{ evidence_links(group.evidence_ids|default([])) }}
+            </article>
+          {% endfor %}
           {% for finding in report.findings %}
             {% set verdict = finding.verdict or finding.review_status %}
             <article class="finding">
-              <header><span class="pill pill-{{ verdict }}">{{ statuses.get(verdict, verdict) }}</span><h3>{{ finding.text }}</h3></header>
+              <header><span class="pill pill-{{ verdict }}">{{ statuses.get(verdict, verdict) }}</span><h3>{{ finding.proposition if finding.compound else finding.text }}</h3></header>
               {% if finding.reason %}<p class="muted">{{ finding.reason }}</p>{% endif %}
               {{ evidence_links(finding.evidence_ids|default([])) }}
               {% if finding.retrieval_paths %}
@@ -300,7 +309,22 @@
             <ul class="compact">
               {% for check in abstract_review.sentence_checks %}
               <li><span class="pill pill-{{ check.status }}">{{ statuses.get(check.status, check.status) }}</span> {{ check.revised.text if check.revised else check.original.text }}
-                <p class="meta">{{ check.reason }}</p>{{ evidence_links(check.evidence_ids|default([])) }}</li>
+                <p class="meta">{{ check.reason }}</p>{{ evidence_links(check.evidence_ids|default([])) }}
+                {% if check.calculations %}
+                <ul class="compact">
+                  {% for calculation in check.calculations %}
+                  <li>
+                    {{ {'matched': '复算一致', 'mismatch': '复算不一致', 'unresolved': '待确认数值'}.get(calculation.verification, calculation.verification) }}
+                    {% if calculation.stated is defined and calculation.stated is not none %} · 摘要写为 {{ calculation.stated }}{% endif %}
+                    {% if calculation.formula %} · <code>{{ calculation.formula }}</code> = {{ calculation.result }} {{ {'percentage_points': '个百分点', 'percent': '%'}.get(calculation.unit, calculation.unit) }}{% endif %}
+                    {% if calculation.reason %} · {{ calculation.reason }}{% endif %}
+                    {{ evidence_links(calculation.evidence_ids|default([])) }}
+                    {{ evidence_links(calculation.scope_evidence_ids|default([])) }}
+                  </li>
+                  {% endfor %}
+                </ul>
+                {% endif %}
+              </li>
               {% endfor %}
             </ul>
           </details>

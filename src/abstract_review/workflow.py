@@ -2,7 +2,7 @@
 
 from contextlib import ExitStack, nullcontext
 
-from .audit import audit_version, review_claim
+from .audit import audit_version, refresh_compound_findings, review_claim
 from .evidence import EvidenceIndex, SentenceTransformerEmbedder
 from .followups import FollowUps
 from .models import ModelUnavailable
@@ -135,6 +135,7 @@ def _refresh_findings(report: dict, model, followups: FollowUps, embedder, data_
                 changed = True
                 report.setdefault("finding_history", []).append(original)
                 report["findings"][number] = finding
+                refresh_compound_findings(report)
                 report["calculations"] = [row for row in report["calculations"] if row["claim_id"] != claim_id]
                 if calculation is not None:
                     report["calculations"].append({**calculation, "claim_id": claim_id})

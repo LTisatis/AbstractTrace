@@ -3,6 +3,7 @@ from copy import deepcopy
 import pytest
 
 from abstract_review.audit import sentences
+from abstract_review.calculations import check_revision_numbers
 from abstract_review.followups import FollowUps
 from abstract_review.models import VerificationQuery
 from abstract_review.revisions import apply_revisions, build_candidate, new_version, repair_candidate, verify_version
@@ -13,9 +14,9 @@ SOURCE = "Accuracy increased by 12 percentage points on Dataset A."
 CORRECTION = "Accuracy increased by 8 percentage points on Dataset A."
 
 
-def cell(eid, text, column, header, *, row=1):
+def cell(eid, text, column, header, *, row=1, subject="Dataset A"):
     return {"evidence_id": eid, "text": text, "kind": "table_cell", "doc_id": "paper",
-            "row_header": "Dataset A", "column_header": header,
+            "row_header": subject, "column_header": header,
             "locator": {"page_index": 1, "table_index": 0, "row_index": row, "column_index": column}}
 
 
@@ -67,6 +68,7 @@ def test_offline_revision_is_limited_to_scoped_numeric_correction():
     verified = verify_version(report, original, candidate)
     local, = verified["sentence_checks"]
     assert local["status"] == "passed"
+    assert local["calculations"][0]["verification"] == "matched"
     assert local["version_id"] == verified["version_id"] == candidate["version_id"]
     assert verified["status"] == "manual_review"
 
@@ -139,12 +141,15 @@ def test_whole_repair_rebases_selected_location_and_consumes_shared_budget():
     report["findings"].append({**report["findings"][0], "claim_id": "claim-b", "sentence_id": "s2",
                                "start": len(SOURCE) + 1, "end": len(SOURCE) + 1 + len(second),
                                "text": second, "proposition": second})
+    report["evidence"].append({"evidence_id": "split", "doc_id": "paper", "kind": "body_text",
+                               "text": "Dataset A uses the fixed split.",
+                               "locator": {"page_index": 0, "section": "Methods"}})
     candidate = build_candidate(report)
     first, original_patch = report["revisions"]
     location = sentences(candidate["text"])[1]
     assert location["start"] != original_patch["start"]
     issue = {"sentence_ids": ["s2"], "reason": "Make the documented split explicit.",
-             "locations": [location], "evidence_ids": ["result"]}
+             "locations": [location], "evidence_ids": ["result", "split"]}
     whole = {"status": "returned", "version_id": candidate["version_id"], "issues": [issue]}
     replacement = "Dataset A recorded an increase of 8 percentage points on the fixed split."
     model = ScriptedModel([
@@ -163,6 +168,7 @@ def test_whole_repair_rebases_selected_location_and_consumes_shared_budget():
     assert latest["replaces_revision_id"] == original_patch["revision_id"]
     assert original_patch["status"] == "superseded"
     assert report["verifications"][-1]["repair_count"] == 1
+    assert report["verifications"][-1]["calculations"][0]["scope_evidence_ids"] == ["split"]
     assert set(model.calls[-1][1]) == {"original_sentence", "revised_sentence", "evidence"}
 
     repeated_issue = {**issue, "locations": [sentences(repaired["text"])[1]]}
@@ -215,6 +221,89 @@ def test_whole_check_cannot_pass_with_a_failed_manual_edit():
     assert checked["sentence_checks"][0]["status"] == "returned"
 
 
+def test_recalculation_overrules_online_approval_and_gives_the_repair_its_evidence():
+    report = report_for()
+    approvals = {"status": "passed", "reason": "The model accepts it.", "evidence_ids": ["result"]}
+    model = ScriptedModel([
+        ("revise", draft(SOURCE.replace("12", "9"), "9")),
+        ("verify_sentence", approvals),
+        ("revise", draft(CORRECTION, "8")),
+        ("verify_sentence", approvals),
+    ])
+    candidate = build_candidate(report, model)
+    assert candidate["text"] == CORRECTION
+    feedback = model.calls[2][1]["verification_feedback"]
+    assert feedback["status"] == "returned"
+    assert {"baseline", "result"} == set(feedback["evidence_ids"])
+    assert "9" in feedback["reason"] and "8" in feedback["reason"]
+    calculation, = report["verifications"][0]["calculations"]
+    assert calculation["verification"] == "matched"
+    assert calculation["operands"] == ["80%", "88%"]
+
+
+@pytest.mark.parametrize("replacement,verification,sentence_status", [
+    ("On Dataset A, accuracy increased by 8%.", "mismatch", "returned"),
+    ("On Dataset A, accuracy decreased by 8 percentage points.", "mismatch", "returned"),
+    ("Accuracy increased from 82% to 88% on Dataset A.", "mismatch", "returned"),
+    ("Against baseline B, accuracy increased by 8 percentage points on Dataset A.", "unresolved", "manual_review"),
+    ("Accuracy increased by 8 percentage points on Dataset A's validation split.", "unresolved", "manual_review"),
+])
+def test_selected_version_does_not_accept_a_model_pass_for_numbers_with_issues(replacement, verification, sentence_status):
+    report = report_for()
+    original = report["original_abstract"]
+    report["evidence"] += [cell("other-base", "80%", 1, "Baseline", row=2, subject="Dataset B"),
+                          cell("other-result", "88%", 2, "Final", row=2, subject="Dataset B")]
+    selected = new_version(replacement, "selected", original["version_id"], [])
+    approval = {"status": "passed", "reason": "The model accepts it.", "evidence_ids": ["result"]}
+    model = ScriptedModel([("verify_sentence", approval), ("verify_abstract", {**approval, "issues": []})])
+    whole = verify_version(report, original, selected, model)
+    check, = whole["sentence_checks"]
+    assert check["status"] == sentence_status
+    assert whole["status"] == "manual_review"
+    assert selected["text"] == replacement
+    failed = next(item for item in check["calculations"] if item["verification"] == verification)
+    if verification == "mismatch":
+        assert failed["evidence_ids"] == ["baseline", "result"]
+
+
+def test_saved_passed_sentence_is_recalculated_without_replaying_a_model_request():
+    report = report_for()
+    candidate = build_candidate(report)
+    original = report["original_abstract"]
+    wrong = SOURCE.replace("12", "9")
+    report["revisions"][0]["replacement"] = wrong
+    report["verifications"][0]["revised_sentence"] = wrong
+    report["verifications"][0].pop("calculations")
+    legacy = new_version(wrong, "candidate", original["version_id"], candidate["revision_ids"])
+    model = ScriptedModel([("verify_abstract", {
+        "status": "passed", "reason": "Stored sentence should be checked.", "evidence_ids": ["result"], "issues": [],
+    })])
+    checked = verify_version(report, original, legacy, model)
+    assert checked["status"] == "manual_review"
+    assert checked["sentence_checks"][0]["calculations"][0]["verification"] == "mismatch"
+    assert build_candidate(report, ScriptedModel([])) is None
+    assert report["verifications"][0]["status"] == "passed"
+
+
+def test_recalculation_keeps_undefined_relative_change_and_conflicting_units_unresolved():
+    evidence = [cell("baseline", "0%", 1, "Baseline"), cell("result", "10%", 2, "Final")]
+    [relative] = check_revision_numbers(SOURCE, "On Dataset A, accuracy increased by 10%.", evidence)
+    assert (relative["operation"], relative["status"], relative["verification"]) == (
+        "relative_change", "not_calculable", "unresolved",
+    )
+    [absolute] = check_revision_numbers(SOURCE, "On Dataset A, accuracy increased by 10.", evidence)
+    assert absolute["verification"] == "unresolved"
+    assert "units" in absolute["reason"]
+
+
+def test_recalculation_accepts_scalar_differences_and_preserves_chinese_percentages():
+    evidence = [cell("baseline", "1.6", 1, "Baseline RMSE"), cell("result", "1.4", 2, "Final RMSE")]
+    [scalar] = check_revision_numbers("On Dataset A, RMSE fell by 0.3.", "On Dataset A, RMSE fell by 0.2.", evidence)
+    assert (scalar["operation"], scalar["result"], scalar["verification"]) == ("absolute_difference", "-0.2", "matched")
+    [points] = check_revision_numbers("数据集A的准确率提高12个百分点。", "数据集A的准确率提高8个百分点。", report_for()["evidence"])
+    assert points["verification"] == "matched"
+
+
 def test_sentence_supplement_is_shared_with_whole_review_and_restart():
     report = report_for()
     report["evidence"].append({"evidence_id": "limitation", "doc_id": "paper", "kind": "body_text",
@@ -246,14 +335,15 @@ def test_sentence_supplement_is_shared_with_whole_review_and_restart():
 
 
 def test_grounded_omission_uses_same_independent_revision_path():
-    report = report_for()
+    source = "The primary endpoint was evaluated."
+    report = report_for(source)
     report["findings"] = []
     report["evidence"].append({"evidence_id": "limit", "doc_id": "paper", "kind": "body_text",
                                "text": "The primary endpoint used a fixed split.",
                                "locator": {"page_index": 2, "section": "Methods"}})
     report["omissions"] = [{"status": "possible_omission", "anchor_sentence_id": "s1",
                             "reason": "The split should be stated.", "evidence_ids": ["limit"]}]
-    replacement = SOURCE.removesuffix(".") + " using a fixed validation split."
+    replacement = source.removesuffix(".") + " using a fixed split."
     model = ScriptedModel([
         ("revise", {"replacement": replacement, "evidence_ids": ["limit"], "semantic_diff": [{
             "kind": "added", "field": "scope", "before": None, "after": "fixed split", "evidence_ids": ["limit"],
