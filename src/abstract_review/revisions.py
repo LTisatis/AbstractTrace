@@ -11,7 +11,7 @@ from pydantic import Field
 
 from .audit import blind_evidence, sentences, validate_ids
 from .calculations import check_revision_numbers, comparison_for_claim
-from .evidence import EvidenceIndex
+from .evidence import EvidenceIndex, with_method_scope
 from .followups import FollowUps
 from .models import ROLE_PROMPTS, ModelPaused, ModelUnavailable, Schema, VerificationQuery
 
@@ -103,11 +103,14 @@ def apply_revisions(original_text: str, revisions: list[dict]) -> str:
     return "".join([*parts, original_text[offset:]])
 
 
-def _scope(report: dict, findings: list[dict], additional_ids=()) -> list[dict]:
+def _scope(report: dict, findings: list[dict], additional_ids=(), *, additional_paths=()) -> list[dict]:
     ids = set(additional_ids)
+    paths = list(additional_paths)
     for item in findings:
         ids.update(item.get("candidate_ids", ()))
+        ids.update(item.get("sent_candidate_ids", ()))
         ids.update(item.get("evidence_ids", ()))
+        paths.extend(item.get("retrieval_paths", ()))
     scope = {item["evidence_id"]: item for item in report["evidence"] if item["evidence_id"] in ids}
     for check in report.get("external_checks", ()):
         if check.get("support_status") != "not_supported":
@@ -116,7 +119,7 @@ def _scope(report: dict, findings: list[dict], additional_ids=()) -> list[dict]:
         for item in check.get("evidence", ()):
             if item["evidence_id"] in reviewed:
                 scope.setdefault(item["evidence_id"], item)
-    return list(scope.values())
+    return with_method_scope(scope.values(), paths)
 
 
 def _numeric_draft(source: str, evidence: list[dict]) -> RevisionDraft | None:
@@ -529,8 +532,11 @@ def _check_changes(report: dict, original: dict, revised: dict, model, followups
             else:
                 if index is None:
                     index = EvidenceIndex(report["evidence"])
-                related = index.search(source["text"] + " " + target["text"], limit=8)["evidence"]
-                evidence = _scope(report, findings, (item["evidence_id"] for item in related))
+                related = index.search(source["text"] + " " + target["text"], limit=8)
+                related_ids = [item["evidence_id"] for item in related["evidence"]]
+                context = index.table_context(related_ids)
+                evidence = _scope(report, findings, [*related_ids, *(item["evidence_id"] for item in context["evidence"])],
+                                  additional_paths=related["paths"])
                 finding_revision = len(report.get("finding_history", []))
                 result = _verify_sentence(source["text"], target["text"], evidence, model,
                                           followups=followups, keys=keys,

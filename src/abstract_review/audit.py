@@ -12,7 +12,7 @@ from pydantic import Field
 
 from .calculations import comparison_for_claim
 from .compound import aggregate_compound_findings, attach_compound, offline_compound_parts, requires_whole_sentence
-from .evidence import EvidenceIndex
+from .evidence import EvidenceIndex, with_method_scope
 from .models import Extraction, Judgement, ModelPaused, ModelUnavailable, Schema
 
 
@@ -315,15 +315,29 @@ def supplied_claims(source: tuple[tuple[str, str], ...]) -> list[dict]:
 
 
 def blind_evidence(evidence: list[dict]) -> list[dict]:
-    permitted = {"evidence_id", "doc_id", "kind", "text", "locator", "row_header", "column_header"}
+    permitted = {"evidence_id", "doc_id", "kind", "text", "locator", "row_header", "column_header",
+                 "column_header_path", "cell_role", "note_marker", "note_scope"}
     return [{key: item[key] for key in sorted(item.keys() & permitted)}
             for item in sorted(evidence, key=lambda item: item["evidence_id"])]
 
 
-def validate_ids(ids: list[str], evidence: list[dict]) -> None:
+def validate_ids(ids: list[str], evidence: Iterable[dict]) -> None:
     allowed = {item["evidence_id"] for item in evidence}
     if not allowed.issuperset(ids):
         raise ModelUnavailable("model cited evidence outside the supplied scope")
+
+
+def _sent_paths(paths: list[dict], sent_ids: list[str]) -> list[dict]:
+    sent = set(sent_ids)
+    unique = {}
+    for path in paths:
+        if sent.issuperset(path["evidence_ids"]):
+            key = (tuple(path["evidence_ids"]), tuple(
+                (edge["relation"], tuple(anchor["evidence_id"] for anchor in edge["anchors"]))
+                for edge in path["edges"]
+            ))
+            unique.setdefault(key, path)
+    return list(unique.values())
 
 
 def _pending(claim: dict, reason: str, *, status: str = "pending") -> dict:
@@ -437,11 +451,20 @@ def review_claim(
         interleaved = (eid for tier in range(8) for column in breadth for eid in column[tier:tier + 1])
         balanced_ids = list(dict.fromkeys((*prioritized, *interleaved)))
         candidates = [by_id[eid] for eid in balanced_ids[:8]]
-        comparison = None if claim.get("logic_review_required") else comparison_for_claim(claim["proposition"], candidates)
+        context = index.table_context(item["evidence_id"] for item in candidates)
+        context_by_id = {item["evidence_id"]: item for item in context["evidence"]}
+        table_context = [
+            {"cell_evidence_id": eid, "evidence": blind_evidence([context_by_id[related] for related in related_ids])}
+            for eid, related_ids in sorted(context["by_seed"].items())
+        ]
+        scoped = {item["evidence_id"]: item for item in [*candidates, *context["evidence"]]}
+        comparison = None if claim.get("logic_review_required") else comparison_for_claim(
+            claim["proposition"], with_method_scope(scoped.values(), paths)
+        )
         calculation = comparison[0] if comparison else None
         if model is None:
             finding = _offline(claim, candidates, comparison)
-            sent_candidate_ids = [item["evidence_id"] for item in candidates]
+            sent_candidate_ids = list(scoped)
             break
         if claim["kind"] in {"background", "purpose"}:
             finding = _pending(claim, "This sentence is outside original-paper result verification.")
@@ -455,18 +478,24 @@ def review_claim(
                         "Ordinary search is not a complete inspection. For missing fields, request up to two concrete "
                         "follow_up_targets tied to the exact field name, with a section, table label or page when known."
                     )}
+        if table_context:
+            material["table_context"] = table_context
         if data_dir and any(item["kind"] == "figure" for item in candidates):
             material["figure_images"] = _figure_images(candidates, documents, data_dir)
         try:
             output = model.call("judge", material, ScopedJudgement)
-            sent_candidate_ids = [item["evidence_id"] for item in material["evidence"]]
+            sent_candidate_ids = list(dict.fromkeys(
+                item["evidence_id"] for item in [
+                    *material["evidence"], *(item for group in table_context for item in group["evidence"])
+                ]
+            ))
             ids = list(dict.fromkeys(eid for group in output.evidence_groups for eid in group.evidence_ids))
             try:
-                validate_ids(ids, candidates)
+                validate_ids(ids, scoped.values())
             except ModelUnavailable:
                 output = model.call("judge", {**material, "retry": "Review the supplied IDs carefully."}, ScopedJudgement)
                 ids = list(dict.fromkeys(eid for group in output.evidence_groups for eid in group.evidence_ids))
-                validate_ids(ids, candidates)
+                validate_ids(ids, scoped.values())
         except ModelUnavailable as exc:
             finding = _pending(claim, str(exc))
             finding["retryable"] = isinstance(exc, ModelPaused)
@@ -513,11 +542,18 @@ def review_claim(
     finding["candidate_ids"] = candidate_ids
     finding["sent_candidate_ids"] = sent_candidate_ids
     finding["searched_scope"] = examined_scopes
-    sent = set(sent_candidate_ids)
-    finding["retrieval_paths"] = [path for path in paths if sent.issuperset(path["evidence_ids"])]
+    finding["retrieval_paths"] = _sent_paths([*paths, *context["paths"]], sent_candidate_ids)
+    if table_context and sent_candidate_ids:
+        finding["table_context"] = [
+            {"cell_evidence_id": group["cell_evidence_id"],
+             "evidence_ids": [item["evidence_id"] for item in group["evidence"]]}
+            for group in table_context
+        ]
     finding["follow_up_performed"] = followup
     if "coverage" not in finding:
         offline_ids = finding["evidence_ids"] if model is None and finding["review_status"] == "completed" else ()
+        if calculation and offline_ids:
+            offline_ids = [*offline_ids, *calculation.get("scope_evidence_ids", ())]
         finding["coverage"] = _coverage(requirements, None, examined_scopes, sent_candidate_ids, offline_ids)
     if finding["verdict"] == "insufficient":
         stop = "source_range_exhausted"

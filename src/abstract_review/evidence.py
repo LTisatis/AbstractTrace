@@ -25,6 +25,16 @@ _EXPERIMENT = re.compile(
     r"(?:(?<![a-z0-9])(?:experiment\s+|exp\.\s*)|实验(?:编号|号)?\s*)"
     r"[:#]?\s*([a-z]*\d+(?:[-.]\d+)*[a-z]?)(?![a-z0-9])"
 )
+_METHOD_SECTION = re.compile(r"^(?:(?:materials and )?methods?|methodology|experimental setup|材料与方法|方法|实验设置)(?:\s|$)")
+_RESULT_SECTION = re.compile(r"^(?:results?|evaluation|experiments?|结果(?:与讨论)?|实验)(?:\s|$)")
+_SHORT_MARKER = r"(?:[a-z]|\d{1,2})"
+_MARKER = rf"(?:\(\s*{_SHORT_MARKER}\s*\)|\[\s*{_SHORT_MARKER}\s*\]|\*{{1,3}}|[†‡⁰¹²³⁴⁵⁶⁷⁸⁹ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ])"
+_MARKER_SUFFIX = re.compile(rf"({_MARKER})\s*$", re.IGNORECASE)
+_MARKER_PREFIX = re.compile(
+    rf"^\s*(?:(?:notes?(?:\s+(?:for|to)\s+{_TABLE_MENTION})?|{_TABLE_MENTION}\s*(?:notes?|注释?)|注释?|说明)"
+    rf"\s*[:：.]\s*)?(?P<marker>{_MARKER})\s*",
+    re.IGNORECASE,
+)
 _UNIT = r"%|百分点|percentage\s+points?|p\.?p\.?\b"
 _NUMBER = re.compile(rf"(?<![a-z0-9_.])([+-]?(?:\d+(?:\.\d+)?|\.\d+))(?:\s*({_UNIT}))?")
 _MAX_CANDIDATES = 24
@@ -40,8 +50,9 @@ _LINK_PRIORITY = {
     "figure_panel": 2,
     "row_header": 3,
     "column_header": 4,
-    "same_table": 5,
+    "same_row": 5,
 }
+_TABLE_CONTEXT = {"row_header", "column_header", "table_note"}
 
 
 class Embedder(Protocol):
@@ -127,6 +138,16 @@ def _cell_position(record: dict) -> tuple[int, int] | None:
     return None
 
 
+def _data_cell(record: dict) -> bool:
+    return record.get("kind") == "table_cell" and record.get("cell_role", "value") == "value" and (
+        (position := _cell_position(record)) is not None and min(position) > 0
+    )
+
+
+def _marker(value: str) -> str:
+    return _normalize(value).strip().strip("()[].").strip()
+
+
 def _table_label(record: dict) -> str | None:
     value = _text_field(record, "table_label") or _text_field(record["locator"], "table_label")
     return _printed_table_label(value)
@@ -170,6 +191,22 @@ class _Edge:
     anchors: tuple[str, ...]
 
 
+def with_method_scope(records: Iterable[dict], paths: Iterable[dict]) -> list[dict]:
+    """Expose Methods only for result cells with a complete, selected graph path."""
+    by_id = {record["evidence_id"]: record for record in records}
+    links = defaultdict(dict)
+    for path in paths:
+        nodes = path["evidence_ids"]
+        edges = path["edges"]
+        if len(nodes) < 2 or not edges or not by_id.keys() >= set(nodes):
+            continue
+        cell, method = by_id[nodes[0]], by_id[nodes[-1]]
+        if (_data_cell(cell) and EvidenceIndex._methods(method) and _document_key(cell) == _document_key(method)
+                and edges[-1]["relation"] in {"same_experiment", "table_reference"}):
+            links[nodes[0]][nodes[-1]] = None
+    return [{**row, "method_evidence_ids": list(links[eid])} if eid in links else row for eid, row in by_id.items()]
+
+
 def _unit_vectors(embedder: Embedder, texts: list[str]) -> list[tuple[float, ...]]:
     vectors = []
     for values in embedder.encode(texts):
@@ -192,6 +229,8 @@ class EvidenceIndex:
         self._graph: dict[str, set[_Edge]] = defaultdict(set)
         self._table_indexes: dict[tuple, list[str]] = defaultdict(list)
         self._named_tables: dict[str, set[str]] = defaultdict(set)
+        self._row_headers: dict[str, str] = {}
+        self._column_families: dict[str, tuple[str, ...]] = {}
         self._embedder = embedder
         texts = []
         lexical_rows = []
@@ -215,8 +254,9 @@ class EvidenceIndex:
         vectors = _unit_vectors(embedder, texts) if embedder is not None and texts else []
         self._vectors = dict(zip(self._records, vectors))
         self._build_tables()
-        self._build_experiments()
         self._build_ingest_links()
+        self._experiment_anchors = {eid: self._experiment_anchor(eid) for eid in self._records}
+        self._build_experiments()
         self._fts = sqlite3.connect(":memory:")
         try:
             self._fts.execute("CREATE VIRTUAL TABLE lexical USING fts5(evidence_id UNINDEXED, text, tokenize='unicode61')")
@@ -246,30 +286,75 @@ class EvidenceIndex:
         return eid
 
     def _connect(self, first: str, second: str, relation: str, *anchors: str) -> None:
-        if first == second or _document_key(self._records[first]) != _document_key(self._records[second]):
+        document = _document_key(self._records[first])
+        if first == second or any(
+            aid not in self._records or _document_key(self._records[aid]) != document
+            for aid in (second, *anchors)
+        ):
             return
         self._graph[first].add(_Edge(second, relation, anchors))
         self._graph[second].add(_Edge(first, relation, anchors))
 
     def _connect_cells(self, ids: list[str]) -> None:
-        positions = {}
+        positions: dict[tuple[int, int], list[str]] = defaultdict(list)
+        rows: dict[str, list[str]] = defaultdict(list)
         for eid in ids:
             position = _cell_position(self._records[eid])
             if position is not None:
-                positions[position] = eid
-        for (row, column), eid in positions.items():
+                positions[position].append(eid)
+        for (row, column), cell_ids in positions.items():
+            if len(cell_ids) != 1 or not row or not column:
+                continue
+            eid = cell_ids[0]
             cell = self._records[eid]
-            for next_position in ((row + 1, column), (row, column + 1)):
-                nearby = positions.get(next_position)
-                if nearby is not None:
-                    self._connect(eid, nearby, "same_table", eid, nearby)
-            for key, target in (("row_header", (row, 0)), ("column_header", (0, column))):
-                header_id = positions.get(target)
-                if header_id is None:
+            if not _data_cell(cell):
+                continue
+            row_header = cell.get("row_header_evidence_id")
+            if not isinstance(row_header, str):
+                row_header = self._legacy_header(cell, "row_header", positions.get((row, 0), []))
+            if (row_header in positions.get((row, 0), []) and len(positions[(row, 0)]) == 1
+                    and self._records[row_header].get("cell_role", "row_header") == "row_header"):
+                self._row_headers[eid] = row_header
+                self._connect(eid, row_header, "row_header", row_header)
+                rows[row_header].append(eid)
+
+            column_headers = cell.get("column_header_evidence_ids")
+            if not isinstance(column_headers, list):
+                legacy = self._legacy_header(cell, "column_header", positions.get((0, column), []))
+                column_headers = [legacy] if legacy is not None else []
+            verified_columns = []
+            for header_id in column_headers:
+                header = self._records.get(header_id) if isinstance(header_id, str) else None
+                if header is None or _table_key(header) != _table_key(cell) or header.get("kind") != "table_cell":
                     continue
-                header = _normalize(_text_field(cell, key)).strip()
-                if header and header == _normalize(self._records[header_id]["text"]).strip():
-                    self._connect(eid, header_id, key, header_id)
+                if header.get("cell_role", "column_header") != "column_header":
+                    continue
+                if (position := _cell_position(header)) is None or positions[position] != [header_id]:
+                    continue
+                header_row, header_column = position
+                if header_row >= row:
+                    continue
+                if header_column != column:
+                    header_box, cell_box = _bbox(header), _bbox(cell)
+                    if (not header_box or not cell_box
+                            or header_box[0] > cell_box[0] + 0.5 or header_box[2] < cell_box[2] - 0.5):
+                        continue
+                self._connect(eid, header_id, "column_header", header_id)
+                verified_columns.append(header_id)
+            if len(verified_columns) > 1 and verified_columns == column_headers:
+                self._column_families[eid] = tuple(verified_columns[:-1])
+
+        for row_header, row_ids in rows.items():
+            row_ids.sort(key=lambda eid: self._records[eid]["locator"]["column_index"])
+            for left, right in zip(row_ids, row_ids[1:]):
+                if self._column_families.get(left) == self._column_families.get(right):
+                    self._connect(left, right, "same_row", row_header, left, right)
+
+    def _legacy_header(self, cell: dict, key: str, candidates: list[str]) -> str | None:
+        expected = _normalize(_text_field(cell, key)).strip()
+        if len(candidates) == 1 and expected == _normalize(self._records[candidates[0]]["text"]).strip():
+            return candidates[0]
+        return None
 
     def _build_tables(self) -> None:
         table_labels: dict[tuple, set[str]] = defaultdict(set)
@@ -284,7 +369,9 @@ class EvidenceIndex:
                     table_labels[table].add(label)
 
         for eid, record in self._records.items():
-            if record.get("kind") == "table_cell":
+            if record.get("kind") in {"table_cell", "table_note", "figure"} or (
+                record["locator"].get("table_continuation") == "unverified"
+            ):
                 continue
             caption_match = _TABLE_CAPTION.match(_normalize(record["text"]))
             label = caption_match[1] if caption_match else None
@@ -316,17 +403,30 @@ class EvidenceIndex:
                 labeled_tables[(table[0], label)].append(table)
 
         for eid, record in self._records.items():
-            if record.get("kind") == "table_cell":
+            if record.get("kind") in {"table_cell", "table_note", "figure"}:
                 continue
             for label in set(_TABLE_REFERENCE.findall(_normalize(record["text"]))):
                 key = _document_key(record), label
                 targets = captions.get(key, [])
-                if len(targets) == 1:
-                    self._connect(eid, targets[0], "table_reference", eid)
-                elif not targets and len(labeled_tables.get(key, [])) == 1:
-                    table = labeled_tables[key][0]
-                    first_cell = min(self._table_indexes[table])
+                tables = labeled_tables.get(key, [])
+                groups = {self._logical_table(table) for table in tables}
+                if len(groups) > 1:
+                    continue
+                originals = [cid for cid in targets if not self._records[cid]["locator"].get("continued_from")]
+                if len(originals) == 1 and len({
+                    _text_field(self._records[cid]["locator"], "table_group_id") or originals[0]
+                    for cid in targets
+                }) == 1:
+                    self._connect(eid, originals[0], "table_reference", eid)
+                elif not targets and len(tables) == 1:
+                    first_cell = min(self._table_indexes[tables[0]])
                     self._connect(eid, first_cell, "table_reference", eid, first_cell)
+
+    def _logical_table(self, table: tuple) -> tuple | str:
+        groups = {_text_field(self._records[eid]["locator"], "table_group_id") for eid in self._table_indexes[table]}
+        if len(groups) == 1 and (group := next(iter(groups))):
+            return group
+        return table
 
     def _nearby_tables(self, record: dict, tables: list[tuple], labels: dict, label: str) -> list[tuple]:
         caption_box = _bbox(record)
@@ -341,22 +441,90 @@ class EvidenceIndex:
                 nearby.append(table)
         return nearby
 
-    def _build_experiments(self) -> None:
-        groups: dict[tuple, list[str]] = defaultdict(list)
-        for eid, record in self._records.items():
-            for reference in set(_EXPERIMENT.findall(_normalize(record["text"]))):
-                groups[(_document_key(record), reference)].append(eid)
-        for ids in groups.values():
-            def method_first(eid: str) -> tuple[bool, str]:
-                section = _normalize(_text_field(self._records[eid]["locator"], "section"))
-                return not ("method" in section or "方法" in section), eid
+    def _experiment_anchor(self, eid: str) -> tuple[frozenset[str], str]:
+        record = self._records[eid]
+        explicit = frozenset(_EXPERIMENT.findall(_normalize(record["text"])))
+        header_id = self._row_headers.get(eid)
+        if header_id is not None:
+            header = self._records[header_id]
+            row_refs = frozenset(_EXPERIMENT.findall(_normalize(header["text"])))
+            if row_refs:
+                return explicit | row_refs, header_id
+        return explicit, eid
 
-            center = min(ids, key=method_first)
-            for eid in ids:
-                self._connect(center, eid, "same_experiment", center, eid)
+    @staticmethod
+    def _methods(record: dict) -> bool:
+        return record.get("kind") == "body_text" and bool(
+            _METHOD_SECTION.match(_section_key(_text_field(record["locator"], "section")))
+        )
+
+    @staticmethod
+    def _results(record: dict) -> bool:
+        return _data_cell(record) or (record.get("kind") == "body_text" and bool(
+            _RESULT_SECTION.match(_section_key(_text_field(record["locator"], "section")))
+        ))
+
+    def _build_experiments(self) -> None:
+        methods: dict[tuple, list[str]] = defaultdict(list)
+        for eid, record in self._records.items():
+            references, _ = self._experiment_anchors[eid]
+            if len(references) == 1 and self._methods(record):
+                methods[(_document_key(record), next(iter(references)))].append(eid)
+        for eid, record in self._records.items():
+            references, anchor_id = self._experiment_anchors[eid]
+            if len(references) == 1 and self._results(record):
+                for method_id in methods[(_document_key(record), next(iter(references)))]:
+                    self._connect(eid, method_id, "same_experiment", anchor_id, method_id)
+
+    def _build_notes(self, eid: str, cell: dict, markers: dict[tuple, set[str]]) -> None:
+        links = cell.get("note_links")
+        if not _data_cell(cell) or not isinstance(links, list):
+            return
+        table = _table_key(cell)
+        if table is None:
+            return
+        headers = {edge.target_id for edge in self._graph[eid] if edge.relation in {"row_header", "column_header"}}
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            note_id, anchor_id = link.get("note_evidence_id"), link.get("anchor_evidence_id")
+            if not isinstance(note_id, str) or not isinstance(anchor_id, str):
+                continue
+            note, anchor = self._records.get(note_id), self._records.get(anchor_id)
+            if not note or not anchor or note.get("kind") != "table_note" or _table_key(note) != table:
+                continue
+            marker = link.get("marker")
+            if note.get("note_scope") == "marked_cells" and isinstance(marker, str):
+                if anchor_id != eid and anchor_id not in headers:
+                    continue
+                reference = _MARKER_SUFFIX.search(anchor["text"])
+                definition = _MARKER_PREFIX.match(note["text"])
+                if not reference or not definition or not (
+                    _marker(reference[1]) == _marker(definition["marker"]) == _marker(marker)
+                    == _marker(_text_field(note, "note_marker"))
+                ):
+                    continue
+                if markers.get((table, _marker(marker))) != {note_id}:
+                    continue
+            elif note.get("note_scope") == "table" and marker is None:
+                caption_id = cell.get("caption_evidence_id")
+                if caption_id is None:
+                    caption_id = min(self._table_indexes[table], key=lambda item: (
+                        _cell_position(self._records[item]) or (math.inf, math.inf), item,
+                    ))
+                if anchor_id != caption_id or _table_key(anchor) != table:
+                    continue
+            else:
+                continue
+            self._connect(eid, note_id, "table_note", anchor_id, note_id)
 
     def _build_ingest_links(self) -> None:
         figures: dict[tuple, list[str]] = defaultdict(list)
+        markers: dict[tuple, set[str]] = defaultdict(set)
+        for eid, record in self._records.items():
+            if record.get("kind") == "table_note" and record.get("note_scope") == "marked_cells":
+                if marker := _text_field(record, "note_marker"):
+                    markers[(_table_key(record), _marker(marker))].add(eid)
         for eid, record in self._records.items():
             locator = record["locator"]
             kind = record.get("kind")
@@ -368,6 +536,10 @@ class EvidenceIndex:
             if caption is not None:
                 relation = {"figure": "figure_caption", "table_cell": "table_caption",
                             "table_note": "table_note"}.get(kind)
+                if kind in {"table_cell", "table_note"} and (
+                    _table_key(record) is None or _table_key(record) != _table_key(caption)
+                ):
+                    relation = None
                 if relation:
                     self._connect(eid, caption_id, relation, caption_id)
             if kind == "figure" and (label := _text_field(record, "figure_label")):
@@ -379,6 +551,8 @@ class EvidenceIndex:
                         self._connect(eid, parent_id, "figure_panel", caption_id, eid)
             if kind == "table_note" and (label := _table_label(record)):
                 self._named_tables[label].add(eid)
+            if kind == "table_cell":
+                self._build_notes(eid, record, markers)
             previous = locator.get("continued_from")
             if not isinstance(previous, dict) or caption is None:
                 continue
@@ -447,6 +621,31 @@ class EvidenceIndex:
         )
         return [eid for (eid,) in rows if eid in active]
 
+    def _compatible_walk(self, seed: str, target: str) -> bool:
+        origin, other = self._records[seed], self._records[target]
+        origin_refs, _ = self._experiment_anchors[seed]
+        other_refs, _ = self._experiment_anchors[target]
+        if (origin_refs and other_refs and origin_refs != other_refs
+                and (self._methods(other) or _data_cell(other))):
+            return False
+        if not _data_cell(origin):
+            return True
+        if other.get("kind") == "table_note":
+            return any(edge.relation == "table_note" and edge.target_id == target for edge in self._graph[seed])
+        if other.get("kind") == "table_cell":
+            if _table_key(origin) != _table_key(other):
+                return False
+            if any(edge.relation in _TABLE_CONTEXT and edge.target_id == target for edge in self._graph[seed]):
+                return True
+            header = self._row_headers.get(seed)
+            return (header is not None and header == self._row_headers.get(target)
+                    and self._column_families.get(seed) == self._column_families.get(target))
+        return True
+
+    @staticmethod
+    def _edge_order(edge: _Edge) -> tuple:
+        return _LINK_PRIORITY[edge.relation], edge.target_id, edge.anchors
+
     def _walk(self, seed: str, active: set[str]) -> Iterable[tuple[tuple[str, ...], tuple[_Edge, ...]]]:
         queue = deque([((seed,), ())])
         while queue:
@@ -455,9 +654,13 @@ class EvidenceIndex:
                 yield nodes, path
             if len(path) == 2:
                 continue
-            for edge in self._graph.get(nodes[-1], ()):
-                if edge.target_id in active and edge.target_id not in nodes:
-                    queue.append(((*nodes, edge.target_id), (*path, edge)))
+            eligible = (
+                edge for edge in self._graph.get(nodes[-1], ())
+                if edge.target_id in active and edge.target_id not in nodes
+                and active.issuperset(edge.anchors) and self._compatible_walk(seed, edge.target_id)
+            )
+            for edge in sorted(eligible, key=self._edge_order)[:_MAX_CANDIDATES]:
+                queue.append(((*nodes, edge.target_id), (*path, edge)))
 
     def _expand(self, ranked: list[str], limit: int, active: set[str]) -> tuple[list[str], list[dict]]:
         if limit <= 1:
@@ -488,27 +691,65 @@ class EvidenceIndex:
             if len(selected) >= limit:
                 break
             selected[eid] = None
-        return list(selected), paths
+        # Keep method paths intact near their best-ranked source before the caller combines queries.
+        prioritized = dict.fromkeys(seeds[:1])
+        for path in paths:
+            if path["edges"][-1]["relation"] in {"same_experiment", "table_reference"}:
+                prioritized.update(dict.fromkeys(path["evidence_ids"]))
+        prioritized.update(selected)
+        return list(prioritized), paths
 
     def _serialize_path(self, nodes: tuple[str, ...], edges: tuple[_Edge, ...]) -> list[dict]:
         result = []
         for source, edge in zip(nodes, edges):
-            result.append({
+            doc_id, version_id = _document_key(self._records[source])
+            serialized = {
                 "from_id": source,
                 "to_id": edge.target_id,
                 "relation": edge.relation,
-                "doc_id": self._records[source]["doc_id"],
+                "doc_id": doc_id,
                 "anchors": [
                     {"evidence_id": aid, "locator": deepcopy(self._records[aid]["locator"]),
                      "text": self._records[aid]["text"]}
                     for aid in edge.anchors
                 ],
-            })
+            }
+            if version_id:
+                serialized["doc_version_id"] = version_id
+            result.append(serialized)
         return result
+
+    def table_context(self, seed_ids: Iterable[str], *, max_per_cell: int = 6) -> dict:
+        """Return direct header and note sources linked to each supplied result cell."""
+        if type(max_per_cell) is not int or not 0 <= max_per_cell <= _MAX_CANDIDATES:
+            raise ValueError("invalid per-cell context limit")
+        seeds = self.get(seed_ids)
+        if len(seeds) > _MAX_CANDIDATES:
+            raise ValueError("too many result cells for table context")
+        by_seed = {}
+        all_ids = {}
+        paths = []
+        for seed in seeds:
+            seed_id = seed["evidence_id"]
+            if seed_id in by_seed or not _data_cell(seed):
+                continue
+            ids = {}
+            edges = (edge for edge in self._graph.get(seed_id, ()) if edge.relation in _TABLE_CONTEXT)
+            for edge in sorted(edges, key=self._edge_order):
+                related = tuple(dict.fromkeys(aid for aid in (*edge.anchors, edge.target_id) if aid != seed_id))
+                if len(ids.keys() | set(related)) > max_per_cell:
+                    continue
+                ids.update(dict.fromkeys(related))
+                nodes = (seed_id, edge.target_id)
+                paths.append({"evidence_ids": list(nodes), "edges": self._serialize_path(nodes, (edge,))})
+            if ids:
+                by_seed[seed_id] = list(ids)
+                all_ids.update(ids)
+        return {"evidence": self.get(all_ids), "paths": paths, "by_seed": by_seed}
 
     def search(
         self, query: str, *, limit: int = 8, section: str | None = None, expand: bool = True,
-        doc_id: str | None = None,
+        doc_id: str | None = None, doc_version_id: str | None = None,
     ) -> dict:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("evidence query must be nonempty text")
@@ -521,6 +762,7 @@ class EvidenceIndex:
         active = {
             eid for eid, record in self._records.items()
             if (doc_id is None or record["doc_id"] == doc_id)
+            and (doc_version_id is None or _document_key(record)[1] == doc_version_id)
             and (section_key is None or section_key in _normalize(_text_field(record["locator"], "section")))
         }
         exact, query_without_exact = _exact_terms(query)
@@ -549,6 +791,7 @@ class EvidenceIndex:
                 "query": query,
                 "section": section,
                 "doc_id": doc_id,
+                "doc_version_id": doc_version_id,
                 "document_ids": sorted({doc_id for doc_id, _, _ in locations}),
                 "locations": [
                     {"doc_id": doc_id, "page_index": page, "section": section_name}
@@ -563,7 +806,8 @@ class EvidenceIndex:
 
     def inspect(
         self, *, section: str | None = None, table_label: str | None = None,
-        page_index: int | None = None, doc_id: str | None = None, limit: int = 8,
+        page_index: int | None = None, doc_id: str | None = None, doc_version_id: str | None = None,
+        limit: int = 8,
     ) -> dict:
         """Read a named local source directly, independent of relevance ranking."""
         if section is None and table_label is None and page_index is None:
@@ -577,6 +821,8 @@ class EvidenceIndex:
         for eid, record in self._records.items():
             locator = record["locator"]
             if doc_id is not None and record["doc_id"] != doc_id:
+                continue
+            if doc_version_id is not None and _document_key(record)[1] != doc_version_id:
                 continue
             if page_index is not None and locator["page_index"] != page_index:
                 continue
@@ -595,7 +841,7 @@ class EvidenceIndex:
         }
         return {"evidence": chosen, "scope": {
             "mode": "direct", "section": section, "table_label": table_label,
-            "page_index": page_index, "doc_id": doc_id, "matching_count": len(ids),
+            "page_index": page_index, "doc_id": doc_id, "doc_version_id": doc_version_id, "matching_count": len(ids),
             "complete": bool(ids) and len(ids) <= limit,
             "examined_evidence_ids": [item["evidence_id"] for item in chosen],
             "document_ids": sorted({doc for doc, _, _ in locators}),

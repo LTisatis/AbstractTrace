@@ -111,11 +111,15 @@ def _marks(selected: dict, page_evidence: list[dict]) -> list[tuple[pymupdf.Rect
     marks = []
     table, row, column = (locator.get(key) for key in ("table_index", "row_index", "column_index"))
     if selected.get("kind") == "table_cell" and all(type(value) is int for value in (table, row, column)):
-        headers = {(0, column), (row, 0)} - {(row, column)}
+        related_ids = {selected.get("row_header_evidence_id"), *selected.get("column_header_evidence_ids", ()),
+                       *selected.get("note_evidence_ids", ())} - {None, selected["evidence_id"]}
+        legacy_headers = {(0, column), (row, 0)} - {(row, column)} if "cell_role" not in selected else set()
         for item in page_evidence:
             loc = item["locator"]
             position = loc.get("row_index"), loc.get("column_index")
-            if item.get("kind") == "table_cell" and loc.get("table_index") == table and position in headers:
+            linked = item["evidence_id"] in related_ids
+            legacy = item.get("kind") == "table_cell" and position in legacy_headers
+            if loc.get("table_index") == table and (linked or legacy):
                 if rect := _box(loc):
                     marks.append((rect, False))
     if rect := _box(locator):

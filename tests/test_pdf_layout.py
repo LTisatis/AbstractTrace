@@ -23,6 +23,24 @@ def table(page, caption, headings, value):
             page.insert_text((x, y), text)
 
 
+def layered_table(page, label):
+    page.insert_text((43, 83), label, fontsize=9)
+    for x in (40, 120, 254, 388):
+        page.draw_line((x, 100), (x, 204))
+    for x in (188, 322):
+        page.draw_line((x, 125), (x, 204))
+    for y in (100, 125, 150, 177, 204):
+        page.draw_line((40, y), (388, y))
+    for x, text in ((48, "Dataset"), (130, "Accuracy"), (261, "F1")):
+        page.insert_text((x, 119), text, fontsize=9)
+    for y, values in ((144, ("", "Baseline", "Final", "Baseline", "Final")),
+                      (169, ("A", "80%", "88%(a)", "80%", "88%(b)")),
+                      (195, ("B", "44%", "48%", "41%", "49%"))):
+        for x, text in zip((48, 128, 196, 264, 330), values):
+            if text:
+                page.insert_text((x, y), text, fontsize=9)
+
+
 def test_continued_table_needs_an_explicit_marker_and_the_same_headers(tmp_path):
     ordinary_headers = ("Dataset", "Baseline", "Final")
     with pymupdf.open() as paper:
@@ -54,6 +72,83 @@ def test_continued_table_needs_an_explicit_marker_and_the_same_headers(tmp_path)
             assert (locator["page_index"], locator["page_number"]) == (page_index, page_index + 1)
             assert original[page_index].get_textbox(pymupdf.Rect(locator["bbox"])) == item["text"]
     assert parse_pdf(path).evidence == parsed.evidence
+
+
+def test_layered_headers_notes_and_experiment_anchors_follow_actual_pdf_boxes(tmp_path):
+    with pymupdf.open() as paper:
+        methods = paper.new_page(width=435, height=500)
+        methods.insert_text((41, 42), "Methods")
+        methods.insert_text((41, 68), "For Experiment E1, we used a fixed test split.")
+        methods.insert_text((41, 93), "For Experiment E2, we used the tuning split.")
+        results = paper.new_page(width=435, height=500)
+        results.insert_text((41, 42), "Results")
+        layered_table(results, "Table 2. Results for Experiment E1.")
+        results.insert_text((42, 219), "(a) Accuracy used the fixed test split.", fontsize=9)
+        results.insert_text((42, 232), "(b) F1 used the tuning split.", fontsize=9)
+        path = save(paper, tmp_path / "anchored.pdf")
+
+    found = parse_pdf(path).evidence
+    ids = {item["evidence_id"]: item for item in found}
+    a = next(item for item in found if item["text"] == "88%(a)")
+    b = next(item for item in found if item["text"] == "88%(b)")
+    caption = ids[a["caption_evidence_id"]]
+    assert a["column_header_path"] == ["Accuracy", "Final"]
+    assert b["column_header_path"] == ["F1", "Final"]
+    assert a["column_header"] == b["column_header"] == "Final"
+    for cell, marker in ((a, "a"), (b, "b")):
+        note_link, = cell["note_links"]
+        note = ids[note_link["note_evidence_id"]]
+        assert note["kind"] == "table_note" and note["note_marker"] == marker
+        assert note["note_scope"] == "marked_cells"
+        assert note["locator"]["page_index"] == cell["locator"]["page_index"] == 1
+        assert note["locator"]["table_index"] == cell["locator"]["table_index"]
+        assert note_link["anchor_evidence_id"] == cell["evidence_id"]
+        assert cell["numeric_text"] == "88%" and cell["text"].endswith(f"({marker})")
+        assert ids[cell["row_header_evidence_id"]]["text"] == "A"
+        assert [ids[eid]["text"] for eid in cell["column_header_evidence_ids"]] == cell["column_header_path"]
+
+    assert [ref["experiment_id"] for ref in caption["experiment_refs"]] == ["e1"]
+    matching = next(item for item in found if item["locator"]["section"] == "Methods" and "Experiment E1" in item["text"])
+    foil = next(item for item in found if item["locator"]["section"] == "Methods" and "Experiment E2" in item["text"])
+    assert [ref["experiment_id"] for ref in foil["experiment_refs"]] == ["e2"]
+    with pymupdf.open(path) as pdf:
+        for item in (a, b, caption, *(ids[eid] for eid in a["column_header_evidence_ids"]),
+                     *(ids[eid] for eid in a["note_evidence_ids"])):
+            locator = item["locator"]
+            assert pdf[locator["page_index"]].get_textbox(pymupdf.Rect(locator["bbox"])).strip() == item["text"]
+        ref, = matching["experiment_refs"]
+        assert ref["text"] == "Experiment E1"
+        assert "Experiment E1" in pdf[0].get_textbox(pymupdf.Rect(ref["bbox"]))
+    assert parse_pdf(path).evidence == found
+
+
+def test_ambiguous_duplicate_and_unlinked_markers_leave_numeric_text_raw(tmp_path):
+    with pymupdf.open() as paper:
+        page = paper.new_page(width=435, height=500)
+        layered_table(page, "Table 2. Duplicate marker.")
+        page.insert_text((42, 219), "(a) Accuracy used the fixed test split.", fontsize=9)
+        page.insert_text((42, 235), "(a) Accuracy used a different split.", fontsize=9)
+        page.insert_text((42, 374), "Note for Table 9: This refers elsewhere.", fontsize=9)
+        path = save(paper, tmp_path / "unproven.pdf")
+    evidence = parse_pdf(path).evidence
+    assert not any(item["kind"] == "table_note" for item in evidence)
+    marked = [item for item in evidence if item["text"] in {"88%(a)", "88%(b)"}]
+    assert len(marked) == 2 and all("numeric_text" not in item and "note_links" not in item for item in marked)
+
+
+def test_explicit_table_note_links_outside_the_footer_only_when_label_is_unique(tmp_path):
+    with pymupdf.open() as paper:
+        page = paper.new_page(width=435, height=500)
+        layered_table(page, "Table 2. Named note reference.")
+        page.insert_text((42, 374), "Note for Table 2: (a) Accuracy used the fixed test split.", fontsize=9)
+        path = save(paper, tmp_path / "named-note.pdf")
+    evidence = parse_pdf(path).evidence
+    note, = [item for item in evidence if item["kind"] == "table_note"]
+    assert note["table_label"] == "2" and note["note_marker"] == "a"
+    assert note["text"].startswith("Note for Table 2:")
+    marked = next(item for item in evidence if item["text"] == "88%(a)")
+    assert marked["note_evidence_ids"] == [note["evidence_id"]]
+    assert marked["numeric_text"] == "88%"
 
 
 def test_figure_requires_a_unique_visible_image_and_caption(tmp_path):

@@ -35,6 +35,8 @@ uv run abstract-review review export $run.run_id --version-id $run.report_versio
 
 `documents` 记录原文件名、SHA-256 和相对于数据目录的 `blob_path`。`evidence[].doc_id` 对应这份归档 PDF。用 `locator.page_index` 打开零基物理页，按 `locator.bbox` 在未旋转的裁剪页上定位文字区域。边框表格还提供表、行、列索引。`--supplement` 可重复使用，指定本人已确认归属的 PDF 附件。默认选 PDF 内摘要，有另贴摘要时可用 `--abstract-file PATH --abstract-source pasted` 切换。
 
+能从原页确认关系时，数据单元格会保留行表头、多层列表头和脚注的证据 ID。报告中的取证路径显示结果表如何连接到同一实验的方法段。Web 报告可以逐个打开这些原页锚点。
+
 不指定 `--engine` 时，PDF 入口只解析原始文档和锚点。PDF 解析依赖 PyMuPDF，分发时请参阅其许可说明。 [PyMuPDF 许可](https://pymupdf.readthedocs.io/en/latest/about.html#license-and-copyright)
 
 ## 审稿、修订与核验

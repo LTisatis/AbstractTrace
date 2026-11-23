@@ -39,6 +39,13 @@ def render_markdown(report: dict) -> str:
         text = item.get("proposition", item["text"]) if item.get("compound") else item["text"]
         lines.extend([f"- **{label}** · {_plain(text)}",
                       f"  {_plain(item['reason'])}", f"  {ids}" if ids else ""])
+        for path in item.get("retrieval_paths", ()):
+            nodes = " → ".join(f"`{eid}`" for eid in path["evidence_ids"])
+            steps = ", ".join(_plain(edge["relation"].replace("_", " ")) for edge in path["edges"])
+            anchors = list(dict.fromkeys(anchor["evidence_id"] for edge in path["edges"] for anchor in edge["anchors"]))
+            if anchors:
+                proof = ", ".join(f"`{eid}`" for eid in anchors)
+                lines.append(f"  - {steps} · {nodes} · source anchors {proof}")
     if groups := report.get("compound_findings"):
         lines.extend(["", "## Compound findings", ""])
         for group in groups:
@@ -83,7 +90,7 @@ def render_markdown(report: dict) -> str:
             location += f" · table {anchor['table_index'] + 1}, row {anchor['row_index'] + 1}, column {anchor['column_index'] + 1}"
         lines.extend([f"- `{item['evidence_id']}` · {location}", f"  {_plain(item['text'])}"])
     for key, title, fields in (
-        ("calculations", "Calculations", ("operation", "formula", "result", "unit", "evidence_ids")),
+        ("calculations", "Calculations", ("operation", "formula", "result", "unit", "evidence_ids", "scope_evidence_ids")),
         ("revisions", "Revisions", ("original_text", "replacement", "status", "evidence_ids")),
         ("omissions", "Omissions", ("status", "reason", "evidence_ids")),
         ("external_checks", "External checks", ("citation_status", "access_status", "support_status", "reason")),

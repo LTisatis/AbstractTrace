@@ -16,6 +16,7 @@ _COMPARE_TO = re.compile(r"\b(?:against|versus|vs\.?|compared\s+(?:to|with)|rela
 _DECREASE = re.compile(r"\b(?:decreas\w*|declin\w*|drop\w*|reduc\w*|lower\w*|fell|fall\w*)\b|降低|下降|减少", re.I)
 _INCREASE = re.compile(r"\b(?:increas\w*|improv\w*|gain\w*|ris\w*|rose|higher|grow\w*|grew)\b|提高|上升|增加|提升", re.I)
 _RELATIVE = re.compile(r"\b(?:relative(?:ly)?|by)\b|相对", re.I)
+_EXPLICIT_RELATIVE = re.compile(r"\brelative(?:ly)?(?:\s+[a-z]+){0,3}\s*$|相对(?:增加|提高|下降|降低)?\s*$", re.I)
 _LEVEL = re.compile(r"\b(?:was|were|is|of|reached|achieved|reported|at)\s*$|(?:为|达到|是)\s*$", re.I)
 _METRIC = re.compile(r"\b(?:accuracy|f[- ]?1|precision|recall|auc|rmse|mae|loss|latency|throughput)\b|准确率|召回率|精确率|延迟|损失", re.I)
 _TABLE = re.compile(r"\btable\s+[a-z]?\d+(?:\.\d+)?\b|表\s*[a-z]?\d+(?:\.\d+)?", re.I)
@@ -36,15 +37,67 @@ def _number(text: str) -> tuple[Decimal, str] | None:
     return value, "percent" if match.group(2) else "number"
 
 
-def _row_key(evidence: dict) -> tuple | None:
+def _table_key(evidence: dict) -> tuple | None:
     location = evidence.get("locator", {})
-    scope = (location.get("page_index"), location.get("table_index"), location.get("row_index"))
-    if evidence.get("kind") != "table_cell" or not evidence.get("doc_id") or None in scope:
+    scope = (location.get("page_index"), location.get("table_index"))
+    if not evidence.get("doc_id") or None in scope:
         return None
-    return evidence["doc_id"], evidence.get("document_version"), evidence.get("version"), *scope
+    version = (evidence.get("doc_version_id") or evidence.get("document_version_id")
+               or evidence.get("document_version") or evidence.get("version"))
+    return evidence["doc_id"], version, *scope
 
 
-def calculate(baseline: dict, target: dict, operation: str) -> dict:
+def _row_key(evidence: dict) -> tuple | None:
+    table = _table_key(evidence)
+    row = evidence.get("locator", {}).get("row_index")
+    if (table is None or row is None or evidence.get("kind") != "table_cell"
+            or evidence.get("cell_role") not in {None, "value"}):
+        return None
+    return *table, row
+
+
+def _table_sources(cell: dict, records: dict[str, dict]) -> list[dict]:
+    declared = (
+        (cell.get("row_header_evidence_id"), "table_cell"),
+        *((eid, "table_cell") for eid in cell.get("column_header_evidence_ids", ())),
+        *((eid, "table_note") for eid in cell.get("note_evidence_ids", ())),
+    )
+    return [
+        source for eid, kind in declared
+        if (source := records.get(eid)) is not None and source["kind"] == kind
+        and _table_key(source) == _table_key(cell)
+    ]
+
+
+def _operand_number(cell: dict, sources: list[dict]) -> tuple[Decimal, str] | None:
+    text = cell["text"]
+    direct_notes = {link["note_evidence_id"] for link in cell.get("note_links", ())
+                    if link["anchor_evidence_id"] == cell["evidence_id"]}
+    if direct_notes.intersection(source["evidence_id"] for source in sources if source["kind"] == "table_note"):
+        text = cell.get("numeric_text", text)
+    number = _number(text)
+    if number and number[1] == "number":
+        header_ids = cell.get("column_header_evidence_ids", ())
+        if any(source["evidence_id"] in header_ids and "%" in _normal(source["text"]) for source in sources):
+            return number[0], "percent"
+    return number
+
+
+def _column_path(cell: dict) -> tuple[str, ...]:
+    return tuple(_normal(part) for part in cell.get("column_header_path", ()))
+
+
+def _split_kind(label: str) -> str:
+    for pattern, kind in (
+        (r"validation|验证", "validation"), (r"test|测试", "test"),
+        (r"train|训练", "train"), (r"development|\bdev\b", "development"),
+    ):
+        if re.search(pattern, label):
+            return kind
+    return label
+
+
+def calculate(baseline: dict, target: dict, operation: str, *, evidence: dict[str, dict] | None = None) -> dict:
     """Require operands from the same row of the same versioned table."""
     result = {
         "operation": operation,
@@ -55,7 +108,18 @@ def calculate(baseline: dict, target: dict, operation: str) -> dict:
     if (_row_key(baseline) is None or _row_key(baseline) != _row_key(target)
             or None in (a.get("column_index"), b.get("column_index")) or a["column_index"] == b["column_index"]):
         return {**result, "status": "not_calculable", "reason": "operands do not share a comparable table row"}
-    left, right = _number(baseline["text"]), _number(target["text"])
+    if _column_path(baseline)[:-1] != _column_path(target)[:-1]:
+        return {**result, "status": "not_calculable", "reason": "operands belong to different column groups"}
+    records = evidence or {}
+    baseline_sources = _table_sources(baseline, records)
+    target_sources = _table_sources(target, records)
+    sources = [*baseline_sources, *target_sources]
+    if sources:
+        result["scope_evidence_ids"] = list(dict.fromkeys(source["evidence_id"] for source in sources))
+    splits = {_split_kind(match[0]) for source in sources for match in _SPLIT.finditer(_normal(source["text"]))}
+    if len(splits) > 1:
+        return {**result, "status": "not_calculable", "reason": "operand headers or notes use different data splits"}
+    left, right = _operand_number(baseline, baseline_sources), _operand_number(target, target_sources)
     if left is None or right is None or left[1] != right[1]:
         return {**result, "status": "not_calculable", "reason": "operand units or values are ambiguous"}
     original, unit = left
@@ -111,6 +175,7 @@ def _comparison_baseline(text: str, fallback: str) -> str | None:
 
 def _scoped_pair(text: str, sentence: str, source: str, candidates: list[dict]) -> tuple[tuple[dict, dict, list[str]] | None, str]:
     by_row = defaultdict(list)
+    by_id = {item["evidence_id"]: item for item in candidates}
     for item in candidates:
         if key := _row_key(item):
             by_row[key].append(item)
@@ -136,23 +201,11 @@ def _scoped_pair(text: str, sentence: str, source: str, candidates: list[dict]) 
             continue
         if expected_table and not any(_normal(item["locator"].get("table_label", "")) == expected_table[0] for item in row):
             continue
-        split = _SPLIT.search(subject)
-        split_evidence = []
-        if expected_split:
-            if split and split[0] != expected_split[0]:
-                continue
-            if not split:
-                split_evidence = [item["evidence_id"] for item in candidates
-                                  if item.get("kind") == "body_text" and item.get("doc_id") == row[0]["doc_id"]
-                                  and expected_split[0] in _normal(item["text"])
-                                  and _matches_subject(_normal(item["text"]), subject)]
-                if not split_evidence:
-                    continue
         baseline = []
         target = []
         for item in row:
             header = _normal(item.get("column_header") or "")
-            heading_metric = _METRIC.search(header)
+            heading_metric = _METRIC.search(" ".join((*_column_path(item), header)))
             if metric and heading_metric and heading_metric[0] != metric:
                 continue
             if _column_role(header) == "baseline" and (baseline_name in {None, "baseline", "基线"} or baseline_name == header):
@@ -160,9 +213,41 @@ def _scoped_pair(text: str, sentence: str, source: str, candidates: list[dict]) 
             if _column_role(header) == "target":
                 target.append(item)
         if metric and source_metric and source_metric[0] != metric and not all(
-            _METRIC.search(_normal(item.get("column_header") or "")) for item in [*baseline, *target]
+            _METRIC.search(" ".join((*_column_path(item), _normal(item.get("column_header") or ""))))
+            for item in [*baseline, *target]
         ):
             continue
+        split_evidence = []
+        if expected_split:
+            split = _SPLIT.search(subject)
+            wanted = _split_kind(expected_split[0])
+            if split and _split_kind(split[0]) != wanted:
+                continue
+            scoped = {record["evidence_id"]: record for cell in [*baseline, *target]
+                      for record in _table_sources(cell, by_id)}
+            declared = [(eid, match[0]) for eid, record in scoped.items()
+                        for match in _SPLIT.finditer(_normal(record["text"]))]
+            if any(_split_kind(label) != wanted for _, label in declared):
+                continue
+            if not split:
+                split_evidence = [eid for eid, label in declared
+                                  if not expected_split[0].startswith("fixed ") or label.startswith("fixed ")]
+                if not split_evidence:
+                    method_ids = {eid for cell in [*baseline, *target] for eid in cell.get("method_evidence_ids", ())}
+                    for item in candidates:
+                        if item.get("kind") != "body_text" or item.get("doc_id") != row[0]["doc_id"]:
+                            continue
+                        snippet = _normal(item["text"])
+                        if expected_split[0] not in snippet or any(
+                            _split_kind(match[0]) != wanted for match in _SPLIT.finditer(snippet)
+                        ):
+                            continue
+                        if item["evidence_id"] in method_ids or (
+                            "cell_role" not in row[0] and _matches_subject(snippet, subject)
+                        ):
+                            split_evidence.append(item["evidence_id"])
+                if not split_evidence:
+                    continue
         if baseline or target:
             matching_rows += 1
         for first in baseline:
@@ -212,6 +297,8 @@ def _stated_values(clause: str, sentence: str) -> list[tuple[str | None, Decimal
             operation = "percentage_points"
         elif re.match(r"\s*(?:baseline\b|基线)", suffix) or re.search(r"\bfrom\s+(?:a\s+|the\s+)?$", prefix):
             operation = "baseline"
+        elif _EXPLICIT_RELATIVE.search(prefix):
+            operation = "relative_change"
         elif _LEVEL.search(prefix):
             operation = "baseline" if re.search(r"\bbaseline\b|基线", prefix) else "target"
         elif _RELATIVE.search(prefix) or direction:
@@ -242,6 +329,7 @@ def _stated_values(clause: str, sentence: str) -> list[tuple[str | None, Decimal
 def check_revision_numbers(source: str, replacement: str, evidence: list[dict]) -> list[dict]:
     """Recompute recognized numeric claims and preserve findings that need manual review."""
     source, replacement = _normal(source), _normal(replacement)
+    by_id = {item["evidence_id"]: item for item in evidence}
     records = []
     for clause in _clauses(replacement):
         values = _stated_values(clause, replacement)
@@ -256,9 +344,11 @@ def check_revision_numbers(source: str, replacement: str, evidence: list[dict]) 
                 }
             else:
                 baseline, target, scope_ids = pair
-                result = calculate(baseline, target, operation)
+                result = calculate(baseline, target, operation, evidence=by_id)
                 if scope_ids:
-                    result["scope_evidence_ids"] = scope_ids
+                    result["scope_evidence_ids"] = list(dict.fromkeys([
+                        *result.get("scope_evidence_ids", ()), *scope_ids,
+                    ]))
                 if result.get("status") == "calculated" and result["unit"] != unit:
                     result.update(status="not_calculable", reason="the stated value and the calculation use incompatible units")
             verification = "unresolved"
