@@ -1,5 +1,7 @@
 from contextlib import closing
 
+import pytest
+
 from abstract_review.audit import audit_version, review_claim, targeted_evidence
 from abstract_review.evidence import EvidenceIndex
 from abstract_review.models import ModelPaused
@@ -49,6 +51,51 @@ def test_ranked_search_cannot_mark_a_requirement_searched_missing():
     assert finding["review_status"] == "pending" and finding["verdict"] is None
     assert finding["coverage"][0]["status"] == "unchecked"
     assert all(scope["mode"] == "ranked" for scope in finding["searched_scope"])
+
+
+@pytest.mark.parametrize(("subject", "extras", "missing_scope", "expected"), [
+    ("same", ["instrument calibration records"], False, "refuted"),
+    ("different", ["instrument calibration records"], False, None),
+    ("uncertain", ["instrument calibration records"], False, None),
+    ("same", [], False, None),
+    ("same", ["instrument calibration records"], True, None),
+    ("same", ["measurement definition", "instrument calibration records"], True, None),
+])
+def test_direct_refutation_requires_same_scope_and_only_supplementary_missing_fields(
+    subject, extras, missing_scope, expected,
+):
+    claim = {**CLAIM, "requirements": ["measurement definition", "instrument calibration records"]}
+    groups = [{"role": "refute", "evidence_ids": ["opposite"]}]
+    proof = {"evidence_ids": ["opposite"], "subject_and_conditions": subject,
+             "relation": "opposite_result", "scope_reason": "The same prototype and study are identified.",
+             "supplementary_fields": extras}
+    checks = [] if missing_scope else [{"requirement": "measurement definition", "status": "found",
+                                       "evidence_ids": ["opposite"]}]
+    pending = ["instrument calibration records"]
+    if missing_scope:
+        pending.append("measurement definition")
+    model = Model({**_judgement(verdict="refuted", groups=groups, observations=checks, missing=pending),
+                   "direct_contradiction": proof})
+    row = _source("opposite", "The prototype did not track biodiversity in the specified study.")
+    with closing(EvidenceIndex([row])) as index:
+        result, _ = review_claim(claim, index, model)
+    assert result["verdict"] == expected
+    assert ("direct_contradiction" in result) == (expected == "refuted")
+    assert len(model.calls) == 1
+
+
+def test_methods_hint_prefers_alias_in_current_document_without_claiming_complete_inspection():
+    here = _source("methods", "The sample flags were checked by hand.", "Materials and methods", 1)
+    other = _source("elsewhere", "The retrospective flags were never checked.", "Results", 2)
+    foreign = {**here, "doc_id": "foreign", "evidence_id": "foreign"}
+    with closing(EvidenceIndex([other, foreign, here])) as index:
+        result = targeted_evidence(index, [{"query": "sample flags checked", "source_kind": "methods"}],
+                                   documents=[{"doc_id": "paper", "role": "main"},
+                                              {"doc_id": "foreign", "role": "supplement"}])
+    assert result["evidence"][0]["evidence_id"] == "methods"
+    assert not {row["evidence_id"] for row in result["evidence"]} & {"foreign"}
+    direct, = [scope for scope in result["scopes"] if scope["mode"] == "direct"]
+    assert direct["matching_count"] == 1 and direct["complete"] is False
 
 
 def test_completing_named_section_can_mark_requirement_searched_missing():
@@ -108,6 +155,7 @@ def test_followup_ranks_named_methods_and_keeps_nearby_refutation_lines():
 
     assert finding["verdict"] == "refuted"
     assert set(refutation) | {"audit"} <= set(finding["sent_candidate_ids"])
+    assert {"evidence_ids": refutation} in model.calls[-1]["body_passages"]
     assert set(refutation) <= set(finding["follow_up_evidence_ids"])
     first, second = model.calls[-1]["direct_inspections"]
     assert (first["matching_count"], first["complete"], second["complete"]) == (15, False, True)

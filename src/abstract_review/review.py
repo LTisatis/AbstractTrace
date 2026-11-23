@@ -63,6 +63,15 @@ class PdfReviewInput:
     remote_source: dict | None = None
     provided_claims: tuple[tuple[str, str], ...] = ()
     ocr_language: str | None = None
+    rerank_model: Path | None = None
+    expected_retrieval_fingerprints: dict[str, str] | None = None
+
+
+def retrieval_fingerprints(embed_model: Path | str | None, rerank_model: Path | str | None) -> dict[str, str]:
+    from .local_ranking import local_model_fingerprint
+
+    return {key: local_model_fingerprint(path, sentence_transformer=key == "embed_model")
+            for key, path in (("embed_model", embed_model), ("rerank_model", rerank_model)) if path}
 
 
 def _object(value: object, keys: set[str], path: str) -> dict[str, object]:
@@ -273,6 +282,12 @@ class ReviewService:
             raise ValueError("--abstract-file is empty")
         if request.abstract_source == "pasted" and request.pasted_abstract is None:
             raise ValueError("--abstract-source pasted requires --abstract-file")
+        if request.rerank_model and request.engine is None:
+            raise ValueError("--rerank-model requires a PDF review engine")
+        model_fingerprints = retrieval_fingerprints(request.embed_model, request.rerank_model) if request.engine else {}
+        if (request.expected_retrieval_fingerprints is not None
+                and model_fingerprints != request.expected_retrieval_fingerprints):
+            raise ValueError("local retrieval model changed since the benchmark started")
         primary = parse_pdf(request.pdf, ocr_language=request.ocr_language)
         versions = {}
         provided_text = "\n".join(text for _, text in request.provided_claims) or None
@@ -344,10 +359,13 @@ class ReviewService:
             report["configuration"] = {
                 "engine": request.engine, "model": request.model,
                 "embed_model": str(request.embed_model.resolve()) if request.embed_model else None,
+                "rerank_model": str(request.rerank_model.resolve()) if request.rerank_model else None,
                 "check_omissions": request.check_omissions, "check_external": request.check_external,
                 "ocr_language": request.ocr_language,
                 "max_requests": 80, "max_seconds": 900,
             }
+            if model_fingerprints:
+                report["configuration"]["retrieval_model_sha256"] = model_fingerprints
         elif request.check_omissions or request.check_external:
             raise ValueError("optional checks require --engine offline or --engine openai")
         started = self._persist_report(report, lease_token)

@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .review import PdfReviewInput
+from .review import PdfReviewInput, retrieval_fingerprints
 from .scoring import score_predictions
 
 
@@ -15,7 +15,7 @@ _LABELS = ("supported", "refuted", "insufficient")
 _SAMPLE_FIELDS = {"sample_id", "pdf", "pdf_sha256", "claims", "abstract_file", "paper_family_id", "split"}
 _ANCHOR_FIELDS = ("sentence_id", "start", "end", "proposition")
 _BENCHMARK_PIPELINE_FILES = ("audit.py", "benchmark.py", "calculations.py", "compound.py", "evidence.py",
-                             "followups.py", "ingest.py", "models.py", "review.py", "revisions.py",
+                             "followups.py", "ingest.py", "local_ranking.py", "models.py", "review.py", "revisions.py",
                              "run_store.py", "scifact.py", "scitabalign.py", "workflow.py")
 
 
@@ -148,7 +148,9 @@ def _prediction(sample_id: str, claim_id: str, finding: dict, claim: dict | None
     return row
 
 
-def benchmark_configuration(engine: str, model: str) -> dict:
+def benchmark_configuration(
+    engine: str, model: str, *, embed_model: Path | None = None, rerank_model: Path | None = None,
+) -> dict:
     from .ingest import PARSER_VERSION
     from .models import ROLE_PROMPTS
 
@@ -161,10 +163,13 @@ def benchmark_configuration(engine: str, model: str) -> dict:
         pipeline.update(name.encode("ascii"))
         pipeline.update(hashlib.sha256(source.read_bytes()).digest())
     prompts = json.dumps(ROLE_PROMPTS, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return {
+    configuration = {
         "engine": engine, "model": model, "parser_version": PARSER_VERSION,
         "prompts_sha256": hashlib.sha256(prompts).hexdigest(), "pipeline_sha256": pipeline.hexdigest(),
     }
+    if fingerprints := retrieval_fingerprints(embed_model, rerank_model):
+        configuration["retrieval_model_sha256"] = fingerprints
+    return configuration
 
 
 def _input_digest(sample: _Sample, configuration: dict) -> tuple[str, str]:
@@ -223,12 +228,17 @@ def run_pdf_samples(
     service, manifest_path: Path, engine: str, model: str, *,
     recovered: dict | None = None, on_sample: Callable[[str, str, list[dict]], None] | None = None,
     on_result: Callable[[dict], None] | None = None, configuration: dict | None = None,
+    embed_model: Path | None = None, rerank_model: Path | None = None,
 ) -> list[dict]:
     """Run input rows through the normal review service without reading gold."""
     if engine not in {"offline", "openai"}:
         raise ValueError("PDF benchmark engine must be offline or openai")
     samples = _load_samples(manifest_path)
-    configuration = configuration or benchmark_configuration(engine, model)
+    if configuration is None:
+        configuration = benchmark_configuration(engine, model, embed_model=embed_model, rerank_model=rerank_model)
+    model_fingerprints = configuration.get("retrieval_model_sha256", {})
+    if model_fingerprints != retrieval_fingerprints(embed_model, rerank_model):
+        raise ValueError("benchmark configuration does not match local retrieval models")
     checkpoints = recovered or {}
     predictions = []
     for sample in samples:
@@ -253,7 +263,8 @@ def run_pdf_samples(
         request = PdfReviewInput(
             pdf=sample.pdf, pasted_abstract=sample.pasted_abstract,
             abstract_source="pasted" if sample.pasted_abstract is not None else "pdf",
-            engine=engine, model=model, provided_claims=sample.claims,
+            engine=engine, model=model, provided_claims=sample.claims, embed_model=embed_model,
+            rerank_model=rerank_model, expected_retrieval_fingerprints=model_fingerprints,
         )
         try:
             run = service.start(request)

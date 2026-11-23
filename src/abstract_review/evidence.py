@@ -1,15 +1,22 @@
 """Scoped paper retrieval with exact matching and source-anchored links."""
 
+from __future__ import annotations
+
 import math
 import re
 import sqlite3
 import unicodedata
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+from .local_ranking import validate_snapshot
+
+if TYPE_CHECKING:
+    from .local_ranking import PairRanker
 
 
 _HAN = re.compile(r"([\u3400-\u9fff\U00020000-\U0003134f]+)")
@@ -38,6 +45,9 @@ _MARKER_PREFIX = re.compile(
 _UNIT = r"%|百分点|percentage\s+points?|p\.?p\.?\b"
 _NUMBER = re.compile(rf"(?<![a-z0-9_.])([+-]?(?:\d+(?:\.\d+)?|\.\d+))(?:\s*({_UNIT}))?")
 _MAX_CANDIDATES = 24
+_MAX_BODY_PASSAGE = 8
+_LINE_END = re.compile(r"[.!?。！？][\"'”’）)】\]]*$")
+_ABBREVIATION_END = re.compile(r"\b(?:e\.g|i\.e|et al|fig|eq|ref|no|vs|pp|vol|dr|prof)\.$", re.IGNORECASE)
 _SECTION_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*|[ivx]+)[.)]?\s+")
 _METHOD_NAMES = frozenset(("method", "methods", "materials and methods", "material and methods", "methodology",
                            "方法", "材料与方法"))
@@ -65,15 +75,14 @@ class SentenceTransformerEmbedder:
     """Use an explicitly installed model snapshot and disable model downloads."""
 
     def __init__(self, model_path: Path | str) -> None:
-        path = Path(model_path).resolve()
-        if not path.is_dir() or not (path / "modules.json").is_file():
-            raise ValueError(f"expected a local Sentence Transformers model snapshot: {path}")
+        path = validate_snapshot(model_path, sentence_transformer=True)
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
-            raise ValueError("local model retrieval requires sentence-transformers") from exc
+            raise ValueError("local model retrieval requires the embeddings extra") from exc
         self.model = SentenceTransformer(
-            str(path), local_files_only=True, trust_remote_code=False, device="cpu"
+            str(path), local_files_only=True, trust_remote_code=False, device="cpu",
+            token=False, model_kwargs={"use_safetensors": True},
         )
 
     def encode(self, texts: list[str]) -> Iterable[Iterable[float]]:
@@ -230,7 +239,9 @@ def _unit_vectors(embedder: Embedder, texts: list[str]) -> list[tuple[float, ...
 class EvidenceIndex:
     """Index only the records authorized for this run and retain their original anchors."""
 
-    def __init__(self, evidence: Iterable[dict], *, embedder: Embedder | None = None) -> None:
+    def __init__(
+        self, evidence: Iterable[dict], *, embedder: Embedder | None = None, reranker: PairRanker | None = None,
+    ) -> None:
         self._records: dict[str, dict] = {}
         self._exact: dict[str, set[str]] = defaultdict(set)
         self._graph: dict[str, set[_Edge]] = defaultdict(set)
@@ -239,7 +250,10 @@ class EvidenceIndex:
         self._row_headers: dict[str, str] = {}
         self._column_families: dict[str, tuple[str, ...]] = {}
         self._body_lines: dict[tuple, list[tuple[str, tuple]]] = defaultdict(list)
+        self._body_neighbors: dict[tuple[str, int], str | None] = {}
+        self._body_windows: dict[str, tuple[str, ...]] = {}
         self._embedder = embedder
+        self._reranker = reranker
         texts = []
         lexical_rows = []
         for raw in evidence:
@@ -644,14 +658,53 @@ class EvidenceIndex:
         for channel in ranks.values():
             for rank, eid in enumerate(channel[:_MAX_CANDIDATES], start=1):
                 scores[eid] += 1 / (60 + rank)
-        return sorted(scores, key=lambda eid: (-scores[eid], eid))[:_MAX_CANDIDATES], list(ranks)
+        shortlist = sorted(scores, key=lambda eid: (-scores[eid], eid))[:_MAX_CANDIDATES]
+        channels = list(ranks)
+        if self._reranker is not None and shortlist:
+            shortlist = self._rerank(query, shortlist, active, set(ranks["exact"]))
+            channels.append("reranker")
+        return shortlist, channels
+
+    def _rerank(self, query: str, ranked: list[str], active: set[str], exact: set[str]) -> list[str]:
+        if self._reranker is None:
+            return ranked
+        movable = [eid for eid in ranked if eid not in exact]
+        if len(movable) < 2:
+            return ranked
+        units = {eid: self._passage_in(eid, active) for eid in movable}
+        passages = dict.fromkeys(units.values())
+        if len(passages) < 2:
+            return ranked
+        texts = []
+        for unit in passages:
+            if len(unit) > 1:
+                texts.append("\n".join(self._records[eid]["text"] for eid in unit))
+            else:
+                record = self._records[unit[0]]
+                texts.append("\n".join(part for part in (
+                    _text_field(record, "row_header"), _text_field(record, "column_header"), record["text"],
+                ) if part))
+        values = self._reranker.score(query, texts)
+        if len(values) != len(texts) or any(type(value) not in (float, int) or not math.isfinite(value)
+                                            for value in values):
+            raise ValueError("reranker must return one finite score per passage")
+        scores = dict(zip(passages, values))
+        reordered = iter(sorted(movable, key=lambda eid: -scores[units[eid]]))
+        # Keep exact numerical and printed-label hits in their original rank slots.
+        return [eid if eid in exact else next(reordered) for eid in ranked]
 
     @staticmethod
     def _line_location(record: dict) -> tuple:
         locator = record["locator"]
         return _document_key(record), locator["page_index"], _text_field(locator, "section")
 
-    def _adjacent_line(self, eid: str, direction: int, active: set[str]) -> str | None:
+    def _adjacent_line(self, eid: str, direction: int) -> str | None:
+        key = eid, direction
+        if key not in self._body_neighbors:
+            self._body_neighbors[key] = self._nearest_line(eid, direction)
+        return self._body_neighbors[key]
+
+    def _nearest_line(self, eid: str, direction: int) -> str | None:
         record = self._records[eid]
         box = _bbox(record)
         if record.get("kind") != "body_text" or box is None:
@@ -660,27 +713,90 @@ class EvidenceIndex:
         height = bottom - top
         nearby = []
         for other, (x0, y0, x1, y1) in self._body_lines[self._line_location(record)]:
-            if other not in active:
-                continue
             gap = direction * (y0 - top)
             overlap = min(right, x1) - max(left, x0)
             if (0.45 * height <= gap <= 1.8 * height and 0.65 * height <= y1 - y0 <= 1.5 * height
-                    and overlap >= 0.6 * min(right - left, x1 - x0) and abs(x0 - left) <= 2.5 * height):
+                    and overlap >= 0.65 * min(right - left, x1 - x0) and abs(x0 - left) <= 1.8 * height):
                 nearby.append((gap, abs(x0 - left), other))
-        return min(nearby)[2] if nearby else None
+        if not nearby:
+            return None
+        nearby.sort()
+        gap, horizontal, match = nearby[0]
+        if len(nearby) > 1:
+            second_gap, second_horizontal, _ = nearby[1]
+            if second_gap - gap < 0.2 * height and abs(second_horizontal - horizontal) < 0.35 * height:
+                return None
+        return match
 
-    def _followup_order(self, ranked: list[str], active: set[str], limit: int, prior: set[str]) -> list[str]:
-        chosen, deferred = {}, {}
+    def _wrap_to_next(self, first: str, second: str) -> bool:
+        text = self._records[first]["text"].rstrip()
+        return (self._adjacent_line(second, -1) == first
+                and (not _LINE_END.search(text) or bool(_ABBREVIATION_END.search(text))))
+
+    def _body_passage(self, eid: str) -> tuple[str, ...]:
+        if eid in self._body_windows:
+            return self._body_windows[eid]
+        before, after = [], []
+        for direction, lines in ((-1, before), (1, after)):
+            current = eid
+            while neighbor := self._adjacent_line(current, direction):
+                first, second = (neighbor, current) if direction == -1 else (current, neighbor)
+                if self._adjacent_line(first, 1) != second or not self._wrap_to_next(first, second):
+                    break
+                lines.append(neighbor)
+                if len(before) + len(after) >= _MAX_BODY_PASSAGE:
+                    self._body_windows[eid] = (eid,)
+                    return (eid,)
+                current = neighbor
+        passage = (*reversed(before), eid, *after)
+        self._body_windows.update(dict.fromkeys(passage, passage))
+        return passage
+
+    def _passage_in(self, eid: str, available: set[str]) -> tuple[str, ...]:
+        passage = self._body_passage(eid)
+        return passage if available.issuperset(passage) else (eid,)
+
+    def evidence_units(self, candidate_ids: Iterable[str]) -> list[tuple[str, ...]]:
+        """Return selected atoms as source-ordered passages or singletons, in candidate rank order."""
+        return list(self._evidence_units(candidate_ids))
+
+    def _evidence_units(self, candidate_ids: Iterable[str]) -> Iterator[tuple[str, ...]]:
+        ordered = dict.fromkeys(candidate_ids)
+        available = set(ordered)
+        seen = set()
+        for eid in ordered:
+            if eid not in self._records:
+                raise ValueError(f"evidence is outside the current scope: {eid!r}")
+            unit = self._passage_in(eid, available)
+            if unit not in seen:
+                seen.add(unit)
+                yield unit
+
+    def body_passages(self, candidate_ids: Iterable[str]) -> list[dict]:
+        """Link only context lines present in the current packet, using their existing evidence IDs."""
+        return [{"evidence_ids": list(unit)} for unit in self.evidence_units(candidate_ids) if len(unit) > 1]
+
+    def _followup_order(
+        self, ranked: list[str], active: set[str], limit: int, prior: set[str], *, passage_limit: int,
+    ) -> list[str]:
+        local, deferred = {}, {}
+        competing_hits = len(ranked) > 1
+        # A long wrap should leave room for another ranked hit and its context.
+        complete_cap = min(passage_limit, max(3, passage_limit - 2)) if competing_hits else passage_limit
         for eid in ranked:
-            previous = self._adjacent_line(eid, -1, active)
-            following = self._adjacent_line(eid, 1, active)
-            group = [item for item in (eid, previous, following) if item]
-            selected = chosen if prior.intersection(group) != set(group) else deferred
-            selected.update(dict.fromkeys(group))
-            if len(chosen) >= limit:
-                break
-        chosen.update(deferred)
-        return list(chosen)[:limit]
+            unit = self._passage_in(eid, active)
+            if len(unit) > complete_cap or (competing_hits and len(unit) == 1):
+                unit = (eid,)
+                if competing_hits:
+                    neighbors = (self._adjacent_line(eid, direction) for direction in (-1, 1))
+                    unit = (eid, *(neighbor for neighbor in neighbors if neighbor in active))[:passage_limit]
+            destination = deferred if prior.issuperset(unit) else local
+            destination.setdefault(unit, None)
+        chosen = {}
+        for unit in (*local, *deferred):
+            if len(chosen.keys() | set(unit)) <= limit:
+                chosen.update(dict.fromkeys(unit))
+        return list(chosen)
 
     def _compatible_walk(self, seed: str, target: str) -> bool:
         origin, other = self._records[seed], self._records[target]
@@ -723,10 +839,17 @@ class EvidenceIndex:
             for edge in sorted(eligible, key=self._edge_order)[:_MAX_CANDIDATES]:
                 queue.append(((*nodes, edge.target_id), (*path, edge)))
 
-    def _expand(self, ranked: list[str], limit: int, active: set[str]) -> tuple[list[str], list[dict]]:
+    def _expand(
+        self, ranked: list[str], limit: int, active: set[str], *, preserve_passages: bool = False,
+    ) -> tuple[list[str], list[dict]]:
         if limit <= 1:
             return ranked[:limit], []
-        seeds = ranked[: max(1, limit - 2)]
+        units = self.evidence_units(ranked) if preserve_passages else [(eid,) for eid in ranked]
+        seed_limit = max(1, limit - 2)
+        seeds = []
+        for unit in units:
+            if len(seeds) + len(unit) <= seed_limit or not seeds and len(unit) <= limit:
+                seeds.extend(unit)
         selected = dict.fromkeys(seeds)
         paths = []
         walks = []
@@ -748,10 +871,11 @@ class EvidenceIndex:
             selected.update(dict.fromkeys(additions))
             paths.append({"evidence_ids": list(nodes), "edges": self._serialize_path(nodes, edges)})
 
-        for eid in ranked:
+        for unit in units:
             if len(selected) >= limit:
                 break
-            selected[eid] = None
+            if len(selected.keys() | set(unit)) <= limit:
+                selected.update(dict.fromkeys(unit))
         # Keep method paths intact near their best-ranked source before the caller combines queries.
         prioritized = dict.fromkeys(seeds[:1])
         for path in paths:
@@ -829,8 +953,9 @@ class EvidenceIndex:
         }
         ranked, channels = self._query_rank(query, active)
         if followup:
-            ranked = self._followup_order(ranked, active, _MAX_CANDIDATES, set(prior_ids))
-        chosen, paths = self._expand(ranked, limit, active) if expand else (ranked[:limit], [])
+            cap = _MAX_CANDIDATES if expand else limit
+            ranked = self._followup_order(ranked, active, cap, set(prior_ids), passage_limit=limit)
+        chosen, paths = self._expand(ranked, limit, active, preserve_passages=followup) if expand else (ranked[:limit], [])
         locations = {
             (self._records[eid]["doc_id"], self._records[eid]["locator"]["page_index"],
              _text_field(self._records[eid]["locator"], "section"))
@@ -890,8 +1015,14 @@ class EvidenceIndex:
         if query and len(ids) > limit:
             active = set(ids)
             ranked, _ = self._query_rank(query, active)
-            focused = self._followup_order(ranked, active, limit, set(prior_ids))
-            ordered = list(dict.fromkeys((*focused, *ids)))
+            focused = self._followup_order(ranked, active, limit, set(prior_ids), passage_limit=limit)
+            selected = dict.fromkeys(focused)
+            for unit in self._evidence_units(ids):
+                if len(selected) == limit:
+                    break
+                if len(selected.keys() | set(unit)) <= limit:
+                    selected.update(dict.fromkeys(unit))
+            ordered = list(selected)
         chosen = self.get(ordered[:limit])
         locators = {
             (record["doc_id"], record["locator"]["page_index"], _text_field(record["locator"], "section"))

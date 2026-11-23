@@ -56,7 +56,9 @@ uv run abstract-review serve
 
 `--engine openai` 显式使用 `OPENAI_API_KEY` 和 Responses API。`uv run abstract-review doctor --online` 用自拟文本和合成裁图检查结构化响应，并记录模型、耗时和用量。也可以用 `uv run pytest -m live --run-live` 进行显式联调。模型默认 `gpt-6.2-sol`，可用 `--model` 指定。运行暂挂后用 `review resume RUN_ID` 从检查点继续。扩额时使用新 `--request-id` 和 `--add-requests` 或 `--add-seconds`。同一请求 ID 重试沿用原值。
 
-原页没有可读文本时，可用 `--ocr-language eng` 启用本机 Tesseract。需要语言数据时，按安装方式配置 `TESSDATA_PREFIX`。检索默认使用 SQLite FTS5、精确词元和图扩展。`uv sync --locked --extra embeddings` 后，`--embed-model PATH` 读取本地模型目录。跨页关联仅用于有明确续表标记且表头对齐的表格。
+原页没有可读文本时，可用 `--ocr-language eng` 启用本机 Tesseract。需要语言数据时，按安装方式配置 `TESSDATA_PREFIX`。检索默认使用 SQLite FTS5、精确词元和图扩展。补查在证据预算内优先送入完整的相邻正文组，报告保留每行原页锚点。跨页关联仅用于有明确续表标记且表头对齐的表格。
+
+`uv sync --locked --extra embeddings` 后，可在 `review start` 和 PDF `bench run` 使用 `--embed-model PATH` 启用本地混合召回，或用 `--rerank-model PATH` 对候选段落进行本地 CrossEncoder 重排。模型需预先保存在本机，权重使用 safetensors。批跑记录模型文件哈希，恢复时仅复用与模型内容相符的检查点。
 
 外部网络入口使用 `review start --source DOI_OR_ARXIV`。DOI 开放全文查询使用 `UNPAYWALL_EMAIL`。arXiv 官方域名可通过 `HTTPS_PROXY` 中的免认证 HTTP 代理访问，并遵循 `NO_PROXY`。运行审稿引擎时，用 `--check-external` 启用内容核查。含首创性措辞时查询少量书目候选，OpenAlex 支持通过 `OPENALEX_API_KEY` 配置。用 `--check-omissions` 查找有正文依据的潜在遗漏。默认审稿只读取指定材料。
 
