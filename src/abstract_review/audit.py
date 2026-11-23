@@ -13,7 +13,10 @@ from typing import Literal
 from pydantic import Field
 
 from .calculations import comparison_for_claim
-from .compound import aggregate_compound_findings, attach_compound, offline_compound_parts, requires_whole_sentence
+from .compound import (
+    aggregate_compound_findings, attach_compound, offline_compound_parts, requires_whole_sentence,
+    shared_procedure_parts,
+)
 from .evidence import EvidenceIndex, with_method_scope
 from .models import Extraction, Judgement, ModelPaused, ModelUnavailable, Schema
 
@@ -36,6 +39,7 @@ class FollowUpTarget(Schema):
 
 class DirectContradiction(Schema):
     evidence_ids: list[str]
+    scope_evidence_ids: list[str] = Field(default_factory=list)
     subject_and_conditions: Literal["same", "different", "uncertain"]
     relation: Literal["opposite_result", "in_scope_counterexample", "uncertain"]
     scope_reason: str
@@ -116,6 +120,11 @@ def _page_failures(scope: dict, documents) -> list[dict]:
     return failures
 
 
+def _interleave_units(index: EvidenceIndex, lanes: Iterable[Iterable[str]]) -> Iterable[tuple[str, ...]]:
+    groups = [index.evidence_units(lane) for lane in lanes]
+    return (unit for tier in zip_longest(*groups) for unit in tier if unit is not None)
+
+
 def targeted_evidence(
     index: EvidenceIndex, queries: Iterable[str | dict], *, documents=(), limit: int = 8,
     prior_ids: Iterable[str] = (),
@@ -136,45 +145,47 @@ def targeted_evidence(
         if not explicit_location:
             target["section"] = _SOURCE_SECTIONS.get(source.get("source_kind"))
         query = source["query"]
-        if source.get("source_kind") == "proof":
-            query = f"{query} theorem proof construction"
+        proof_query = source.get("source_kind") == "proof"
         if any(target[key] is not None for key in ("section", "table_label", "page_index")):
-            result = index.inspect(**target, limit=limit, query=query, prior_ids=prior_ids)
+            result = index.inspect(**target, limit=limit, query=query, prior_ids=prior_ids, passage_query=proof_query)
             scope = result["scope"]
             failures = _page_failures(scope, documents)
             scope["unreadable_locations"] = failures
             scope["complete"] = explicit_location and scope["complete"] and not failures
-            if not scope["complete"] and (not target["table_label"] or not scope["matching_count"]):
+            section_hint = proof_query and target["section"] is not None and all(
+                target[key] is None for key in ("page_index", "table_label")
+            )
+            if (section_hint or not scope["complete"]) and (not target["table_label"] or not scope["matching_count"]):
                 broad = index.search(query, limit=limit, doc_id=target["doc_id"],
-                                     followup=True, prior_ids=prior_ids)
+                                     followup=True, prior_ids=prior_ids, passage_query=proof_query)
                 inspected = set(scope["examined_evidence_ids"])
                 broad_by_id = {row["evidence_id"]: row for row in broad["evidence"]}
-                extra = [broad_by_id[eid] for unit in index.evidence_units(broad_by_id)
-                         if not inspected.issuperset(unit) for eid in unit]
-                if extra:
+                extra_units = [unit for unit in index.evidence_units(broad_by_id) if not inspected.issuperset(unit)]
+                if extra_units:
+                    extra = [broad_by_id[eid] for unit in extra_units for eid in unit]
                     scopes.append({**broad["scope"], "mode": "ranked", "requirement": source.get("requirement")})
                     paths.extend(broad["paths"])
-                    if result["evidence"]:
+                    if section_hint and len(extra_units[0]) > 1:
+                        wider.append(result["evidence"])
+                        result["evidence"] = extra
+                    elif result["evidence"]:
                         wider.append(extra)
                     else:
                         result["evidence"] = extra
         else:
             result = index.search(query, limit=limit, doc_id=target["doc_id"],
-                                  followup=True, prior_ids=prior_ids)
+                                  followup=True, prior_ids=prior_ids, passage_query=proof_query)
             scope = {**result["scope"], "mode": "ranked"}
         scopes.append({**scope, "query": source["query"], "requirement": source.get("requirement")})
         paths.extend(result.get("paths", []))
         primary.append(result["evidence"])
 
-    def interleave(lanes):
-        groups = [index.evidence_units(row["evidence_id"] for row in lane) for lane in lanes]
-        return [unit for tier in zip_longest(*groups) for unit in tier if unit is not None]
-
-    ordered = interleave(primary)
-    expanded = interleave(wider)
+    ordered = list(_interleave_units(index, ([row["evidence_id"] for row in lane] for lane in primary)))
+    expanded = _interleave_units(index, ([row["evidence_id"] for row in lane] for lane in wider))
     preferred_ids = {eid for unit in ordered for eid in unit}
     alternatives = [unit for unit in expanded if not preferred_ids.issuperset(unit)]
-    reserve = min(limit // 2, len(alternatives[0])) if alternatives else 0
+    primary_space = limit - len(ordered[0]) if ordered else limit
+    reserve = min(limit // 2, len(alternatives[0]), primary_space) if alternatives else 0
     selected = {}
 
     def pack(units, cap):
@@ -245,37 +256,47 @@ def _coverage(requirements: list[str], output, scopes: list[dict], sent: list[st
     return covered
 
 
-def _grounded_contradiction(output: ScopedJudgement, sent: list[str]) -> DirectContradiction | None:
+def _contradiction_error(output: ScopedJudgement, sent: list[str]) -> str | None:
     proof = output.direct_contradiction
-    if (output.verdict != "refuted" or not proof
-            or proof.subject_and_conditions != "same" or proof.relation == "uncertain"
-            or not proof.scope_reason.strip()):
-        return None
-    ids = set(proof.evidence_ids)
-    if (not ids or not set(sent).issuperset(ids)
+    if proof is None:
+        return "missing_direct_contradiction"
+    if proof.subject_and_conditions != "same" or proof.relation == "uncertain" or not proof.scope_reason.strip():
+        return "unconfirmed_contradiction_scope"
+    ids = set(proof.evidence_ids) | set(proof.scope_evidence_ids)
+    if (not proof.evidence_ids or not set(sent).issuperset(ids)
             or not any(group.role == "refute" and set(group.evidence_ids).issuperset(ids)
                        for group in output.evidence_groups)):
-        return None
-    return proof
+        return "ungrounded_contradiction"
+    return None
 
 
-def _direct_refutation(claim: dict, output: ScopedJudgement, coverage: list[dict], sent: list[str]) -> dict | None:
-    proof = _grounded_contradiction(output, sent)
-    if (not proof or claim.get("logic_review_required") or output.follow_up_queries
-            or any(group.role == "support" and group.evidence_ids for group in output.evidence_groups)):
-        return None
+def _direct_refutation_blocker(claim: dict, output: ScopedJudgement, coverage: list[dict]) -> str | None:
+    proof = output.direct_contradiction
+    assert proof is not None
+    if claim.get("logic_review_required"):
+        return "unresolved_sentence_logic"
+    if any(group.role == "support" and group.evidence_ids for group in output.evidence_groups):
+        return "conflicting_support"
+    if any(field["status"] == "unreadable" for field in coverage):
+        return "unreadable_source"
     supplementary = {_field_key(field) for field in proof.supplementary_fields if field.strip()}
     required = {_field_key(field["requirement"]) for field in coverage}
     unresolved = {_field_key(field["requirement"]) for field in coverage if field["status"] != "found"}
     core = {_field_key(field) for field in claim["requirements"]} - supplementary
-    ids = set(proof.evidence_ids)
-    if (not unresolved <= supplementary <= required or any(field["status"] == "unreadable" for field in coverage)
-            or not any(_field_key(field["requirement"]) in core and field["status"] == "found"
-                       and ids.intersection(field["evidence_ids"]) for field in coverage)
-            or any(not target.requirement or _field_key(target.requirement) not in supplementary
-                   for target in output.follow_up_targets)):
-        return None
-    return proof.model_dump()
+    if not unresolved <= supplementary <= required:
+        return "unchecked_decisive_requirement"
+    scope_ids = set(proof.scope_evidence_ids or proof.evidence_ids)
+    if not any(_field_key(field["requirement"]) in core and field["status"] == "found"
+               and scope_ids.intersection(field["evidence_ids"]) for field in coverage):
+        return "missing_scope_coverage"
+    proof_ids = scope_ids | set(proof.evidence_ids)
+    if proof.scope_evidence_ids and any(_field_key(field["requirement"]) in core
+                                       and not proof_ids.intersection(field["evidence_ids"]) for field in coverage):
+        return "missing_scope_coverage"
+    if output.follow_up_queries or any(not target.requirement or _field_key(target.requirement) not in supplementary
+                                       for target in output.follow_up_targets):
+        return "outstanding_decisive_followup"
+    return None
 
 
 def sentences(text: str) -> list[dict]:
@@ -321,19 +342,21 @@ def _plain_claim(part: dict, offset: int = 0, end: int | None = None, propositio
     return _anchor_claim(part, claim, offset)
 
 
+def _compound_claims(part: dict, split: tuple[list[tuple[int, int, str]], str]) -> list[dict]:
+    operands, operator = split
+    atoms = [_plain_claim(part, start, end, proposition) for start, end, proposition in operands]
+    attach_compound(part, atoms, operator)
+    return atoms if all("compound" in atom for atom in atoms) else []
+
+
 def extract_claims(text: str, model=None) -> list[dict]:
     parts = sentences(text)
     if model is None:
         results = []
         for part in parts:
             split = offline_compound_parts(part["text"])
-            if split is None:
-                results.append(_plain_claim(part))
-                continue
-            operands, operator = split
-            atoms = [_plain_claim(part, start, end, proposition) for start, end, proposition in operands]
-            attach_compound(part, atoms, operator)
-            results.extend(atoms if all("compound" in atom for atom in atoms) else [_plain_claim(part)])
+            atoms = _compound_claims(part, split) if split else []
+            results.extend(atoms or [_plain_claim(part)])
         return results
 
     parsed = model.call("extract", {"sentences": parts}, Extraction)
@@ -376,10 +399,25 @@ def extract_claims(text: str, model=None) -> list[dict]:
         if not all(atom.get("compound", {}).get("operator") == group.operator for atom in atoms):
             whole_sentences.add(sentence_id)
 
+    counts = {}
+    for atom in anchored:
+        sentence_id = atom["sentence_id"]
+        counts[sentence_id] = counts.get(sentence_id, 0) + 1
+
     result = {}
     for atom in anchored:
-        part = by_sentence[atom["sentence_id"]]
-        if atom["sentence_id"] in whole_sentences:
+        sentence_id = atom["sentence_id"]
+        part = by_sentence[sentence_id]
+        whole = sentence_id in whole_sentences
+        unsplit = (counts[sentence_id] == 1 and atom["kind"] not in {"background", "purpose"}
+                   and atom["quote"].rstrip(".?!") == part["text"].rstrip(".?!"))
+        if whole or unsplit:
+            split = shared_procedure_parts(part["text"])
+            recovered = _compound_claims(part, split) if split else []
+            if recovered:
+                result.update((member["claim_id"], member) for member in recovered)
+                continue
+        if whole:
             atom = _plain_claim(part)
             atom["logic_review_required"] = True
         result[atom["claim_id"]] = atom
@@ -595,9 +633,12 @@ def review_claim(
         return bool(follow_up_evidence_ids) or any(scope.get("complete") for scope in results["scopes"])
 
     def candidate_order() -> list[str]:
-        # Named inspections take priority; interleave remaining support and counter searches.
-        interleaved = (eid for tier in zip_longest(*breadth) for eid in tier if eid is not None)
-        return list(dict.fromkeys((*prioritized, *interleaved)))[:8]
+        # Keep context from each lane together when combining support and counter searches.
+        ordered = dict.fromkeys(prioritized[:8])
+        for unit in _interleave_units(index, breadth):
+            if len(ordered.keys() | set(unit)) <= 8:
+                ordered.update(dict.fromkeys(unit))
+        return list(ordered)
 
     gather([claim["support_query"], claim["counter_query"]])
     if additional_evidence:
@@ -639,9 +680,13 @@ def review_claim(
                         "For each required field, report its status; found requires supplied evidence IDs. "
                         "Read listed body passages in source order. Match the study, model, intervention and conditions. "
                         "Separate methods of the current study from cited or sensitivity analyses. "
-                        "When a direct opposite result or a witness within the claimed domain suffices, refute with "
-                        "direct_contradiction, citing the anchors, explaining the matched scope, and naming any missing "
-                        "fields that are supplementary to the contradiction. Include only genuinely optional details. "
+                        "For an atomic claim, when the paper states the opposite or provides a witness within the claimed "
+                        "domain, return refuted and a direct_contradiction. Put the opposite result or witness in evidence_ids and any "
+                        "separate same-study, same-conditions anchors in scope_evidence_ids. Put both sets in one refute "
+                        "group. Use subject_and_conditions=same only when the anchors establish that match, and say how "
+                        "in scope_reason. Give the exact names of optional unchecked fields in supplementary_fields. "
+                        "An unreported instrument or operational detail can be optional for a directly stated qualitative "
+                        "contradiction. An explicit population, model, intervention, comparator, or claim condition is essential. "
                         "If scope or another decisive condition is unresolved, request up to two follow_up_targets. "
                         "Use the exact missing field and concise source terms. For universal negatives, search for a "
                         "constructive witness using the same architecture and assumptions. Prefer source_kind methods, "
@@ -650,10 +695,20 @@ def review_claim(
                     )}
         if table_context:
             material["table_context"] = table_context
+        if compound := claim.get("compound"):
+            material["sentence_context"] = compound["text"]
+            material["coverage_instructions"] += (
+                " Use sentence_context to resolve shared terms and conditions. Judge only the highlighted proposition "
+                "in claim. The other operands have their own findings."
+            )
         if passages:
             material["body_passages"] = sorted(passages, key=lambda group: group["evidence_ids"][0])
         if claim.get("logic_review_required"):
             material["logic_review_required"] = True
+            material["coverage_instructions"] += (
+                " This sentence requires a full logic review. Use ordinary evidence groups and leave "
+                "direct_contradiction empty."
+            )
         material.update(figure_material(candidates, documents, data_dir))
         try:
             output = model.call("judge", material, ScopedJudgement)
@@ -675,7 +730,12 @@ def review_claim(
             break
 
         coverage = _coverage(requirements, output, examined_scopes, sent_candidate_ids)
-        direct_proof = _direct_refutation(claim, output, coverage, sent_candidate_ids)
+        verdict = output.verdict
+        proof_error = proof_blocker = None
+        if verdict == "refuted":
+            proof_error = _contradiction_error(output, sent_candidate_ids)
+            proof_blocker = proof_error or _direct_refutation_blocker(claim, output, coverage)
+        direct_proof = verdict == "refuted" and proof_blocker is None
         targets = [] if direct_proof else _pending_targets(output, requirements, documents)
         if targets and not followup:
             if reserve_followup is None or reserve_followup():
@@ -687,9 +747,11 @@ def review_claim(
                 stop = "no_progress"
             else:
                 stop = "follow_up_budget"
-        coverage = _coverage(requirements, output, examined_scopes, sent_candidate_ids)
-        direct_proof = _direct_refutation(claim, output, coverage, sent_candidate_ids)
-        verdict = output.verdict
+        if stop == "no_progress":
+            coverage = _coverage(requirements, output, examined_scopes, sent_candidate_ids)
+            if verdict == "refuted" and proof_error is None:
+                proof_blocker = _direct_refutation_blocker(claim, output, coverage)
+                direct_proof = proof_blocker is None
         role = {"supported": "support", "refuted": "refute"}.get(verdict)
         has_evidence = any(group.role == role and group.evidence_ids for group in output.evidence_groups)
         conflicting = {group.role for group in output.evidence_groups if group.evidence_ids}
@@ -697,7 +759,9 @@ def review_claim(
         follow_up_requested = bool(output.follow_up_queries or output.follow_up_targets)
         decisive_fields_checked = checked <= {"found"} and not follow_up_requested
         invalid_contradiction = (verdict == "refuted" and output.direct_contradiction is not None
-                                 and _grounded_contradiction(output, sent_candidate_ids) is None)
+                                 and (proof_error is not None or proof_blocker in {
+                                     "missing_scope_coverage", "conflicting_support",
+                                 }))
         can_call_insufficient = (
             "searched_missing" in checked and checked <= {"found", "searched_missing"}
             and not follow_up_requested
@@ -707,7 +771,9 @@ def review_claim(
                 or (verdict == "manual_conflict" and not {"support", "refute"} <= conflicting)):
             verdict = "pending"
         status = verdict if verdict in {"pending", "manual_conflict"} else "completed"
-        if (output.verdict == "insufficient" or (role and not decisive_fields_checked)) and verdict == "pending":
+        if invalid_contradiction:
+            reason = f"The proposed refutation did not pass the evidence checks. Proposed assessment: {output.reason}"
+        elif (output.verdict == "insufficient" or (role and not decisive_fields_checked)) and verdict == "pending":
             reason = f"Required sources have not been fully checked. Proposed assessment: {output.reason}"
         else:
             reason = output.reason
@@ -716,7 +782,9 @@ def review_claim(
                    "evidence_groups": [group.model_dump() for group in output.evidence_groups],
                    "missing_fields": output.missing_fields, "coverage": coverage}
         if direct_proof:
-            finding["direct_contradiction"] = direct_proof
+            finding["direct_contradiction"] = output.direct_contradiction.model_dump()
+        elif output.verdict == "refuted" and status == "pending":
+            finding["refutation_blocker"] = proof_blocker if has_evidence else "missing_refutation_evidence"
         break
     candidate_ids = [item["evidence_id"] for item in candidates]
     finding["candidate_ids"] = candidate_ids

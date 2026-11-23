@@ -76,6 +76,8 @@ PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `ab
 
 等义清单使用 `schema_version: 1`、`annotation_id`、`annotator_type`（`human` 或 `ai`）、`predictions_sha256`、`gold_sha256` 及 `matches`。每个匹配填写 `sample_id`、`predicted_claim_id` 和 `gold_claim_id`。哈希可用 `abstract_review.scoring.semantic_manifest_sha256` 计算。核对时应保留事实、极性、条件和数量。评分器要求同句区间重叠、一对一对应，并优先采用已有的严格匹配。推理过程只读取输入清单。
 
+旧报告有时只给出整句反驳。若独立审阅确认报告中的反证指向一个合取子命题，可以通过 `--verdict-projections projections.json` 补充诊断。清单沿用等义清单的版本、审阅者和哈希字段，将 `matches` 换成 `projections`。每条记录填写上述三个 ID、`relation`（`conjunct`）、金标子命题的完整 `operand_anchor`、与报告引证相符的 `evidence_ids`，以及说明反证为何指向该子命题的 `review_note`。证据须实际送审、已被引用并覆盖一组完整的金标证据。通过的记录写入 `verdict_projection`，严格评分和等义评分沿用各自口径。
+
 SciFact 适配器读取作者发布的 JSONL，将每条断言与它的给定引用摘要配对，并保留原始文档和句子 ID。这组指标的适用范围是给定引用摘要。 [SciFact 数据和评估协议](https://github.com/allenai/scifact#dataset)
 
 ```powershell
