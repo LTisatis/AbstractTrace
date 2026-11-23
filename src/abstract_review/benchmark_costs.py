@@ -41,6 +41,8 @@ def _event_cost(event: dict, rates: dict) -> Decimal | None:
 
 def score_costs(run_record: dict, price_table: object) -> dict:
     pricing_id, rates = _rates(price_table)
+    if not run_record.get("samples"):
+        raise ValueError("cost estimates require per-sample usage records")
     samples = []
     observed_cost = Decimal(0)
     priced, unknown, missing = 0, 0, 0

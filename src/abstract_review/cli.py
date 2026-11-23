@@ -286,6 +286,10 @@ def score_review_benchmark(args: argparse.Namespace) -> None:
     run_source = args.run_record.read_bytes()
     gold_source = args.gold_manifest.read_bytes()
     run_record = json.loads(run_source.decode("utf-8-sig"))
+    configuration = run_record.get("configuration") if isinstance(run_record, dict) else None
+    if (not isinstance(configuration, dict) or configuration.get("dataset") is not None
+            or configuration.get("engine") not in ("offline", "openai") or not run_record.get("samples")):
+        raise ValueError("score-reviews requires a PDF benchmark run record with samples")
     result = score_review_quality(run_record, json.loads(gold_source.decode("utf-8-sig")))
     result["input_sha256"] = {
         "run_record": hashlib.sha256(run_source).hexdigest(),

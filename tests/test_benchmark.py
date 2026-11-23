@@ -253,3 +253,19 @@ def test_cost_only_prices_recorded_tokens_and_keeps_unknown_requests_visible():
     assert result["known_cost_usd"] == "0.0022"
     assert (result["priced_requests"], result["unpriced_requests"], result["samples_without_usage"]) == (1, 1, 1)
     assert result["complete"] is False
+
+
+def test_review_scoring_does_not_report_zero_cost_for_unmeasured_dataset(tmp_path, capsys):
+    record = tmp_path / "run.json"
+    record.write_text(json.dumps({"schema_version": 1, "prediction_count": 1, "samples": [],
+                                  "configuration": {"engine": "openai", "dataset": "scifact-cited-abstracts"}}),
+                      encoding="utf-8")
+    gold = tmp_path / "gold.json"
+    gold.write_text('{"schema_version": 1}', encoding="utf-8")
+    pricing = tmp_path / "rates.json"
+    pricing.write_text('{"schema_version": 1, "pricing_id": "fixture", "models": {}}', encoding="utf-8")
+    output = tmp_path / "scores.json"
+    assert main(["bench", "score-reviews", "--run-record", str(record), "--gold-manifest", str(gold),
+                 "--pricing", str(pricing), "--output", str(output)]) == 1
+    assert "requires a PDF benchmark run record" in capsys.readouterr().err
+    assert not output.exists()
