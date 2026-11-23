@@ -48,7 +48,8 @@ class FollowUps:
 
         index = EvidenceIndex(self.report["evidence"])
         try:
-            result = targeted_evidence(index, record["queries"], documents=self.report.get("documents", ()))
+            result = targeted_evidence(index, record["queries"], documents=self.report.get("documents", ()),
+                                       prior_ids=record["prior_ids"])
         finally:
             index.close()
         prior = set(record["prior_ids"])
@@ -65,5 +66,6 @@ class FollowUps:
             if "queries" in record and "evidence_ids" not in record:
                 self._complete(record)
         seen = {row["evidence_id"] for row in prior}
-        wanted = {eid for key in keys for eid in self.rounds.get(key, {}).get("evidence_ids", ())}
-        return [row for row in self.report["evidence"] if row["evidence_id"] in wanted - seen]
+        wanted = dict.fromkeys(eid for key in keys for eid in self.rounds.get(key, {}).get("evidence_ids", ()))
+        available = {row["evidence_id"]: row for row in self.report["evidence"]}
+        return [available[eid] for eid in wanted if eid not in seen and eid in available]

@@ -252,8 +252,12 @@ def score_benchmark(args: argparse.Namespace) -> None:
     from .scoring import score_predictions
 
     source_paths = {args.predictions.resolve(), args.gold_manifest.resolve()}
+    if args.semantic_matches:
+        if args.dataset:
+            raise ValueError("--semantic-matches is only available for generic claim scoring")
+        source_paths.add(args.semantic_matches.resolve())
     if args.output.resolve() in source_paths:
-        raise ValueError("score output must differ from both scoring input files")
+        raise ValueError("score output must differ from scoring input files")
     predictions, gold = read_json(args.predictions), read_json(args.gold_manifest)
     if args.dataset == "scifact":
         from .scifact import score_scifact
@@ -268,7 +272,10 @@ def score_benchmark(args: argparse.Namespace) -> None:
 
         result = score_scitabalign(predictions, gold)
     else:
-        result = score_predictions(predictions, gold)
+        semantic_matches = read_json(args.semantic_matches) if args.semantic_matches else None
+        if args.semantic_matches and not isinstance(semantic_matches, dict):
+            raise ValueError("semantic matches must be a JSON object")
+        result = score_predictions(predictions, gold, semantic_matches=semantic_matches)
     write_json(args.output, result)
     emit(result)
 
@@ -427,6 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--predictions", type=Path, required=True)
     score.add_argument("--gold-manifest", type=Path, required=True)
     score.add_argument("--output", type=Path, required=True)
+    score.add_argument("--semantic-matches", type=Path, help="independent one-to-one proposition equivalence annotations")
     score.add_argument("--dataset", choices=("scifact", "claimbench", "scitabalign"), help="select dataset-specific metrics")
     score.set_defaults(handler=score_benchmark)
 

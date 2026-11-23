@@ -5,6 +5,7 @@ import re
 from base64 import b64encode
 from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
+from itertools import zip_longest
 from math import isfinite
 from pathlib import Path
 from typing import Literal
@@ -88,10 +89,9 @@ def normalize_targets(queries: Iterable[str | dict], documents=()) -> list[dict]
 
 def _page_failures(scope: dict, documents) -> list[dict]:
     failures = []
-    allowed_docs = {scope["doc_id"]} if scope["doc_id"] else set(scope["document_ids"])
     for document in documents:
         doc_id = document["doc_id"]
-        if allowed_docs and doc_id not in allowed_docs:
+        if scope["doc_id"] is not None and doc_id != scope["doc_id"]:
             continue
         for page in document.get("pages", []):
             if scope["page_index"] is not None and page["page_index"] != scope["page_index"]:
@@ -102,28 +102,60 @@ def _page_failures(scope: dict, documents) -> list[dict]:
     return failures
 
 
-def targeted_evidence(index: EvidenceIndex, queries: Iterable[str | dict], *, documents=(), limit: int = 8) -> dict:
+def targeted_evidence(
+    index: EvidenceIndex, queries: Iterable[str | dict], *, documents=(), limit: int = 8,
+    prior_ids: Iterable[str] = (),
+) -> dict:
     """Check up to two named sources, and keep ordinary retrieval distinct from direct inspection."""
     documents = tuple(documents)
     sources = normalize_targets(queries, documents)
-    evidence = {}
+    prior_ids = tuple(prior_ids)
+    primary, wider = [], []
     scopes = []
     paths = []
     for source in sources:
         target = {key: source.get(key) for key in _SCOPE_KEYS}
         if any(target[key] is not None for key in ("section", "table_label", "page_index")):
-            result = index.inspect(**target, limit=limit)
+            result = index.inspect(**target, limit=limit, query=source["query"], prior_ids=prior_ids)
             scope = result["scope"]
             failures = _page_failures(scope, documents)
             scope["unreadable_locations"] = failures
             scope["complete"] = scope["complete"] and not failures
+            if not scope["complete"] and (not target["table_label"] or not scope["matching_count"]):
+                broad = index.search(source["query"], limit=limit, doc_id=target["doc_id"],
+                                     followup=True, prior_ids=prior_ids)
+                inspected = set(scope["examined_evidence_ids"])
+                extra = [row for row in broad["evidence"] if row["evidence_id"] not in inspected]
+                if extra:
+                    scopes.append({**broad["scope"], "mode": "ranked", "requirement": source.get("requirement")})
+                    paths.extend(broad["paths"])
+                    if result["evidence"]:
+                        wider.append(extra)
+                    else:
+                        result["evidence"] = extra
         else:
-            result = index.search(source["query"], limit=limit, doc_id=source.get("doc_id"))
+            result = index.search(source["query"], limit=limit, doc_id=source.get("doc_id"),
+                                  followup=True, prior_ids=prior_ids)
             scope = {**result["scope"], "mode": "ranked"}
         scopes.append({**scope, "query": source["query"], "requirement": source.get("requirement")})
         paths.extend(result.get("paths", []))
-        evidence.update((record["evidence_id"], record) for record in result["evidence"])
-    return {"evidence": list(evidence.values())[:limit], "paths": paths, "scopes": scopes}
+        primary.append(result["evidence"])
+
+    def interleave(groups):
+        return {row["evidence_id"]: row for tier in zip_longest(*groups) for row in tier if row is not None}
+
+    ordered = interleave(primary)
+    extra = interleave(wider)
+    extra_ids = [eid for eid in extra if eid not in ordered]
+    reserve = min(2, limit // 4, len(extra_ids))
+    first = list(ordered)[:limit - reserve]
+    ids = dict.fromkeys((*first, *extra_ids[:reserve], *ordered))
+    selected = list(ids)[:limit]
+    for scope in scopes:
+        if scope["mode"] == "direct" and scope["complete"]:
+            scope["complete"] = set(scope["examined_evidence_ids"]).issubset(selected)
+    by_id = {**extra, **ordered}
+    return {"evidence": [by_id[eid] for eid in selected], "paths": paths, "scopes": scopes}
 
 
 def _field_key(value: str) -> str:
@@ -475,14 +507,28 @@ def review_claim(
             examined_scopes.append({**result["scope"], "mode": "ranked"})
             remember(result)
 
-    def inspect(targets: Sequence[dict]) -> bool:
-        known = set(by_id)
-        results = targeted_evidence(index, targets, documents=documents)
+    def inspect(targets: Sequence[dict], previous: list[str], known: set[str]) -> bool:
+        results = targeted_evidence(index, targets, documents=documents, prior_ids=sorted(known))
         examined_scopes.extend(results["scopes"])
         remember(results)
-        prioritized.extend(item["evidence_id"] for item in results["evidence"])
-        follow_up_evidence_ids.extend(item["evidence_id"] for item in results["evidence"] if item["evidence_id"] not in known)
-        return bool(set(by_id) - known) or any(scope.get("complete") for scope in results["scopes"])
+        selected = [item["evidence_id"] for item in results["evidence"]]
+        if previous and len(selected) == 8 and previous[0] not in selected:
+            # A partial check can add a missing condition while an initial hit is
+            # still needed to judge the result. Keep that hit if space allows.
+            exhaustive = {eid for scope in results["scopes"] if scope.get("complete")
+                          for eid in scope["examined_evidence_ids"]}
+            for offset in reversed(range(len(selected))):
+                if selected[offset] not in exhaustive:
+                    selected[offset] = previous[0]
+                    break
+        prioritized.extend(selected)
+        follow_up_evidence_ids.extend(eid for eid in selected if eid not in known)
+        return bool(follow_up_evidence_ids) or any(scope.get("complete") for scope in results["scopes"])
+
+    def candidate_order() -> list[str]:
+        # Named inspections take priority; interleave remaining support and counter searches.
+        interleaved = (eid for tier in zip_longest(*breadth) for eid in tier if eid is not None)
+        return list(dict.fromkeys((*prioritized, *interleaved)))[:8]
 
     gather([claim["support_query"], claim["counter_query"]])
     if additional_evidence:
@@ -491,13 +537,12 @@ def review_claim(
         by_id.update((item["evidence_id"], item) for item in supplements)
     followup = bool(saved_targets or additional_evidence)
     if saved_targets:
-        inspect(saved_targets)
+        previous = candidate_order()
+        context = index.table_context(previous)
+        inspect(saved_targets, previous, set(previous) | {item["evidence_id"] for item in context["evidence"]})
     calculation = None
     while True:
-        # Named inspections take priority; interleave remaining support and counter searches.
-        interleaved = (eid for tier in range(8) for column in breadth for eid in column[tier:tier + 1])
-        balanced_ids = list(dict.fromkeys((*prioritized, *interleaved)))
-        candidates = [by_id[eid] for eid in balanced_ids[:8]]
+        candidates = [by_id[eid] for eid in candidate_order()]
         context = index.table_context(item["evidence_id"] for item in candidates)
         context_by_id = {item["evidence_id"]: item for item in context["evidence"]}
         table_context = [
@@ -522,8 +567,12 @@ def review_claim(
                     "direct_inspections": [scope for scope in examined_scopes if scope.get("mode") == "direct"],
                     "coverage_instructions": (
                         "For each required field, report its status; found requires supplied evidence IDs. "
-                        "Ordinary search is not a complete inspection. For missing fields, request up to two concrete "
-                        "follow_up_targets tied to the exact field name, with a section, table label or page when known."
+                        "Read adjacent lines together using their locators. Ordinary search is not a complete inspection. "
+                        "For missing fields, request up to two follow_up_targets tied to the exact field name. "
+                        "Use concise phrases likely to appear in the paper, including terms that would locate opposite "
+                        "results or an explicit counterexample. A summary may omit the decisive result or condition. "
+                        "Specify a section, table or page only when supported by the source. If the missing field is now "
+                        "resolved, cite its source and do not request it again."
                     )}
         if table_context:
             material["table_context"] = table_context
@@ -553,7 +602,7 @@ def review_claim(
                 followup = True
                 if save_targets is not None:
                     save_targets(targets)
-                if inspect(targets):
+                if inspect(targets, [item["evidence_id"] for item in candidates], set(sent_candidate_ids)):
                     continue
                 stop = "no_progress"
             else:
