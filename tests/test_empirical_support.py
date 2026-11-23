@@ -2,7 +2,7 @@ from contextlib import closing
 
 import pytest
 
-from abstract_review.audit import ScopedJudgement, _pending_targets, review_claim, supplied_claims
+from abstract_review.audit import ScopedJudgement, _empirical_context_query, _pending_targets, review_claim, supplied_claims
 from abstract_review.evidence import EvidenceIndex
 
 
@@ -67,6 +67,48 @@ def test_author_summary_triggers_one_grounded_check_for_primary_results():
     assert finding["verdict"] == "supported"
     assert finding["empirical_support"] == complete["empirical_support"]
     assert "empirical_support_blocker" not in finding
+
+
+def test_results_page_keeps_typed_query_and_uses_printed_failure_heading_for_context():
+    claim = empirical_claim(proposition="The evaluation results demonstrate detector limitations under load.")
+    records = [
+        evidence("summary", "Detector evaluation summary."),
+        evidence("failures", "Evaluation error categories showed 12 missing pulses.", page=1),
+        evidence("scope", "All evaluation trials used the same detector at high load.", page=2),
+    ]
+    documents = [{"doc_id": "paper", "role": "main", "pages": [
+        {"page_index": 1, "source_headings": ["4.3 Error Breakdown", "4.4 Evaluation Results"]},
+        {"page_index": 2, "source_headings": ["3 Methods"]},
+    ]}]
+    follow_up = {"verdict": "pending", "reason": "Read the results and methods.", "evidence_groups": [],
+                 "missing_fields": [], "follow_up_queries": [],
+                 "follow_up_targets": [
+                     {"query": "Compare Evaluation Results", "source_kind": "results", "page_index": 1},
+                     {"query": "Detector evaluation trials", "source_kind": "methods", "page_index": 2},
+                 ]}
+    model = Model(follow_up, supported(claim, {"result_source": "direct_result",
+                                               "result_evidence_ids": ["failures"], "scope_evidence_ids": ["scope"],
+                                               "same_study_and_scope": "same"}, ["failures", "scope"]))
+    with closing(EvidenceIndex(records)) as index:
+        finding, _ = review_claim(claim, index, model, documents=documents)
+    result, method = model.materials[1]["direct_inspections"]
+    assert result["query"] == "Compare Evaluation Results"
+    assert result["body_context_query"] == "4.3 Error Breakdown evaluation failure cases and error categories"
+    assert method["query"] == "Detector evaluation trials" and "body_context_query" not in method
+    assert finding["verdict"] == "supported"
+
+
+@pytest.mark.parametrize(("query", "section", "expected"), [
+    ("Find the main detector results and comparison", None, "Experimental Results"),
+    ("Find the alternate-room experiment", None, None),
+    ("Find the main detector results", "Alternate room", None),
+])
+def test_main_result_context_requires_a_matching_printed_heading(query, section, expected):
+    scope = {"doc_id": "paper", "page_index": 2, "source_kind": "results", "section": section, "query": query}
+    documents = [{"doc_id": "paper", "pages": [
+        {"page_index": 2, "source_headings": ["5 Alternate Room", "4 Experimental Results"]},
+    ]}]
+    assert _empirical_context_query(empirical_claim(), scope, documents) == expected
 
 
 @pytest.mark.parametrize(("variant", "blocker"), [

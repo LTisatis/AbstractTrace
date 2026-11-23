@@ -77,6 +77,12 @@ _EMPIRICAL_RESULT = re.compile(
 )
 _FAILURE_SUBJECT = re.compile(r"\b(?:limitations?|failures?|errors?)\b|局限|错误|失败", re.I)
 _FAILURE_HEADING = re.compile(r"\b(?:errors?|failures?)\b|错误|失败", re.I)
+_FAILURE_QUERY = "evaluation failure cases and error categories"
+_MAIN_RESULT_QUERY = re.compile(r"\b(?:main|primary|overall)\b|主要|总体", re.I)
+_MAIN_RESULT_HEADING = re.compile(
+    r"^(?:\d+(?:\.\d+)*[.)]?\s+)?(?P<title>(?:(?:main|experimental) )?results(?: and discussion)?"
+    r"|(?:主要|实验)?结果(?:与讨论)?)[：:]?$", re.I,
+)
 _RESULT_HEADING = re.compile(r"\b(?:results?|evaluation|experiments?|ablation|analysis)\b|结果|评估|实验|分析", re.I)
 _SCOPE_HEADING = re.compile(r"\b(?:methods?|setup|datasets?|participants?|tasks?)\b|方法|设置|数据集|任务", re.I)
 _TABLE_QUERY = re.compile(r"(?<![A-Za-z0-9])(?:table|tab\.)\s*([A-Za-z]*\d+)|表\s*([A-Za-z]*\d+)", re.I)
@@ -238,6 +244,8 @@ def targeted_evidence(
             result = index.search(query, limit=limit, doc_id=target["doc_id"],
                                   followup=True, prior_ids=prior_ids, passage_query=proof_query)
             scope = {**result["scope"], "mode": "ranked"}
+        if source.get("source_kind"):
+            scope["source_kind"] = source["source_kind"]
         scopes.append({**scope, "query": source["query"], "requirement": source.get("requirement")})
         paths.extend(result.get("paths", []))
         primary.append(result["evidence"])
@@ -367,7 +375,7 @@ def _empirical_followup(claim: dict, blocker: str, hints: list[dict]) -> dict | 
     elif blocker in {"missing_empirical_support", "summary_only_result", "missing_observed_result"}:
         choices = ((_RESULT_HEADING, "observed outcomes and measured comparisons", "results"),)
         if _FAILURE_SUBJECT.search(claim["proposition"]):
-            choices = ((_FAILURE_HEADING, "evaluation failure cases and error categories", "results"), *choices)
+            choices = ((_FAILURE_HEADING, _FAILURE_QUERY, "results"), *choices)
     else:
         return None
     for pattern, focus, kind in choices:
@@ -377,6 +385,29 @@ def _empirical_followup(claim: dict, blocker: str, hints: list[dict]) -> dict | 
                 field = "Tested study scope" if kind == "methods" else "Observed empirical result"
                 return {"query": f"{matching} {focus}", "requirement": field, "source_kind": kind,
                         "doc_id": hint["doc_id"], "page_index": hint["page_index"]}
+    return None
+
+
+def _empirical_context_query(claim: dict, scope: dict, documents: Iterable[dict]) -> str | None:
+    """Use a printed heading as a second retrieval cue within the requested results page."""
+    if scope.get("source_kind") != "results" or scope.get("section") or scope.get("page_index") is None:
+        return None
+    for document in documents:
+        if document["doc_id"] != scope["doc_id"]:
+            continue
+        for page in document.get("pages", ()):
+            if page["page_index"] != scope["page_index"]:
+                continue
+            headings = [title for title in page.get("source_headings", ())
+                        if isinstance(title, str) and 0 < len(title) <= 100]
+            if _FAILURE_SUBJECT.search(claim["proposition"]):
+                failure_heading = next((title for title in headings if _FAILURE_HEADING.search(title)), None)
+                if failure_heading:
+                    return f"{failure_heading} {_FAILURE_QUERY}"
+            if _MAIN_RESULT_QUERY.search(scope["query"]):
+                for title in headings:
+                    if match := _MAIN_RESULT_HEADING.fullmatch(title):
+                        return match["title"]
     return None
 
 
@@ -788,8 +819,11 @@ def review_claim(
         examined_scopes.extend(results["scopes"])
         for scope in results["scopes"]:
             if scope["mode"] == "direct" and scope["matching_count"] and scope["table_label"] is None:
+                query = _empirical_context_query(claim, scope, documents) if empirical else None
+                if query and query != scope["query"]:
+                    scope["body_context_query"] = query
                 inspected_body_windows.extend(index.ranked_body_context(
-                    [scope["query"]], doc_id=scope["doc_id"], doc_version_id=scope["doc_version_id"],
+                    [query or scope["query"]], doc_id=scope["doc_id"], doc_version_id=scope["doc_version_id"],
                     page_index=scope["page_index"], section=scope["section"],
                 ))
         remember(results)
@@ -904,7 +938,9 @@ def review_claim(
                 "the anchors give a concrete original observation, analysis or measurement for the claimed effect. "
                 "A restatement of the claim or a summary of the authors' conclusions is summary. Use "
                 "same_study_and_scope=same when the cited tests cover the asserted scope. If a result or scope is missing, "
-                "request a targeted check of the actual results, error analysis or methods, naming the missing item."
+                "request a targeted check of the actual results, error analysis or methods, naming the missing item. "
+                "For qualitative claims, match the tested scope and direction; an unstated effect size or unit is "
+                "supplementary if it cannot change either."
             )
         hints = _source_hints(documents, (claim["proposition"], *initial_queries)) if not followup else []
         if hints:
