@@ -92,6 +92,14 @@ _SHARED_EXCEPTION = re.compile(
     r"(?P<right_anchor>nor\s+(?P<right>[\w-]+(?:\s+[\w-]+){0,9})),\s+"
     r"(?P<condition>unless\s+[^,;.!?]+)[.!?]?", re.I,
 )
+_SCALING_EXCEPTION = re.compile(
+    r"(?:[\w-]+\s+){1,8}(?:grow(?:s)?|in-?crease(?:s)?|scale(?:s)?)\s+with\s+"
+    r"(?P<axis>(?:[\w-]+\s+){1,4}(?:length|size|count))", re.I,
+)
+_NESTED_EXCEPTION = re.compile(
+    r"\b(?:although|because|but|denied|denies|doubt\w*|either|if|neither|never|no|nor|not|provided|"
+    r"unless|until|when|whereas|whether|while)\b|n['’]t\b", re.I,
+)
 
 
 def _dataset_names(value: str, name_pattern: str) -> tuple[list[tuple[int, int, str]], str] | None:
@@ -249,8 +257,7 @@ def _absolute_and_relative_parts(text: str) -> tuple[list[tuple[int, int, str]],
     ], "and"
 
 
-def _shared_exception_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
-    """Keep a terminal exception on both simple objects of one negated verb."""
+def _shared_exception_match(text: str) -> re.Match | None:
     match = _SHARED_EXCEPTION.fullmatch(text)
     if not match or any(_LIMITED_REPORTED_SCOPE.search(match[part]) for part in ("left", "right")):
         return None
@@ -258,10 +265,30 @@ def _shared_exception_parts(text: str) -> tuple[list[tuple[int, int, str]], str]
     if (_UNSAFE_LOGIC.search(prefix) or _NEGATED_SHARED.search(prefix) or _NON_ASSERTED_REPORT.search(prefix)
             or _UNSAFE_LOGIC.search(match["condition"][len("unless "):])):
         return None
+    return match
+
+
+def _shared_exception_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:
+    """Keep a terminal exception on both simple objects of one negated verb."""
+    match = _shared_exception_match(text)
+    if not match:
+        return None
     return [
         (0, match.end("left"), f"{match['prefix']}{match['left']}, {match['condition']}"),
         (*match.span("right_anchor"), f"{match['prefix']}{match['right']}, {match['condition']}"),
     ], "and"
+
+
+def adjudicable_shared_exception(text: str) -> str | None:
+    """Identify a single scaling condition that both grounded operands must retain."""
+    if not (match := _shared_exception_match(text)):
+        return None
+    condition = match["condition"].split(maxsplit=1)[1]
+    scaling = _SCALING_EXCEPTION.fullmatch(condition)
+    if (scaling and not _NESTED_EXCEPTION.search(condition) and not _NESTED_EXCEPTION.search(match["prefix"])
+            and not (_AND.search(scaling["axis"]) or _OR.search(scaling["axis"]))):
+        return condition
+    return None
 
 
 def reported_compound_parts(text: str) -> tuple[list[tuple[int, int, str]], str] | None:

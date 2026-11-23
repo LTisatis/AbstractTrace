@@ -5,6 +5,7 @@ import json
 import re
 import unicodedata
 from base64 import b64encode
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
 from itertools import zip_longest
@@ -16,8 +17,8 @@ from pydantic import Field
 
 from .calculations import comparison_for_claim
 from .compound import (
-    aggregate_compound_findings, attach_compound, offline_compound_parts, reported_compound_parts, requires_whole_sentence,
-    shared_procedure_parts,
+    adjudicable_shared_exception, aggregate_compound_findings, attach_compound, offline_compound_parts,
+    reported_compound_parts, requires_whole_sentence, shared_procedure_parts,
 )
 from .evidence import EvidenceIndex, _document_key, _terms, with_method_scope
 from .models import EvidenceGroup, Extraction, InvalidJudgeReference, Judgement, ModelPaused, ModelUnavailable, Schema
@@ -117,6 +118,10 @@ _MAIN_RESULT_HEADING = re.compile(
 )
 _RESULT_HEADING = re.compile(r"\b(?:results?|evaluation|experiments?|ablation|analysis)\b|结果|评估|实验|分析", re.I)
 _SCOPE_HEADING = re.compile(r"\b(?:methods?|setup|datasets?|participants?|tasks?)\b|方法|设置|数据集|任务", re.I)
+_PROOF_NAVIGATION = re.compile(
+    r"\b(?:theorem|proof|lemma|counterexample)\b|\bcannot\s+(?:capture|compute|express|model|recognize|represent)\b"
+    r"|定理|证明|引理|反例", re.I,
+)
 _TABLE_QUERY = re.compile(r"(?<![A-Za-z0-9])(?:table|tab\.)\s*([A-Za-z]*\d+)|表\s*([A-Za-z]*\d+)", re.I)
 _PAGE_QUERY = re.compile(r"(?:\b(?:page|p\.)\s*(\d+)|第\s*(\d+)\s*页)", re.I)
 _SECTION_QUERY = re.compile(
@@ -187,9 +192,22 @@ def _page_failures(scope: dict, documents) -> list[dict]:
     return failures
 
 
-def _source_hints(documents: Iterable[dict], queries: Iterable[str]) -> list[dict]:
+def _printed_headings(page: dict) -> tuple[str, ...]:
+    titles = page.get("source_headings")
+    if not isinstance(titles, list) or page.get("status") in {"unreadable", "no_text"}:
+        return ()
+    clean = dict.fromkeys(" ".join(title.split()) for title in titles if isinstance(title, str))
+    return tuple(title for title in clean if 0 < len(title) <= 100)
+
+
+def _source_hints(
+    documents: Iterable[dict], queries: Iterable[str], proof_labels: Iterable[tuple[str, int, str]] = (),
+) -> list[dict]:
     """Select printed navigation labels by query relevance, keeping physical page numbers."""
     terms = _terms(" ".join(queries))
+    proof_by_page = {}
+    for doc_id, page_index, label in proof_labels:
+        proof_by_page.setdefault((doc_id, page_index), []).append(label)
     candidates = []
     seen = set()
     for doc_order, document in enumerate(documents):
@@ -200,16 +218,16 @@ def _source_hints(documents: Iterable[dict], queries: Iterable[str]) -> list[dic
                 or not isinstance(pages, list)):
             continue
         for page in pages:
-            if not isinstance(page, dict):
+            if not isinstance(page, dict) or page.get("status") in {"unreadable", "no_text"}:
                 continue
-            page_index, titles = page.get("page_index"), page.get("source_headings")
-            if type(page_index) is not int or not 0 <= page_index < 2**32 or not isinstance(titles, list):
+            page_index = page.get("page_index")
+            if type(page_index) is not int or not 0 <= page_index < 2**32:
                 continue
             key = doc_id, page_index
             if key in seen:
                 continue
-            headings = dict.fromkeys(" ".join(title.split()) for title in titles if isinstance(title, str))
-            scored = {title: len(terms & _terms(title)) for title in headings if 0 < len(title) <= 100}
+            headings = _printed_headings(page) or proof_by_page.get(key, ())
+            scored = {title: len(terms & _terms(title)) for title in headings}
             if not scored:
                 continue
             chosen = set(sorted(scored, key=scored.__getitem__, reverse=True)[:2])
@@ -218,6 +236,16 @@ def _source_hints(documents: Iterable[dict], queries: Iterable[str]) -> list[dic
             seen.add(key)
     selected = sorted(candidates, key=lambda item: item[:3])[:6]
     return [hint for _, _, _, hint in sorted(selected, key=lambda item: item[1:3])]
+
+
+def _is_printed_page_heading(target: dict, documents: Iterable[dict]) -> bool:
+    """A displayed heading and its page can be sound even when indexed section labels lag."""
+    if target["page_index"] is None or not target["doc_id"] or not target["section"] or target["table_label"]:
+        return False
+    return any(_field_key(heading) == _field_key(target["section"])
+               for document in documents if document["doc_id"] == target["doc_id"]
+               for page in document.get("pages", ()) if page["page_index"] == target["page_index"]
+               for heading in _printed_headings(page))
 
 
 def _interleave_units(index: EvidenceIndex, lanes: Iterable[Iterable[str]]) -> Iterable[tuple[str, ...]]:
@@ -249,13 +277,20 @@ def targeted_evidence(
         if any(target[key] is not None for key in ("section", "table_label", "page_index")):
             result = index.inspect(**target, limit=limit, query=query, prior_ids=prior_ids, passage_query=proof_query)
             scope = result["scope"]
+            repaired_heading = not scope["matching_count"] and _is_printed_page_heading(target, documents)
+            if repaired_heading:
+                result = index.inspect(**{**target, "section": None}, limit=limit, query=query,
+                                       prior_ids=prior_ids, passage_query=proof_query)
+                scope = result["scope"]
+                scope["printed_heading"] = target["section"]
             failures = _page_failures(scope, documents)
             scope["unreadable_locations"] = failures
-            scope["complete"] = explicit_location and scope["complete"] and not failures
+            scope["complete"] = explicit_location and scope["complete"] and not failures and not repaired_heading
             section_hint = proof_query and target["section"] is not None and all(
                 target[key] is None for key in ("page_index", "table_label")
             )
-            if (section_hint or not scope["complete"]) and (not target["table_label"] or not scope["matching_count"]):
+            can_widen = not scope["matching_count"] or not (repaired_heading or target["table_label"])
+            if (section_hint or not scope["complete"]) and can_widen:
                 broad = index.search(query, limit=limit, doc_id=target["doc_id"],
                                      followup=True, prior_ids=prior_ids, passage_query=proof_query)
                 inspected = set(scope["examined_evidence_ids"])
@@ -625,7 +660,13 @@ def _compound_claims(part: dict, split: tuple[list[tuple[int, int, str]], str]) 
     operands, operator = split
     atoms = [_plain_claim(part, start, end, proposition) for start, end, proposition in operands]
     attach_compound(part, atoms, operator)
-    return atoms if all("compound" in atom for atom in atoms) else []
+    if not all("compound" in atom for atom in atoms):
+        return []
+    if condition := adjudicable_shared_exception(part["text"]):
+        for atom in atoms:
+            atom.pop("logic_review_required", None)
+            atom["requirements"].append(f"scope in which the exception does not hold ({condition})")
+    return atoms
 
 
 def _claim_sentence(part: dict) -> dict:
@@ -647,6 +688,31 @@ def _claim_sentences(text: str) -> list[dict]:
                 and gap and not gap.strip()):
             parts.pop()
     return [_claim_sentence(part) for part in parts]
+
+
+def recover_compound_claim(claim: dict, source_text: str) -> list[dict]:
+    """Recover reviewable operands of a cached claim only at its original source anchors."""
+    if not claim.get("logic_review_required"):
+        return []
+    part = next((row for row in _claim_sentences(source_text) if row["sentence_id"] == claim.get("sentence_id")), None)
+    if (part is None or part["start"] != claim.get("sentence_start") or part["end"] != claim.get("sentence_end")):
+        return []
+    split = shared_procedure_parts(part["text"]) or reported_compound_parts(part["text"])
+    if split is None:
+        return []
+    if group := claim.get("compound"):
+        fields = ("claim_id", "start", "end", "quote", "proposition")
+        for atom in _compound_claims(part, split):
+            if (not atom.get("logic_review_required") and group == atom["compound"]
+                    and all(atom[field] == claim.get(field) for field in fields)):
+                updated = {key: value for key, value in claim.items() if key != "logic_review_required"}
+                updated["requirements"] = list(dict.fromkeys([*claim["requirements"], *atom["requirements"]]))
+                return [updated]
+        return []
+    if (part["start"] != claim.get("start") or part["end"] != claim.get("end")
+            or part["text"] != claim.get("quote") or part["text"] != claim.get("proposition")):
+        return []
+    return _compound_claims(part, split)
 
 
 def _fidelity_text(text: str) -> str:
@@ -714,6 +780,8 @@ def extract_claims(text: str, model=None) -> list[dict]:
 
     parsed = model.call("extract", {"sentences": parts}, Extraction)
     by_sentence = {part["sentence_id"]: part for part in parts}
+    grounded_splits = {part["sentence_id"]: split for part in parts
+                       if (split := shared_procedure_parts(part["text"]) or reported_compound_parts(part["text"]))}
     groups = getattr(parsed, "compounds", [])
     compound_indexes = {index for group in groups for index in group.claim_indexes}
     anchored = []
@@ -773,8 +841,8 @@ def extract_claims(text: str, model=None) -> list[dict]:
         blockers = fidelity_failures.get(sentence_id)
         unsplit = (counts[sentence_id] == 1 and atom["kind"] not in {"background", "purpose"}
                    and atom["quote"].rstrip(".?!") == part["text"].rstrip(".?!"))
-        if whole or unsplit or blockers:
-            split = shared_procedure_parts(part["text"]) or reported_compound_parts(part["text"])
+        split = grounded_splits.get(sentence_id)
+        if whole or unsplit or blockers or (split and "compound" not in atom):
             if blockers and not whole and not split:
                 split = offline_compound_parts(part["text"])
             recovered = _compound_claims(part, split) if split else []
@@ -793,9 +861,15 @@ def extract_claims(text: str, model=None) -> list[dict]:
         else:
             _restore_source_queries(atom, part)
         result[atom["claim_id"]] = atom
-    missing = whole_sentences - {atom["sentence_id"] for atom in anchored}
+    missing = (whole_sentences | grounded_splits.keys()) - counts.keys()
     for part in parts:
-        if part["sentence_id"] in missing:
+        sentence_id = part["sentence_id"]
+        if sentence_id not in missing:
+            continue
+        split = grounded_splits.get(sentence_id)
+        if recovered := (_compound_claims(part, split) if split else []):
+            result.update((member["claim_id"], member) for member in recovered)
+        elif sentence_id in whole_sentences:
             atom = _plain_claim(part)
             atom["logic_review_required"] = True
             result[atom["claim_id"]] = atom
@@ -1048,6 +1122,8 @@ def review_claim(
     sent_table_region = None
     sent_priority = []
     inspected_body_windows = []
+    continuation_windows = []
+    new_continuation_ids = set()
     decision_attempts = []
     decision_blockers = []
     output = None
@@ -1070,11 +1146,40 @@ def review_claim(
             examined_scopes.append({**result["scope"], "mode": "ranked"})
             remember(result)
 
-    def inspect(targets: Sequence[dict], previous: list[str], known: set[str], *, context_ids=()) -> bool:
+    def inspect(targets: Sequence[dict], previous: list[str], known: set[str], *, context_ids=(), retain=()) -> bool:
         results = targeted_evidence(index, targets, documents=documents, prior_ids=sorted(known - set(context_ids)))
         examined_scopes.extend(results["scopes"])
+        remember(results)
+        selected = [item["evidence_id"] for item in results["evidence"]]
+        retained_rows = index.get(retain)
+        retained = [item["evidence_id"] for item in retained_rows] or previous[:1]
+        by_id.update((item["evidence_id"], item) for item in retained_rows)
+        exhaustive = {eid for scope in results["scopes"] if scope.get("complete")
+                      for eid in scope["examined_evidence_ids"]}
+        grouped = {eid for unit in index.evidence_units(selected) if len(unit) > 1 for eid in unit}
+        for eid in retained:
+            if eid in selected:
+                continue
+            if len(selected) < primary_limit:
+                if retained_rows:
+                    selected.append(eid)
+                continue
+            for offset in reversed(range(len(selected))):
+                previous_id = selected[offset]
+                if previous_id not in exhaustive and previous_id not in grouped and previous_id not in retained:
+                    selected[offset] = eid
+                    break
         for scope in results["scopes"]:
             if scope["mode"] == "direct" and scope["matching_count"] and scope["table_label"] is None:
+                if scope["page_index"] is not None:
+                    inspected = set(scope["examined_evidence_ids"])
+                    if continuation := index.page_continuation((eid for eid in selected if eid in inspected), documents):
+                        continuation_windows.append(continuation)
+                        window = continuation[1]
+                        inspected_body_windows.append(window)
+                        new_continuation_ids.update(set(window.evidence_ids) - known)
+                        scope["complete"] = False
+                        continue
                 query = _empirical_context_query(claim, scope, documents) if empirical else None
                 if query and query != scope["query"]:
                     scope["body_context_query"] = query
@@ -1082,18 +1187,6 @@ def review_claim(
                     [query or scope["query"]], doc_id=scope["doc_id"], doc_version_id=scope["doc_version_id"],
                     page_index=scope["page_index"], section=scope["section"],
                 ))
-        remember(results)
-        selected = [item["evidence_id"] for item in results["evidence"]]
-        if previous and len(selected) == 8 and previous[0] not in selected:
-            # A partial check can add a missing condition while an initial hit is
-            # still needed to judge the result. Keep that hit if space allows.
-            exhaustive = {eid for scope in results["scopes"] if scope.get("complete")
-                          for eid in scope["examined_evidence_ids"]}
-            grouped = {eid for unit in index.evidence_units(selected) if len(unit) > 1 for eid in unit}
-            for offset in reversed(range(len(selected))):
-                if selected[offset] not in exhaustive and selected[offset] not in grouped:
-                    selected[offset] = previous[0]
-                    break
         prioritized.extend(selected)
         follow_up_evidence_ids.extend(eid for eid in selected if eid not in known)
         if follow_up_evidence_ids or any(scope.get("complete") for scope in results["scopes"]):
@@ -1165,7 +1258,9 @@ def review_claim(
     if saved:
         previous = candidate_order()
         context = index.table_context(previous)
-        inspect(saved, previous, set(previous) | {item["evidence_id"] for item in context["evidence"]})
+        retain = saved_targets[0].get("retained_evidence_ids", ()) if isinstance(saved_targets[0], dict) else ()
+        known = set(previous) | {item["evidence_id"] for item in context["evidence"]} | set(retain)
+        inspect(saved, previous, known, retain=retain)
     calculation = None
     while True:
         candidates = [by_id[eid] for eid in candidate_order()]
@@ -1259,12 +1354,19 @@ def review_claim(
                 "with comparable model, task and metric. A reported comparison can cover both conditions in one anchor. "
                 "If the evidence covers only one condition or changes the comparison setup, request the missing result."
             )
-        hints = _source_hints(documents, (claim["proposition"], *initial_queries)) if not followup else []
+        hints = []
+        if documents and not followup:
+            proof_claim = claim["kind"] == "theoretical" or _PROOF_NAVIGATION.search(proposition)
+            hints = _source_hints(documents, (proposition, *requirements, *initial_queries),
+                                  index.proof_navigation_labels if proof_claim else ())
         if hints:
             material["source_hints"] = hints
             material["coverage_instructions"] += (
-                " Source hints are navigation labels only. To follow a hint, use its doc_id and zero-based page_index "
-                "in a typed follow_up_target and leave section empty. Base judgments on the returned source anchors."
+                " Choose the unresolved required condition and the most relevant source for checking it. Source hints "
+                "are navigation labels only. For a specific printed page use its doc_id and zero-based page_index "
+                "without a section filter. For a named section that may span pages, set section without restricting "
+                "it to the heading's page. A known table can be targeted by table_label. Use a targeted search if "
+                "no listed source fits. Base judgments on the returned source anchors."
             )
         if table_context:
             material["table_context"] = table_context
@@ -1301,6 +1403,16 @@ def review_claim(
                 " For one continuous citation, use evidence_ranges with a role and the inclusive start_evidence_id "
                 "and end_evidence_id in one displayed body passage or context span. Cite separate evidence in "
                 "individual evidence_groups."
+            )
+        if links := [
+            {"from_evidence_id": source, "to_evidence_ids": list(window.evidence_ids)}
+            for source, window in continuation_windows
+            if source in scoped and scoped.keys() >= set(window.evidence_ids)
+        ]:
+            material["body_continuations"] = links
+            material["coverage_instructions"] += (
+                " body_continuations links an unfinished line to source text on the next physical page. "
+                "Use separate citations for each page. These links do not make the source inspection exhaustive."
             )
         if claim.get("logic_review_required"):
             material["logic_review_required"] = True
@@ -1377,10 +1489,15 @@ def review_claim(
             if targets:
                 if reserve_followup is None or reserve_followup():
                     followup = True
+                    retained = list(dict.fromkeys([
+                        *(eid for group in output.evidence_groups if group.role in {"support", "refute"}
+                          for eid in group.evidence_ids),
+                        *(eid for field in coverage if field["status"] == "found" for eid in field["evidence_ids"]),
+                    ]))[:2]
                     if save_targets is not None:
-                        save_targets(targets)
+                        save_targets([{**targets[0], "retained_evidence_ids": retained}, *targets[1:]] if retained else targets)
                     if inspect(targets, [item["evidence_id"] for item in candidates], set(sent_candidate_ids),
-                               context_ids=body_ids):
+                               context_ids=body_ids, retain=retained):
                         continue
                     stop = "no_progress"
                 else:
@@ -1488,6 +1605,12 @@ def review_claim(
                                                            for eid in window.expanded_ids)),
             "priority_evidence_ids": sent_priority,
         }
+        if continuations := [
+            {"from_evidence_id": source, "to_evidence_ids": list(window.evidence_ids)}
+            for source, window in continuation_windows
+            if source in sent_candidate_ids and set(sent_candidate_ids).issuperset(window.evidence_ids)
+        ]:
+            finding["retrieval_trace"]["page_continuations"] = continuations
     finding["searched_scope"] = examined_scopes
     finding["retrieval_paths"] = _sent_paths([*paths, *context["paths"]], sent_candidate_ids)
     if sent_table_context:
@@ -1506,6 +1629,7 @@ def review_claim(
     if sent_body_context:
         finding["body_context"] = sent_body_context
     finding["follow_up_performed"] = followup
+    follow_up_evidence_ids.extend(eid for eid in sent_candidate_ids if eid in new_continuation_ids)
     if follow_up_evidence_ids:
         finding["follow_up_evidence_ids"] = list(dict.fromkeys(follow_up_evidence_ids))
     if "coverage" not in finding:
@@ -1523,6 +1647,40 @@ def review_claim(
     return finding, calculation
 
 
+def _recover_cached_compounds(report: dict, version: dict) -> bool:
+    if (version.get("kind") not in {"pdf_original", "pasted_original"}
+            or version.get("version_id") != report.get("original_abstract", {}).get("version_id")
+            or any(report.get(key) for key in ("revisions", "verifications", "candidate_proposal"))):
+        return False
+    claims = report["claims"]
+    locked = {row["claim_id"] for row in report["findings"]
+              if not row.get("retryable") or row.get("evidence_ids")}
+    locked.update(row["claim_id"] for key in ("calculations", "finding_history") for row in report.get(key, ()))
+    locked.update(report.get("follow_up_rounds", ()))
+    locked.update(report.get("claim_followups", ()))
+    ids = {claim["claim_id"] for claim in claims}
+    counts = Counter(claim["sentence_id"] for claim in claims)
+    updated = []
+    replaced = set()
+    for claim in claims:
+        claim_id = claim["claim_id"]
+        if claim_id not in locked and (counts[claim["sentence_id"]] == 1 or claim.get("compound")):
+            recovered = recover_compound_claim(claim, version["text"])
+            recovered_ids = {member["claim_id"] for member in recovered}
+            if recovered and not ((recovered_ids - {claim_id}) & ids):
+                replaced.add(claim_id)
+                ids.update(recovered_ids)
+                updated.extend(recovered)
+                continue
+        updated.append(claim)
+    if not replaced:
+        return False
+    report["claims"] = updated
+    for key in ("findings", "unresolved_items"):
+        report[key] = [row for row in report.get(key, ()) if row.get("claim_id") not in replaced]
+    return True
+
+
 def audit_version(
     report: dict, model, commit, *, embedder=None, reranker=None, data_dir=None,
     reserve_followup: Callable[[str], bool] | None = None,
@@ -1530,6 +1688,9 @@ def audit_version(
     version = report["reviewed_abstract"]
     if "claims" not in report:
         report["claims"] = extract_claims(version["text"], model)
+        refresh_compound_findings(report)
+        commit()
+    elif _recover_cached_compounds(report, version):
         refresh_compound_findings(report)
         commit()
     index = EvidenceIndex(report["evidence"], embedder=embedder, reranker=reranker)

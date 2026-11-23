@@ -182,7 +182,9 @@ def test_shared_negated_capability_retains_its_exception_for_both_operands():
         f"In both settings, the finite-state controller cannot recognize {subject}, unless memory grows with sequence length"
         for subject in ["mirrored tokens", "balanced markers"]
     ]
-    assert all(atom["logic_review_required"] and atom["compound"]["operator"] == "and" for atom in claims)
+    assert all(not atom.get("logic_review_required") and atom["compound"]["operator"] == "and" for atom in claims)
+    assert all("scope in which the exception does not hold (memory grows with sequence length)" in atom["requirements"]
+               for atom in claims)
 
 
 @pytest.mark.parametrize("source", [

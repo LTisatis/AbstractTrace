@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -70,8 +71,15 @@ _TRAILING_TRANSITION = re.compile(
     r"[.!?。！？]\s*(?:first|second|third|fourth|finally|alternatively|next|however|moreover|for example|"
     r"首先|其次|然后|最后|另外|例如|第[一二三四])[，,]$", re.IGNORECASE,
 )
+_PAGE_BODY_LABEL = re.compile(r"^(?:fig(?:ure)?\.?|table|图|表)\s*[A-Z]?\d", re.IGNORECASE)
+_PAGE_CONTINUATION_START = re.compile(r"^(?:[a-z\u3400-\u9fff]|[\[{(]\s*\d)")
 _WRAPPED_WORD = re.compile(r"(?<=[^\W\d_])[-\u00ad]\n\s*(?=[^\W\d_])")
 _WITNESS_QUERY = re.compile(r"\b(?:counter[\s-]?examples?|witness(?:es)?|constructive|examples?)\b|反例|构造性")
+_PRINTED_PROOF_LABEL = re.compile(
+    r"^(?:Proof of (?:Theorem|Lemma|Proposition|Corollary)|Theorem|Lemma|Proposition|Corollary)"
+    r"\s+\d+(?:\.\d+)*(?=[.:(\s]|$)"
+)
+_NON_PROOF_SECTION = re.compile(r"^(?:abstract|references?|bibliography|acknowledg\w*|摘要|参考文献)(?:\b|$)")
 _WITNESS_TEXT = re.compile(
     r"\b(?:can|could)\s+(?:(?:also|directly|exactly|successfully|always|still)\s+){0,2}"
     r"(?:(?:recognize|represent|express|simulate|separate|implement|compute|model|solve|realize|accept|classify|"
@@ -672,6 +680,18 @@ class EvidenceIndex:
             result.append(deepcopy(self._records[eid]))
         return result
 
+    @cached_property
+    def proof_navigation_labels(self) -> tuple[tuple[str, int, str], ...]:
+        """Locate printed proof labels in text when PDF heading detection omits them."""
+        labels = {}
+        for row in self._records.values():
+            loc = row["locator"]
+            if row.get("kind") != "body_text" or _NON_PROOF_SECTION.match(_inspection_section(_text_field(loc, "section"))):
+                continue
+            if match := _PRINTED_PROOF_LABEL.match(" ".join(row["text"].split())):
+                labels[row["doc_id"], loc["page_index"], match[0]] = None
+        return tuple(labels)
+
     @staticmethod
     def _rank(postings: dict[str, set[str]], tokens: set[str], active: set[str]) -> list[str]:
         scores: dict[str, float] = defaultdict(float)
@@ -861,6 +881,82 @@ class EvidenceIndex:
             window = windows[first]
             results.setdefault(window.expanded_ids, window)
         return list(results.values())
+
+    @staticmethod
+    def _page_heading_keys(page: dict) -> set[str]:
+        headings = page.get("source_headings")
+        if not isinstance(headings, (list, tuple)):
+            return set()
+        return {_section_key(heading) for heading in headings if isinstance(heading, str) and heading.strip()}
+
+    def _page_lines(self, record: dict, page_index: int) -> Iterator[tuple[str, tuple]]:
+        page_key = _document_key(record), page_index
+        return (line for location, lines in self._body_lines.items() if location[:2] == page_key for line in lines)
+
+    def _page_prose(self, record: dict, page: dict) -> list[tuple[str, tuple]]:
+        width, height = page["width"], page["height"]
+        headings = self._page_heading_keys(page)
+        prose = []
+        for eid, box in self._page_lines(record, page["page_index"]):
+            text = self._records[eid]["text"].strip()
+            if (box[2] - box[0] >= 0.18 * width and box[1] >= 0.025 * height and box[3] <= 0.94 * height
+                    and sum(char.isalpha() for char in text) >= 8
+                    and not _PAGE_BODY_LABEL.search(text) and _section_key(text) not in headings):
+                prose.append((eid, box))
+        return prose
+
+    def page_continuation(self, candidate_ids: Iterable[str], documents: Iterable[dict]) -> tuple[str, _ContextWindow] | None:
+        """Find a displayed page-tail line and the physically continuous prose on the next page."""
+        pages = {(doc["doc_id"], page["page_index"]): page for doc in documents for page in doc.get("pages", ())
+                 if isinstance(page, dict) and type(page.get("page_index")) is int and page.get("status") == "parsed"
+                 and all(isinstance(page.get(axis), (int, float)) and page[axis] > 0 for axis in ("width", "height"))}
+        for eid in dict.fromkeys(candidate_ids):
+            row = self._records[eid]
+            box, text = _bbox(row), row["text"].rstrip()
+            if row.get("kind") != "body_text" or box is None or _LINE_END.search(text) or _TRAILING_TRANSITION.search(text):
+                continue
+            page_index = row["locator"]["page_index"]
+            current = pages.get((row["doc_id"], page_index))
+            next_page = pages.get((row["doc_id"], page_index + 1))
+            if not current or not next_page or current.get("rotation", 0) != next_page.get("rotation", 0):
+                continue
+            if box[3] < 0.82 * current["height"] or self._adjacent_line(eid, 1):
+                continue
+            prose = self._page_prose(row, current)
+            if (eid, box) not in prose or any(other != eid and (
+                rect[0] >= box[2] or (rect[1] > box[1] and rect[2] > box[0] and rect[0] < box[2])
+            ) for other, rect in prose):
+                continue
+            starts = [(other, rect) for other, rect in self._page_prose(row, next_page)
+                      if rect[1] <= 0.17 * next_page["height"]]
+            if not starts:
+                continue
+            left = min(rect[0] for _, rect in starts)
+            head, head_box = min((item for item in starts if item[1][0] <= left + box[3] - box[1]),
+                                 key=lambda item: (item[1][1], item[1][0], item[0]))
+            start_text = self._records[head]["text"].lstrip()
+            section = _section_key(_text_field(row["locator"], "section"))
+            if (not section or section in {"abstract", "references", "bibliography"}
+                    or section != _section_key(_text_field(self._records[head]["locator"], "section"))
+                    or not _PAGE_CONTINUATION_START.match(start_text)
+                    or (start_text[0] in "[{(" and text.count("(") <= text.count(")")
+                        and text.count("[") <= text.count("]") and text.count("{") <= text.count("}"))
+                    or not 0.65 * (box[3] - box[1]) <= head_box[3] - head_box[1] <= 1.5 * (box[3] - box[1])):
+                continue
+            headings = self._page_heading_keys(next_page)
+            if headings and any(rect[1] <= head_box[1] and rect[0] < head_box[2] and rect[2] > head_box[0]
+                                and _section_key(self._records[other]["text"]) in headings
+                                for other, rect in self._page_lines(row, page_index + 1)):
+                continue
+            anchors = [head]
+            while len(anchors) < _CONTEXT_WINDOW_LINES and (following := self._adjacent_line(anchors[-1], 1)):
+                if not self._wrap_to_next(anchors[-1], following):
+                    break
+                anchors.append(following)
+            ids = tuple(anchors)
+            passage = "\n".join(self._records[item]["text"] for item in ids)
+            return eid, _ContextWindow(passage, ids, ids)
+        return None
 
     def pack_body_context(self, windows: Iterable[_ContextWindow], primary_ids: Iterable[str]) -> list[dict]:
         """Attach original anchors under one extra-text budget across all passages."""
