@@ -150,6 +150,57 @@ def test_direct_refutation_requires_same_scope_and_only_supplementary_missing_fi
     assert len(model.calls) == 1
 
 
+@pytest.mark.parametrize(("field", "proposition", "condition_text"), [
+    ("human patient population", "The intervention lowered recurrence in human patients.",
+     "The study used mice and enrolled no human patients."),
+    ("held-out test split", "The prototype improved detection on the held-out test split.",
+     "Detection was measured only on the training split."),
+    ("instrument calibration records", "With the specified instrument calibration, the prototype reduced drift.",
+     "The experiment did not record instrument calibration."),
+])
+def test_refutation_cannot_waive_decisive_conditions(field, proposition, condition_text):
+    claim = {**CLAIM, "proposition": proposition, "requirements": [field, "outcome"],
+             "support_query": condition_text, "counter_query": "opposite tested outcome"}
+    output = _judgement(verdict="refuted", missing=[field], groups=[{"role": "refute", "evidence_ids": ["scope", "opposite"]}],
+                        observations=[{"requirement": "outcome", "status": "found", "evidence_ids": ["opposite"]}])
+    output["direct_contradiction"] = {
+        "evidence_ids": ["opposite"], "scope_evidence_ids": ["scope"], "subject_and_conditions": "same",
+        "relation": "opposite_result", "scope_reason": "An opposite result was reported.", "supplementary_fields": [field],
+    }
+    model = Model(output)
+    with closing(EvidenceIndex([_source("scope", condition_text), _source("opposite", "The opposite tested outcome occurred.")])) as index:
+        result, _ = review_claim(claim, index, model)
+    assert model.calls[0]["optional_refutation_requirements"] == []
+    assert result["review_status"] == "pending" and result["verdict"] is None
+    assert result["refutation_blocker"] == "unapproved_supplementary_requirement"
+    assert result["evidence_ids"] == ["scope", "opposite"]
+
+
+@pytest.mark.parametrize(("verdict", "direction", "blocker"), [
+    ("supported", "support", "unlinked_support_requirements"),
+    ("refuted", "refute", "missing_scope_coverage"),
+])
+def test_decisive_scope_must_be_linked_to_the_directional_evidence(verdict, direction, blocker):
+    claim = {**CLAIM, "requirements": ["test split", "biodiversity outcome"],
+             "support_query": "biodiversity result test split", "counter_query": "test split"}
+    observed = _judgement(verdict=verdict, missing=[], groups=[{"role": direction, "evidence_ids": ["result"]}], observations=[
+        {"requirement": "biodiversity outcome", "status": "found", "evidence_ids": ["result"]},
+        {"requirement": "test split", "status": "found", "evidence_ids": ["other"]},
+    ])
+    if verdict == "refuted":
+        observed["direct_contradiction"] = {
+            "evidence_ids": ["result"], "subject_and_conditions": "same", "relation": "opposite_result",
+            "scope_reason": "The prototype was the same.", "supplementary_fields": [],
+        }
+    rows = [_source("result", "The biodiversity result was measured in the development run."),
+            _source("other", "The test split was used in a different experiment.")]
+    with closing(EvidenceIndex(rows)) as index:
+        result, _ = review_claim(claim, index, Model(observed))
+    assert {"result", "other"} <= set(result["sent_candidate_ids"])
+    assert result["review_status"] == "pending" and result["verdict"] is None
+    assert blocker in result["decision_trace"]["blocker_codes"]
+
+
 @pytest.mark.parametrize(("proof_mode", "blocker"), [
     ("complete", None),
     ("missing", "missing_direct_contradiction"),

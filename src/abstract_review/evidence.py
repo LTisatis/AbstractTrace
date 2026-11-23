@@ -57,6 +57,10 @@ _RESULT_LANGUAGE = re.compile(
     r"\b(?:as shown in|results? (?:indicate|show|suggest)|outperform\w*|perform\w* comparably|"
     r"(?:increase|improve|decrease|reduce)\w* by|measured|observed)\b", re.I,
 )
+_INLINE_REFERENCE_CONTINUATION = re.compile(
+    r"\s*(?:19|20)\d{2}[a-z]?(?:[;,]\s*[^;,.\d]{1,32}(?:\s+et al\.)?,\s*(?:19|20)\d{2}[a-z]?)+"
+    r"\s*\)?(?:\s+(?:and|or))?\s*", re.I,
+)
 _TABLE_AXIS_QUERY = re.compile(r"\b(?:all|each|every)\s+(?:other\s+)?(?:rows?|columns?|intervals?|bins?|ranges?)\b"
                                r"|(?:每[一个]|所有)(?:行|列|区间)", re.I)
 _SUMMARY_SECTION = re.compile(r"^(?:abstract|introduction|conclusions?|摘要|引言|结论)(?:\b|$)")
@@ -254,6 +258,10 @@ class _Edge:
     target_id: str
     relation: str
     anchors: tuple[str, ...]
+
+
+def experiment_ids(text: str) -> frozenset[str]:
+    return frozenset(_EXPERIMENT.findall(_normalize(text)))
 
 
 def with_method_scope(records: Iterable[dict], paths: Iterable[dict]) -> list[dict]:
@@ -520,11 +528,11 @@ class EvidenceIndex:
 
     def _experiment_anchor(self, eid: str) -> tuple[frozenset[str], str]:
         record = self._records[eid]
-        explicit = frozenset(_EXPERIMENT.findall(_normalize(record["text"])))
+        explicit = experiment_ids(record["text"])
         header_id = self._row_headers.get(eid)
         if header_id is not None:
             header = self._records[header_id]
-            row_refs = frozenset(_EXPERIMENT.findall(_normalize(header["text"])))
+            row_refs = experiment_ids(header["text"])
             if row_refs:
                 return explicit | row_refs, header_id
         return explicit, eid
@@ -1091,7 +1099,23 @@ class EvidenceIndex:
                 score = (strength, complete_end, -min(ranks[aid] for aid in span), -len(span))
                 if score > best:
                     best, promoted = score, span
+        if len(promoted) == limit:
+            promoted = self._restore_comparison_scope(query, promoted, available)
         return list(dict.fromkeys([*promoted, *ordered]))
+
+    def _restore_comparison_scope(self, query: str, span: tuple[str, ...], available: set[str]) -> tuple[str, ...]:
+        """Promote a clipped amount-comparison lead-in over a references-only line."""
+        exact, _ = _exact_terms(query)
+        numbers = [term for term in exact if term.startswith("number:")]
+        if len(numbers) < 2 or not any(term.endswith((":%", ":pp")) for term in numbers):
+            return span
+        previous = self._adjacent_line(span[0], -1)
+        if (previous not in available or previous in span or self._adjacent_line(previous, 1) != span[0]
+                or not self._wrap_to_next(previous, span[0])):
+            return span
+        reference = next((eid for eid in span[1:-1]
+                          if _INLINE_REFERENCE_CONTINUATION.fullmatch(self._records[eid]["text"])), None)
+        return (previous, *(eid for eid in span if eid != reference)) if reference else span
 
     def _comparison_packet(self, query: str, ordered: list[str], limit: int) -> list[str]:
         exact, without_numbers = _exact_terms(query)

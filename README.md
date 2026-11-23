@@ -70,7 +70,9 @@ uv run abstract-review bench run --engine offline --input-manifest .review-data/
 uv run abstract-review bench score --predictions .review-data/d11/out/predictions.json --gold-manifest .review-data/d11/gold.json --output .review-data/d11/out/scores.json
 ```
 
-PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `abstract_file`、`paper_family_id`、`split` 和给定 `claims`。给定断言每项含 `claim_id` 与 `text`，省略时由引擎从摘要抽取。金标从独立清单载入评分器。`run.json` 记录输入和配置指纹、用量与耗时。评分区分已完成项的分类成绩和所有金标的交付比例，并按实际送审顺序计算完整证据组的 `Recall@K`。样例为合成的多个论文族，跨学科质量评测需要独立标注的全文留出集。
+PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `pdf_sha256`、`abstract_file`、`paper_family_id`、`split` 和给定 `claims`。给定断言每项含 `claim_id` 与 `text`，省略时由引擎从摘要抽取。批跑开始前会计算每个 PDF 的实际 SHA-256 并验证清单中提供的校验值。即使文件名和论文族不同，内容完全相同的 PDF 也不能跨划分。使用相同输入、配置、数据目录和输出目录加上 `--resume`，可复用已完成项，并沿用原有额度恢复已保存的暂停项。
+
+金标从独立清单载入评分器。`run.json` 记录输入和配置指纹、用量与耗时。通用评分和 SciFact 评分可加上 `--run-record`，传入同一轮生成的 `run.json`。评分器按预测文件内容的 SHA-256 校验两者，`run_diagnostics` 会列出未执行、暂停、已执行未决和已判定等结果。评分区分已完成项的分类成绩和所有金标的交付比例，并按实际送审顺序计算完整证据组的 `Recall@K`。样例为合成的多个论文族，跨学科质量评测需要独立标注的全文留出集。
 
 自主抽取的严格评分按同句区间和规范化命题匹配。独立核对等义命题后，可以向 `bench score` 增加 `--semantic-matches equivalents.json`。原严格结果保留在顶层，`semantic_extraction` 记录补充匹配，`semantic_scoring` 记录相应的判定、覆盖和取证指标。
 

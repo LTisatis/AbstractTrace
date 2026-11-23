@@ -28,7 +28,7 @@ class _Sample:
     claims: tuple[tuple[str, str], ...]
     paper_family_id: str | None
     split: str | None
-    pdf_sha256: str | None
+    pdf_sha256: str
 
 
 def _identifier(value: object, location: str) -> str:
@@ -68,6 +68,11 @@ def _check_split(key: str | Path, split: str, seen: dict, location: str) -> None
         raise ValueError(f"{location}: {key!s} appears in both {previous!r} and {split!r} splits")
 
 
+def _pdf_digest(pdf: Path) -> str:
+    with pdf.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
 def _load_samples(path: Path) -> list[_Sample]:
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -79,6 +84,7 @@ def _load_samples(path: Path) -> list[_Sample]:
         raise ValueError("PDF benchmark input requires schema_version 1 and a nonempty samples list")
 
     samples, seen, family_splits, source_splits = [], set(), {}, {}
+    pdf_digests: dict[Path, str] = {}
     base = path.parent
     for number, row in enumerate(data["samples"]):
         location = f"samples[{number}]"
@@ -89,11 +95,19 @@ def _load_samples(path: Path) -> list[_Sample]:
             raise ValueError(f"{location} repeats sample_id {sample_id!r}")
         seen.add(sample_id)
         pdf = _source_path(row["pdf"], base, f"{location}.pdf")
-        pdf_sha256 = None
+        expected_digest = None
         if "pdf_sha256" in row:
-            pdf_sha256 = _identifier(row["pdf_sha256"], f"{location}.pdf_sha256")
-            if len(pdf_sha256) != 64 or any(character not in "0123456789abcdef" for character in pdf_sha256):
+            expected_digest = _identifier(row["pdf_sha256"], f"{location}.pdf_sha256")
+            if len(expected_digest) != 64 or any(character not in "0123456789abcdef" for character in expected_digest):
                 raise ValueError(f"{location}.pdf_sha256 must be a lowercase SHA-256 digest")
+        try:
+            if pdf not in pdf_digests:
+                pdf_digests[pdf] = _pdf_digest(pdf)
+        except OSError as exc:
+            raise ValueError(f"benchmark sample {sample_id!r}: {exc}") from exc
+        pdf_sha256 = pdf_digests[pdf]
+        if expected_digest is not None and expected_digest != pdf_sha256:
+            raise ValueError(f"benchmark sample {sample_id!r}: PDF does not match the manifest SHA-256")
         family = _identifier(row["paper_family_id"], f"{location}.paper_family_id") if "paper_family_id" in row else None
         split = None
         if "split" in row:
@@ -101,7 +115,7 @@ def _load_samples(path: Path) -> list[_Sample]:
             if family is None:
                 raise ValueError(f"{location}.split requires paper_family_id")
             _check_split(family, split, family_splits, location)
-            _check_split(pdf, split, source_splits, location)
+            _check_split(pdf_sha256, split, source_splits, f"{location}.pdf SHA-256")
 
         abstract = abstract_digest = None
         if "abstract_file" in row:
@@ -175,10 +189,9 @@ def benchmark_configuration(
 
 
 def _input_digest(sample: _Sample, configuration: dict) -> tuple[str, str]:
-    with sample.pdf.open("rb") as source:
-        pdf_hash = hashlib.file_digest(source, "sha256").hexdigest()
-    if sample.pdf_sha256 is not None and pdf_hash != sample.pdf_sha256:
-        raise ValueError(f"benchmark sample {sample.sample_id!r}: PDF does not match the manifest SHA-256")
+    pdf_hash = _pdf_digest(sample.pdf)
+    if pdf_hash != sample.pdf_sha256:
+        raise ValueError(f"benchmark sample {sample.sample_id!r}: PDF changed after manifest validation")
     material = [1, configuration, sample.sample_id, pdf_hash, sample.abstract_digest,
                 sample.claims, sample.paper_family_id, sample.split]
     encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -226,9 +239,53 @@ def _checkpoint_rows(sample: _Sample, input_digest: str, entry: object) -> list[
     return rows
 
 
+def _resume_pdf_sample(service, sample: _Sample, request: PdfReviewInput, pause: object) -> tuple[dict, dict]:
+    if not isinstance(pause, dict):
+        raise ValueError("invalid paused PDF checkpoint")
+    run_id = _identifier(pause.get("run_id"), "paused run ID")
+    version_id = _identifier(pause.get("report_version_id"), "paused report version ID")
+    expected = {
+        "engine": request.engine, "model": request.model,
+        "embed_model": str(request.embed_model.resolve()) if request.embed_model else None,
+        "rerank_model": str(request.rerank_model.resolve()) if request.rerank_model else None,
+        "check_omissions": request.check_omissions, "check_external": request.check_external,
+        "ocr_language": request.ocr_language,
+    }
+    with service.store.acquire(run_id) as lease_token:
+        report = service.store.read(run_id)
+        original, current = report["original_abstract"], report["reviewed_abstract"]
+        config = report.get("configuration") or {}
+        documents = report.get("documents", [])
+        claims = tuple((claim["claim_id"], claim["text"]) for claim in report.get("claims", []))
+        abstract_source = "provided" if sample.claims else request.abstract_source
+        report_version = report["report_version_id"]
+        status = report.get("run_status")
+        completed_candidate = (status == "report_ready" and current.get("kind") == "candidate"
+                               and current.get("parent_version_id") == version_id)
+        if (report.get("mode") != "pdf" or report["run_id"] != run_id
+                or not documents or documents[0]["sha256"] != sample.pdf_sha256
+                or original["version_id"] != version_id or original.get("kind") != f"{abstract_source}_original"
+                or (sample.pasted_abstract is not None and not any(
+                    version.get("kind") == "pasted_original" and version.get("text") == sample.pasted_abstract
+                    for version in report.get("abstract_versions", [])
+                ))
+                or (sample.claims and claims != sample.claims)
+                or (report_version != version_id and not completed_candidate)
+                or any(config.get(key) != value for key, value in expected.items())
+                or config.get("retrieval_model_sha256", {}) != request.expected_retrieval_fingerprints):
+            raise ValueError("stored review does not match the paused PDF checkpoint")
+        if status == "report_ready":
+            return {"run_id": run_id, "report_version_id": report_version, "run_status": status}, report
+        if status not in {"paused", "running"}:
+            raise ValueError("stored review is no longer resumable from the paused PDF checkpoint")
+        run = service.resume(run_id, lease_token=lease_token)
+        return run, service.export(run_id, run["report_version_id"])
+
+
 def run_pdf_samples(
     service, manifest_path: Path, engine: str, model: str, *,
     recovered: dict | None = None, on_sample: Callable[[str, str, list[dict]], None] | None = None,
+    on_pause: Callable[[str, str, dict], None] | None = None,
     on_result: Callable[[dict], None] | None = None, configuration: dict | None = None,
     embed_model: Path | None = None, rerank_model: Path | None = None,
 ) -> list[dict]:
@@ -269,8 +326,13 @@ def run_pdf_samples(
             rerank_model=rerank_model, expected_retrieval_fingerprints=model_fingerprints,
         )
         try:
-            run = service.start(request)
-            report = service.export(run["run_id"], run["report_version_id"])
+            if isinstance(entry, dict) and "pause" in entry:
+                if entry.get("input_digest") != digest:
+                    raise ValueError("paused PDF checkpoint inputs or configuration changed; use another output directory")
+                run, report = _resume_pdf_sample(service, sample, request, entry["pause"])
+            else:
+                run = service.start(request)
+                report = service.export(run["run_id"], run["report_version_id"])
         except (ValueError, OSError) as exc:
             raise ValueError(f"benchmark sample {sample.sample_id!r}: {exc}") from exc
 
@@ -286,6 +348,8 @@ def run_pdf_samples(
             on_result(_sample_result(result, run, report, rows, time.perf_counter() - started))
         if on_sample is not None and run.get("run_status") == "report_ready":
             on_sample(sample.sample_id, digest, rows)
+        if on_pause is not None and run.get("run_status") == "paused":
+            on_pause(sample.sample_id, digest, run)
     return predictions
 
 
@@ -309,6 +373,7 @@ def _sample_result(result: dict, run: dict, report: dict, rows: list[dict], elap
                              })
     summary = {
         **result, "cache_hit": False, "run_id": run["run_id"], "run_status": run.get("run_status"),
+        "report_version_id": run["report_version_id"],
         "prediction_count": len(rows), "wall_seconds": round(elapsed, 6),
         "model_requests": usage.get("external_requests"), "tokens": tokens, "request_usage": request_usage,
         "follow_up_count": sum(bool(row.get("follow_up_performed")) for row in report.get("findings", [])),

@@ -176,6 +176,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
     import hashlib
     import time
 
+    from .scoring import semantic_manifest_sha256
+
     started = time.perf_counter()
     results = []
     output_path = args.output_dir / "predictions.json"
@@ -187,6 +189,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
         raise ValueError("benchmark outputs and input manifest must use distinct files")
     manifest_bytes = args.input_manifest.read_bytes()
     manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{args.input_manifest}: invalid UTF-8 JSON ({exc})") from exc
     retrieval_options = {"embed_model": args.embed_model, "rerank_model": args.rerank_model}
     if any(retrieval_options.values()) and (args.dataset or not args.engine):
         raise ValueError("local retrieval models require a PDF benchmark engine without --dataset")
@@ -198,8 +204,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
     def finish(predictions: list[dict], configuration: dict, batch: dict | None = None) -> None:
         if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
             raise ValueError("benchmark input manifest changed during review")
-        write_json(output_path, {"schema_version": 1, "predictions": predictions})
-        record = {"schema_version": 1, "input_manifest_sha256": manifest_hash, "configuration": configuration,
+        document = {"schema_version": 1, "predictions": predictions}
+        write_json(output_path, document)
+        record = {"schema_version": 1, "input_manifest_sha256": manifest_hash,
+                  "input_sample_ids": [row["sample_id"] for row in manifest["samples"]],
+                  "predictions_sha256": semantic_manifest_sha256(document), "configuration": configuration,
                   "wall_seconds": round(time.perf_counter() - started, 6), "prediction_count": len(predictions),
                   "samples": results}
         summary = {"predictions_path": str(output_path), "prediction_count": len(predictions)}
@@ -216,10 +225,6 @@ def run_benchmark(args: argparse.Namespace) -> None:
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scifact-cited-abstracts"
         if online_scifact:
-            try:
-                manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
-            except (UnicodeError, json.JSONDecodeError) as exc:
-                raise ValueError(f"{args.input_manifest}: invalid UTF-8 JSON ({exc})") from exc
             with scifact_checkpoint(checkpoints, manifest_hash, configuration, resume=args.resume, **batch_limits) as batch:
                 predictions = run_scifact(manifest, engine, args.model, batch=batch)
                 results.extend(batch.results)
@@ -227,7 +232,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             return
         if args.resume:
             raise ValueError("--resume is available for PDF benchmarks and online SciFact")
-        predictions = run_scifact(read_json(args.input_manifest), engine, args.model)
+        predictions = run_scifact(manifest, engine, args.model)
     elif args.dataset == "scitabalign":
         from .benchmark import benchmark_configuration
         from .scitabalign import run_scitabalign
@@ -236,7 +241,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             raise ValueError("SciTabAlign cell ranking uses the offline engine without --resume")
         configuration = benchmark_configuration("offline", args.model)
         configuration["dataset"] = "scitabalign-cells"
-        predictions = run_scitabalign(read_json(args.input_manifest))
+        predictions = run_scitabalign(manifest)
     elif args.engine:
         from .benchmark import benchmark_configuration, run_pdf_samples
 
@@ -250,8 +255,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
             recovered[sample_id] = {"input_digest": input_digest, "predictions": rows, "result": results[-1]}
             write_json(checkpoints, recovered)
 
+        def save_pause(sample_id: str, input_digest: str, run: dict) -> None:
+            recovered[sample_id] = {"input_digest": input_digest, "pause": run}
+            write_json(checkpoints, recovered)
+
         predictions = run_pdf_samples(service, args.input_manifest, args.engine, args.model,
-                                      recovered=recovered, on_sample=save_sample, on_result=results.append,
+                                      recovered=recovered, on_sample=save_sample, on_pause=save_pause,
+                                      on_result=results.append,
                                       configuration=configuration, **retrieval_options)
     else:
         if args.resume:
@@ -277,6 +287,10 @@ def score_benchmark(args: argparse.Namespace) -> None:
     from .scoring import score_predictions
 
     source_paths = {args.predictions.resolve(), args.gold_manifest.resolve()}
+    if args.run_record:
+        if args.dataset not in (None, "scifact"):
+            raise ValueError("--run-record is available for generic claim and SciFact scoring")
+        source_paths.add(args.run_record.resolve())
     annotations = {}
     for name in ("semantic_matches", "verdict_projections"):
         path = getattr(args, name)
@@ -289,10 +303,15 @@ def score_benchmark(args: argparse.Namespace) -> None:
     if args.output.resolve() in source_paths:
         raise ValueError("score output must differ from scoring input files")
     predictions, gold = read_json(args.predictions), read_json(args.gold_manifest)
+    run_record = None
+    if args.run_record:
+        run_record = read_json(args.run_record)
+        if not isinstance(run_record, dict):
+            raise ValueError("run record must be a JSON object")
     if args.dataset == "scifact":
         from .scifact import score_scifact
 
-        result = score_scifact(predictions, gold)
+        result = score_scifact(predictions, gold, run_record=run_record)
     elif args.dataset == "claimbench":
         from .claimbench import score_claimbench
 
@@ -306,7 +325,7 @@ def score_benchmark(args: argparse.Namespace) -> None:
         for name, content in reviews.items():
             if not isinstance(content, dict):
                 raise ValueError(f"{name.replace('_', ' ')} must be a JSON object")
-        result = score_predictions(predictions, gold, **reviews)
+        result = score_predictions(predictions, gold, run_record=run_record, **reviews)
     write_json(args.output, result)
     emit(result)
 
@@ -461,7 +480,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     run.add_argument("--embed-model", type=Path, help="path to an installed local Sentence Transformers model")
     run.add_argument("--rerank-model", type=Path, help="path to an installed local CrossEncoder")
-    run.add_argument("--resume", action="store_true", help="reuse matching PDF or online SciFact checkpoints")
+    run.add_argument("--resume", action="store_true",
+                     help="reuse completed checkpoints and resume matching paused PDF or online SciFact runs")
     run.add_argument("--max-requests", type=int, help="total online SciFact provider attempts, including resumed runs (default: 8)")
     run.add_argument("--max-seconds", type=int, help="total online SciFact elapsed seconds, including resumed runs (default: 180)")
     run.set_defaults(handler=run_benchmark)
@@ -470,6 +490,8 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--predictions", type=Path, required=True)
     score.add_argument("--gold-manifest", type=Path, required=True)
     score.add_argument("--output", type=Path, required=True)
+    score.add_argument("--run-record", type=Path,
+                       help="predictions-bound run.json for execution and pause diagnostics alongside scores")
     score.add_argument("--semantic-matches", type=Path, help="independent one-to-one proposition equivalence annotations")
     score.add_argument("--verdict-projections", type=Path, help="independent annotations of refuted conjuncts")
     score.add_argument("--dataset", choices=("scifact", "claimbench", "scitabalign"), help="select dataset-specific metrics")

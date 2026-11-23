@@ -6,6 +6,7 @@ import pytest
 from abstract_review.cli import main
 from abstract_review.models import ResponsesModel
 from abstract_review.scifact import run_scifact, scifact_checkpoint
+from abstract_review.scoring import semantic_manifest_sha256
 
 
 def _manifest():
@@ -56,12 +57,29 @@ def test_online_scifact_cli_caps_and_resumes_the_whole_batch(tmp_path, monkeypat
     assert partial["prediction_count"] == len(calls) == 1
     assert partial["batch"]["stop_reason"] == "request_budget_exhausted"
 
+    gold_path, score_path = tmp_path / "gold.json", tmp_path / "score.json"
+    gold_path.write_text(json.dumps({"schema_version": 1, "labels": [
+        {"sample_id": f"scifact:{i}:11", "claim_id": str(i), "verdict": "refuted",
+         "accepted_evidence_groups": [["scifact:11:0"]]} for i in (1, 2)
+    ]}), encoding="utf-8")
+    score = ["bench", "score", "--dataset", "scifact", "--predictions", str(output / "predictions.json"),
+             "--gold-manifest", str(gold_path), "--run-record", str(output / "run.json"),
+             "--output", str(score_path)]
+    assert main(score) == 0
+    diagnostics = json.loads(score_path.read_bytes())["run_diagnostics"]
+    assert diagnostics["outcome_counts"] == {"unexecuted": 1, "unresolved": 1}
+    assert diagnostics["sample_execution_coverage"] == {"numerator": 1, "denominator": 2, "value": 0.5}
+    capsys.readouterr()
+
     assert main([*args, "--max-requests", "1", "--resume"]) == 0
     assert json.loads(capsys.readouterr().out)["batch"]["requests_used"] == len(calls) == 1
     assert main([*args, "--max-requests", "2", "--resume"]) == 0
     finished = json.loads(capsys.readouterr().out)
     record = json.loads((output / "run.json").read_bytes())
-    predictions = json.loads((output / "predictions.json").read_bytes())["predictions"]
+    prediction_file = json.loads((output / "predictions.json").read_bytes())
+    predictions = prediction_file["predictions"]
+    assert record["input_sample_ids"] == ["scifact:1:11", "scifact:2:11"]
+    assert record["predictions_sha256"] == semantic_manifest_sha256(prediction_file)
     assert len(predictions) == len(calls) == finished["batch"]["requests_used"] == 2
     assert predictions[0] == first and record["batch"]["status"] == "completed"
     assert [item["cache_hit"] for item in record["samples"]] == [True, False]
@@ -70,6 +88,20 @@ def test_online_scifact_cli_caps_and_resumes_the_whole_batch(tmp_path, monkeypat
         {"input_tokens": None, "output_tokens": None, "total_tokens": None},
     ]
     assert all("gold" not in json.loads(call) for call in calls)
+
+    # A real sample pause is distinguishable from the next sample, which was never entered.
+    monkeypatch.setattr(adapter, "run_scifact", lambda *args, **kwargs: run_scifact(
+        *args, **kwargs, make_model=_provider([], invalid_reference=True),
+    ))
+    pause_dir = tmp_path / "with-pause"
+    args[args.index("--output-dir") + 1] = str(pause_dir)
+    assert main([*args, "--max-requests", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["batch"]["last_paused_sample"]["sample_id"] == "scifact:1:11"
+    score[score.index("--predictions") + 1] = str(pause_dir / "predictions.json")
+    score[score.index("--run-record") + 1] = str(pause_dir / "run.json")
+    assert main(score) == 0
+    diagnostics = json.loads(score_path.read_bytes())["run_diagnostics"]
+    assert diagnostics["outcome_counts"] == {"paused": 1, "unexecuted": 1}
 
 
 def test_interrupted_scifact_response_reserves_a_request_before_transport(tmp_path):

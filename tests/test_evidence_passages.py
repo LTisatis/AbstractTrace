@@ -190,3 +190,22 @@ def test_packet_priority_keeps_a_complete_result_excerpt_ahead_of_isolated_match
         supplied = ["loose", "before", "middle", "first", "last"]
         ordered = index.prioritize_packet("Lower thermal drift during the overnight detector assay", supplied, limit=3)
         assert ordered == ["first", "middle", "last", "loose", "before"]
+
+
+def test_numeric_excerpt_prioritizes_same_sentence_scope_and_keeps_the_reference_in_the_packet():
+    rows = [_line(f"e{i}", text, 100 + 12 * i) for i, text in enumerate((
+        "Across the six coastal test sites, we compared",
+        "prototype drift with results from earlier detectors (Lee et al., 2014,",
+        "2015; Doe et al., 2016; Lai et al., 2017) and",
+        "retained the original processing conditions.",
+        "Under those conditions, drift was measured for",
+        "the old and redesigned prototype in the same week.",
+        "The strongest prior comparison reported",
+        "a gain of 4.2 percentage points compared with",
+        "a gain of 2.2 percentage points in the second group.",
+    ))]
+    ids = [row["evidence_id"] for row in rows]
+    with closing(EvidenceIndex(rows)) as index:
+        result = index.prioritize_packet("Prototype drift gained 4.2 and 2.2 percentage points", [*ids[1:], ids[0]])
+    assert result[:8] == [*ids[:2], *ids[3:]]
+    assert result[8:] == [ids[2]]

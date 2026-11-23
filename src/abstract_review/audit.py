@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+import unicodedata
 from base64 import b64encode
 from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
@@ -469,6 +470,24 @@ def _contradiction_error(output: ScopedJudgement, sent: list[str]) -> str | None
     return None
 
 
+_OPTIONAL_CALIBRATION_DETAIL = re.compile(r"(?:instrument|equipment|sensor|noise) calibration(?: (?:records|details))?\Z", re.I)
+_CALIBRATION_SCOPE = re.compile(r"\bcalibrat\w*\b|校准|标定", re.I)
+
+
+def _optional_refutation_requirements(claim: dict) -> list[str]:
+    """Declare optional measurement details before the judge proposes a verdict."""
+    if _CALIBRATION_SCOPE.search(claim["proposition"]):
+        return []
+    return [field for field in claim["requirements"] if _OPTIONAL_CALIBRATION_DETAIL.fullmatch(_field_key(field))]
+
+
+def _covers_requirements(coverage: list[dict], required: set[str], evidence_ids: Iterable[str]) -> bool:
+    anchors = set(evidence_ids)
+    linked = {_field_key(field["requirement"]) for field in coverage
+              if field["status"] == "found" and anchors.intersection(field["evidence_ids"])}
+    return required <= linked
+
+
 def _direct_refutation_blocker(claim: dict, output: ScopedJudgement, coverage: list[dict]) -> str | None:
     proof = output.direct_contradiction
     assert proof is not None
@@ -479,18 +498,20 @@ def _direct_refutation_blocker(claim: dict, output: ScopedJudgement, coverage: l
     if any(field["status"] == "unreadable" for field in coverage):
         return "unreadable_source"
     supplementary = {_field_key(field) for field in proof.supplementary_fields if field.strip()}
+    allowed_supplementary = {_field_key(field) for field in _optional_refutation_requirements(claim)}
+    if not supplementary <= allowed_supplementary:
+        return "unapproved_supplementary_requirement"
     required = {_field_key(field["requirement"]) for field in coverage}
     unresolved = {_field_key(field["requirement"]) for field in coverage if field["status"] != "found"}
-    core = {_field_key(field) for field in claim["requirements"]} - supplementary
-    if not unresolved <= supplementary <= required:
+    core = required - supplementary
+    if not unresolved <= supplementary:
         return "unchecked_decisive_requirement"
     scope_ids = set(proof.scope_evidence_ids or proof.evidence_ids)
     if not any(_field_key(field["requirement"]) in core and field["status"] == "found"
                and scope_ids.intersection(field["evidence_ids"]) for field in coverage):
         return "missing_scope_coverage"
     proof_ids = scope_ids | set(proof.evidence_ids)
-    if proof.scope_evidence_ids and any(_field_key(field["requirement"]) in core
-                                       and not proof_ids.intersection(field["evidence_ids"]) for field in coverage):
+    if not _covers_requirements(coverage, core, proof_ids):
         return "missing_scope_coverage"
     if output.follow_up_queries or any(not target.requirement or _field_key(target.requirement) not in supplementary
                                        for target in output.follow_up_targets):
@@ -507,6 +528,41 @@ _ABBREVIATION_CONTINUATIONS = (
     (re.compile(r"\bet[ \t]+al\.$", re.I), re.compile(r"[ \t]+(?:\(?[12]\d{3}[a-zA-Z]?(?=[.,;)\]])|[a-z])")),
     (re.compile(r"\b(?:e\.g|i\.e)\.$", re.I), re.compile(r"[ \t]+(?=\w)")),
     (re.compile(r"\b(?:figs?|eqs?|secs?|refs?|nos?|pp)\.$", re.I), re.compile(r"[ \t]+\(?\d")),
+)
+_DETACHED_FOOTNOTE = re.compile(r"[1-9][0-9]?")
+_FIDELITY_NUMBER = re.compile(
+    r"(?<![a-z0-9_.])(?P<value>[+\-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+))"
+    r"(?:\s*(?P<unit>percentage\s+points?\b|p\.?p\b\.?|个?百分点|percent\b|%|"
+    r"milliseconds?\b|ms\b|seconds?\b|secs?\b|(?:minutes?|hours?|days?|weeks?|years?)\b|毫秒|秒|"
+    r"(?:[km]\s*)?(?:tokens?|samples?|words?)\b|fold\b|×))?(?![a-z0-9_]|\.\d)"
+)
+_FIDELITY_UNITS = {
+    "%": "%", "percent": "%", "pp": "pp", "p.p": "pp", "p.p.": "pp", "百分点": "pp", "个百分点": "pp",
+    "ms": "ms", "millisecond": "ms", "milliseconds": "ms", "毫秒": "ms",
+    "sec": "s", "secs": "s", "second": "s", "seconds": "s", "秒": "s", "fold": "fold", "×": "fold",
+}
+_FIDELITY_MARKERS = {
+    "negation": r"\b(?:not(?!\s+only\b)|no(?!\s+(?:more|less|fewer)\b|\.)|never|neither|nor|cannot|without)\b|n['’]t\b|未能|没有|不能|并非|未(?:提高|降低|提升|增加|下降)",
+    "exclusive": r"\b(?:only|solely|exclusively)\b(?<!not only)|仅(?:有|限|在|对|用于)?",
+    "exception": r"\b(?:unless|except)\b|除非|除了",
+    "conditional": r"\b(?:if|provided that)\b|如果|前提是",
+    "minimum": r"\b(?:at least|no (?:less|fewer) than)\b|至少|不低于",
+    "maximum": r"\b(?:at most|up to|no more than)\b|至多|不超过",
+    "universal": r"\b(?:all|each|every)\b|所有|每(?:项|个|位)",
+    "human": r"\b(?:humans?|patients?)\b|人体|人类|患者",
+    "adult": r"\badults?\b|成人",
+    "child": r"\b(?:children|child|pediatric)\b|儿童",
+    "mouse": r"\b(?:mice|mouse|murine)\b|小鼠",
+    "rat": r"\brats?\b|大鼠",
+    "test_split": r"\btest\s+(?:split|set|cohort)\b|测试集",
+    "validation_split": r"\b(?:validation|development)\s+(?:split|set|cohort)\b|验证集|开发集",
+    "training_split": r"\btraining\s+(?:split|set|cohort)\b|训练集",
+}
+_FIDELITY_MARKER_PATTERNS = {name: re.compile(pattern) for name, pattern in _FIDELITY_MARKERS.items()}
+_FIDELITY_WORD_UNITS = re.compile(r"(?:(?:[km]\s*)?(?:token|sample|word)|minute|hour|day|week|year)s?")
+_FIDELITY_DIRECTIONS = (
+    re.compile(r"\b(?:increas\w*|ris(?:e|es|ing)|rose|gain\w*|higher)\b|增加|上升|提高"),
+    re.compile(r"\b(?:decreas\w*|reduc\w*|declin\w*|fell|lower|drop\w*)\b|减少|下降|降低"),
 )
 
 
@@ -582,8 +638,72 @@ def _claim_sentence(part: dict) -> dict:
     return part
 
 
+def _claim_sentences(text: str) -> list[dict]:
+    parts = sentences(text)
+    if len(parts) > 1:
+        previous, last = parts[-2:]
+        gap = text[previous["end"]:last["start"]]
+        if (_DETACHED_FOOTNOTE.fullmatch(last["text"]) and re.search(r"[^\W\d_]{2}[.!?。！？]$", previous["text"])
+                and gap and not gap.strip()):
+            parts.pop()
+    return [_claim_sentence(part) for part in parts]
+
+
+def _fidelity_text(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).casefold().replace("−", "-")
+
+
+def _fidelity_quantities(text: str) -> set[tuple[Decimal, str]]:
+    quantities = set()
+    for match in _FIDELITY_NUMBER.finditer(text):
+        unit = " ".join((match["unit"] or "").split())
+        if unit.startswith("percentage point"):
+            unit = "pp"
+        if unit == "pp.":
+            unit = "pp"
+        if _FIDELITY_WORD_UNITS.fullmatch(unit):
+            unit = unit.removesuffix("s").replace(" ", "")
+        quantities.add((Decimal(match["value"].replace(",", "")), _FIDELITY_UNITS.get(unit, unit)))
+    return quantities
+
+
+def _fidelity_markers(text: str) -> set[str]:
+    return {name for name, pattern in _FIDELITY_MARKER_PATTERNS.items() if pattern.search(text)}
+
+
+def _claim_fidelity_blockers(part: dict, atom: dict, *, only_claim: bool) -> list[str]:
+    source, quote, proposed = map(_fidelity_text, (part["text"], atom["quote"], atom["proposition"]))
+    protected = source if only_claim else quote
+    source_quantities = _fidelity_quantities(source)
+    proposed_quantities = _fidelity_quantities(proposed)
+    blockers = []
+    if not _fidelity_quantities(protected) <= proposed_quantities <= source_quantities:
+        blockers.append("quantity_changed")
+    if not _fidelity_markers(protected) <= _fidelity_markers(proposed) <= _fidelity_markers(source):
+        blockers.append("qualification_changed")
+    directions = [tuple(bool(pattern.search(text)) for pattern in _FIDELITY_DIRECTIONS) for text in (protected, proposed)]
+    if all(sum(direction) == 1 for direction in directions) and directions[0] != directions[1]:
+        blockers.append("direction_changed")
+    return blockers
+
+
+def _restore_source_queries(atom: dict, part: dict) -> None:
+    available = _fidelity_quantities(_fidelity_text(part["text"]))
+    claim_units = {unit for _, unit in _fidelity_quantities(_fidelity_text(atom["proposition"]))}
+    # Values in a named table or page are retrieval hypotheses. Unscoped queries should retain the source quantity.
+    queries = (atom["support_query"], atom["counter_query"])
+    queried = set().union(*(_fidelity_quantities(_fidelity_text(query)) for query in queries
+                            if not (_TABLE_QUERY.search(query) or _PAGE_QUERY.search(query))))
+    if any(unit in claim_units for _, unit in queried - available):
+        atom["support_query"] = atom["proposition"]
+        atom["counter_query"] = "limitation exception subgroup " + atom["proposition"]
+        atom["extraction_guard"] = {"status": "query_rebuilt", "blocker_codes": ["ungrounded_query_quantity"]}
+
+
 def extract_claims(text: str, model=None) -> list[dict]:
-    parts = [_claim_sentence(part) for part in sentences(text)]
+    parts = _claim_sentences(text)
+    if not parts:
+        return []
     if model is None:
         results = []
         for part in parts:
@@ -637,22 +757,41 @@ def extract_claims(text: str, model=None) -> list[dict]:
         sentence_id = atom["sentence_id"]
         counts[sentence_id] = counts.get(sentence_id, 0) + 1
 
+    fidelity_failures = {}
+    for atom in anchored:
+        sentence_id = atom["sentence_id"]
+        if atom["kind"] not in {"background", "purpose"}:
+            blockers = _claim_fidelity_blockers(by_sentence[sentence_id], atom, only_claim=counts[sentence_id] == 1)
+            if blockers:
+                fidelity_failures.setdefault(sentence_id, {}).update(dict.fromkeys(blockers))
+
     result = {}
     for atom in anchored:
         sentence_id = atom["sentence_id"]
         part = by_sentence[sentence_id]
         whole = sentence_id in whole_sentences
+        blockers = fidelity_failures.get(sentence_id)
         unsplit = (counts[sentence_id] == 1 and atom["kind"] not in {"background", "purpose"}
                    and atom["quote"].rstrip(".?!") == part["text"].rstrip(".?!"))
-        if whole or unsplit:
+        if whole or unsplit or blockers:
             split = shared_procedure_parts(part["text"]) or reported_compound_parts(part["text"])
+            if blockers and not whole and not split:
+                split = offline_compound_parts(part["text"])
             recovered = _compound_claims(part, split) if split else []
             if recovered:
+                if blockers:
+                    for member in recovered:
+                        member["extraction_guard"] = {"status": "source_fallback", "blocker_codes": list(blockers)}
                 result.update((member["claim_id"], member) for member in recovered)
                 continue
-        if whole:
+        if whole or blockers:
             atom = _plain_claim(part)
-            atom["logic_review_required"] = True
+            if whole:
+                atom["logic_review_required"] = True
+            if blockers:
+                atom["extraction_guard"] = {"status": "source_fallback", "blocker_codes": list(blockers)}
+        else:
+            _restore_source_queries(atom, part)
         result[atom["claim_id"]] = atom
     missing = whole_sentences - {atom["sentence_id"] for atom in anchored}
     for part in parts:
@@ -779,14 +918,13 @@ def _pending(claim: dict, reason: str, *, status: str = "pending") -> dict:
             "evidence_ids": [], "evidence_groups": [], "missing_fields": claim["requirements"]}
 
 
-def _offline(claim: dict, candidates: list[dict], comparison) -> dict:
+def _offline(claim: dict, candidates: list[dict], calculation: dict | None) -> dict:
     if claim.get("logic_review_required"):
         return _pending(claim, "This logical relationship needs a scope-aware review.")
     if claim["kind"] in {"background", "purpose"}:
         return _pending(claim, "This sentence is outside original-paper result verification.")
-    if comparison is not None:
-        calculation, expected = comparison
-        matches = Decimal(calculation["result"]) == expected
+    if calculation is not None:
+        matches = calculation["verification"] == "matched"
         ids = calculation["evidence_ids"]
         return {**claim, "review_status": "completed", "verdict": "supported" if matches else "refuted",
                 "reason": "The scoped table operands were independently recomputed.", "evidence_ids": ids,
@@ -1042,10 +1180,6 @@ def review_claim(
             for eid, related_ids in sorted(context["by_seed"].items())
         ]
         scoped = {item["evidence_id"]: item for item in [*candidates, *context["evidence"]]}
-        comparison = None if claim.get("logic_review_required") else comparison_for_claim(
-            claim["proposition"], with_method_scope(scoped.values(), paths)
-        )
-        calculation = comparison[0] if comparison else None
         body_context = index.pack_body_context(context_windows(), scoped)
         body_ids = [eid for group in body_context for eid in group["new_evidence_ids"]]
         body_rows = {row["evidence_id"]: row for row in index.get(body_ids)}
@@ -1056,12 +1190,16 @@ def review_claim(
             table_region = index.referenced_table_region(claim["support_query"], [*source_ids, *body_ids], scoped)
             if table_region:
                 scoped.update((row["evidence_id"], row) for row in table_region["evidence"])
+        comparison = None if claim.get("logic_review_required") else comparison_for_claim(
+            claim["proposition"], with_method_scope(scoped.values(), paths)
+        )
+        calculation = comparison[0] if comparison else None
         packet_order = list(scoped)
         if documents and claim["kind"] not in {"background", "purpose"} and not _ABSENCE_CONDITION.search(proposition):
             packet_order = index.prioritize_packet(claim["support_query"], scoped)
         priority = packet_order[:8] if packet_order[:8] != list(scoped)[:8] else []
         if model is None:
-            finding = _offline(claim, [*candidates, *body_rows.values()], comparison)
+            finding = _offline(claim, [*candidates, *body_rows.values()], calculation)
             sent_candidate_ids = packet_order
             sent_priority = priority
             sent_body_context = body_context
@@ -1085,9 +1223,7 @@ def review_claim(
                         "domain, return refuted and a direct_contradiction. Put the opposite result or witness in evidence_ids and any "
                         "separate same-study, same-conditions anchors in scope_evidence_ids. Put both sets in one refute "
                         "group. Use subject_and_conditions=same only when the anchors establish that match, and say how "
-                        "in scope_reason. Give the exact names of optional unchecked fields in supplementary_fields. "
-                        "An unreported instrument or operational detail can be optional for a directly stated qualitative "
-                        "contradiction. An explicit population, model, intervention, comparator, or claim condition is essential. "
+                        "in scope_reason. For supplementary_fields, use only fields listed in optional_refutation_requirements. "
                         "If scope or another decisive condition is unresolved, request up to two follow_up_targets. "
                         "Use an empty follow_up_queries list when supplying structured targets. "
                         "Name the exact missing field and target the outcome, comparator, setup, or failure mechanism "
@@ -1184,6 +1320,11 @@ def review_claim(
                 material["coverage_instructions"] += (
                     " Supply empirical_support.comparison with matched outcomes under both conditions."
                 )
+        material["optional_refutation_requirements"] = _optional_refutation_requirements(claim)
+        material["coverage_instructions"] += (
+            " Treat every required field as decisive. Cite sources for each decisive field in the same evidence group as "
+            "the result. In a refutation, only optional_refutation_requirements may be reported as unchecked supplementary_fields."
+        )
         material.update(figure_material(candidates, documents, data_dir))
         try:
             try:
@@ -1274,8 +1415,17 @@ def review_claim(
             decision_blockers.append("opposite_proof_unresolved")
         if verdict == "supported" and empirical_blocker:
             decision_blockers.append(empirical_blocker)
+        if verdict == "supported" and has_evidence and decisive_fields_checked and not any(
+            _covers_requirements(coverage, {_field_key(field) for field in requirements}, group.evidence_ids)
+            for group in output.evidence_groups if group.role == "support"
+        ):
+            decision_blockers.append("unlinked_support_requirements")
         if invalid_contradiction:
             decision_blockers.append(proof_blocker)
+        calculation_disagrees = (calculation is not None and role is not None
+                                 and (verdict == "supported") != (calculation["verification"] == "matched"))
+        if calculation_disagrees:
+            decision_blockers.append("calculation_disagrees")
         if role and not has_evidence:
             decision_blockers.append("missing_directional_evidence")
         if role and not (decisive_fields_checked or direct_proof):
@@ -1289,8 +1439,14 @@ def review_claim(
         status = verdict if verdict in {"pending", "manual_conflict"} else "completed"
         if opposing and role:
             reason = "The assessment supplied both supporting and contradicting evidence. Their scopes need review."
+        elif calculation_disagrees:
+            reason = (f"The proposed verdict disagrees with the scoped calculation. The claim states "
+                      f"{calculation['stated']} {calculation['unit']} and the result at that precision is "
+                      f"{calculation['rounded_result']} {calculation['unit']}.")
         elif invalid_contradiction:
             reason = f"The proposed refutation did not pass the evidence checks. Proposed assessment: {output.reason}"
+        elif "unlinked_support_requirements" in decision_blockers:
+            reason = f"The stated conditions are not linked to the supporting result. Proposed assessment: {output.reason}"
         elif empirical_blocker == "unconfirmed_matched_comparison" and output.verdict == "supported":
             reason = f"The comparison between tested conditions needs further verification. Proposed assessment: {output.reason}"
         elif empirical_blocker and output.verdict == "supported":

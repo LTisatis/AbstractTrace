@@ -351,9 +351,9 @@ def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=Re
     return predictions
 
 
-def score_scifact(predictions: dict, gold: dict) -> dict:
+def score_scifact(predictions: dict, gold: dict, *, run_record: object = None) -> dict:
     """Score labeled cited-abstract pairs using SciFact's abstract and sentence rules."""
-    scored = score_predictions(predictions, gold)
+    scored = score_predictions(predictions, gold, run_record=run_record)
     source_rows = {(row["sample_id"], row["claim_id"]): row for row in predictions["predictions"]}
     labels = {(row["sample_id"], row["claim_id"]): row for row in gold["labels"]}
     relevant_abstracts = retrieved_abstracts = relevant_sentences = retrieved_sentences = 0

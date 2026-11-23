@@ -5,11 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from abstract_review.scoring import score_predictions
+from abstract_review.scoring import score_predictions, semantic_manifest_sha256
 
 from abstract_review.benchmark import benchmark_configuration, run_pdf_samples, summarize_classification
 from abstract_review.benchmark_costs import score_costs
 from abstract_review.cli import main
+from abstract_review.models import ModelUnavailable
 from abstract_review.review import ReviewService
 
 
@@ -124,7 +125,7 @@ def test_inference_rejects_gold_fields_before_starting_any_case(tmp_path, invali
 
 def test_one_paper_family_cannot_cross_development_and_final_splits(tmp_path):
     for name in ("v1.pdf", "v2.pdf"):
-        (tmp_path / name).touch()
+        (tmp_path / name).write_bytes(name.encode())
     source = manifest(tmp_path / "inputs.json", [
         {"sample_id": "old", "pdf": "v1.pdf", "paper_family_id": "family", "split": "dev"},
         {"sample_id": "new", "pdf": "v2.pdf", "paper_family_id": "family", "split": "test"},
@@ -132,6 +133,39 @@ def test_one_paper_family_cannot_cross_development_and_final_splits(tmp_path):
     service = ServiceStub({})
     with pytest.raises(ValueError, match="appears in both"):
         run_pdf_samples(service, source, "offline", "unused")
+    assert service.requests == []
+
+
+@pytest.mark.parametrize("second_split", ["dev", "test"])
+def test_copied_pdf_bytes_cannot_cross_splits_under_different_families(tmp_path, second_split):
+    for name in ("source.pdf", "copy.pdf"):
+        (tmp_path / name).write_bytes(b"identical PDF bytes")
+    source = manifest(tmp_path / "inputs.json", [
+        {"sample_id": "a", "pdf": "source.pdf", "paper_family_id": "family-one", "split": "dev"},
+        {"sample_id": "b", "pdf": "copy.pdf", "paper_family_id": "family-two", "split": second_split},
+    ])
+    service = ServiceStub({})
+
+    if second_split == "test":
+        with pytest.raises(ValueError, match="pdf SHA-256.*appears in both"):
+            run_pdf_samples(service, source, "offline", "unused")
+        assert service.requests == []
+    else:
+        run_pdf_samples(service, source, "offline", "unused")
+        assert len(service.requests) == 2
+
+
+def test_declared_pdf_checksum_is_validated_before_reviewing_an_earlier_sample(tmp_path):
+    for name in ("valid.pdf", "later.pdf"):
+        (tmp_path / name).write_bytes(name.encode())
+    source = manifest(tmp_path / "inputs.json", [
+        {"sample_id": "valid", "pdf": "valid.pdf"},
+        {"sample_id": "invalid", "pdf": "later.pdf", "pdf_sha256": "0" * 64},
+    ])
+    service = ServiceStub({})
+
+    with pytest.raises(ValueError, match="invalid.*manifest SHA-256"):
+        run_pdf_samples(service, source, "openai", "unused")
     assert service.requests == []
 
 
@@ -149,6 +183,43 @@ def test_classification_uses_completed_cases_and_all_unsupported_gold():
     assert summary["unsupported_as_support"] == {"numerator": 1, "denominator": 3, "value": 1 / 3}
     assert summary["confusion_matrix"]["refuted"] == {"supported": 1, "refuted": 0, "insufficient": 0}
     assert summary["macro_f1"] == pytest.approx(2 / 9)
+
+
+def test_run_record_diagnoses_execution_without_changing_strict_metrics():
+    predictions = {"schema_version": 1, "predictions": [
+        {"sample_id": "processed", **finding("correct")},
+        {"sample_id": "processed", **finding("wrong")},
+        {"sample_id": "processed", **finding("pending", "pending", None)},
+        {"sample_id": "paused", **finding("pending", "pending", None)},
+    ]}
+    gold = {"schema_version": 1, "labels": [
+        {"sample_id": sample_id, "claim_id": claim_id, "verdict": label, "accepted_evidence_groups": []}
+        for sample_id, claim_id, label in [
+            ("processed", "correct", "supported"), ("processed", "wrong", "refuted"),
+            ("processed", "pending", "refuted"), ("processed", "missing", "refuted"),
+            ("paused", "pending", "refuted"), ("untouched", "missing", "refuted"),
+            ("outside", "missing", "refuted"),
+        ]
+    ]}
+    record = {"schema_version": 1, "predictions_sha256": semantic_manifest_sha256(predictions),
+              "input_manifest_sha256": "1" * 64, "input_sample_ids": ["processed", "paused", "untouched"],
+              "prediction_count": 4, "samples": [
+                  {"sample_id": "processed", "run_status": "report_ready", "prediction_count": 3},
+                  {"sample_id": "paused", "run_status": "paused", "prediction_count": 1},
+              ]}
+
+    scored = score_predictions(predictions, gold, run_record=record)
+    diagnostics = scored.pop("run_diagnostics")
+    assert scored == score_predictions(predictions, gold)
+    assert diagnostics["outcome_counts"] == {
+        "completed_correct": 1, "completed_incorrect": 1, "unresolved": 1,
+        "missing_after_execution": 1, "paused": 1, "unexecuted": 1, "outside_input": 1,
+    }
+    assert diagnostics["sample_execution_coverage"] == {"numerator": 2, "denominator": 4, "value": 0.5}
+
+    predictions["predictions"][0]["verdict"] = "refuted"
+    with pytest.raises(ValueError, match="predictions SHA-256 does not match"):
+        score_predictions(predictions, gold, run_record=record)
 
 
 def test_recovery_reuses_only_the_exact_sample_inputs(tmp_path):
@@ -283,6 +354,49 @@ def test_pdf_bench_resume_preserves_the_exact_version_for_independent_scoring(tm
     assert main(["bench", "score-reviews", "--run-record", str(output / "run.json"),
                  "--gold-manifest", str(annotations), "--pricing", str(pricing), "--output", str(scores)]) == 0
     assert json.loads(scores.read_bytes())["estimated_cost"]["known_cost_usd"] == "0"
+
+
+def test_pdf_bench_resume_keeps_paused_run_and_its_existing_budget(tmp_path, monkeypatch, capsys):
+    pdf = tmp_path / "paper.pdf"
+    subprocess.run([sys.executable, str(GENERATOR), str(pdf)], check=True, capture_output=True, timeout=30)
+    abstract = tmp_path / "abstract.txt"
+    abstract.write_text("On dataset A, accuracy increased by 10 percentage points.", encoding="utf-8")
+    inputs = manifest(tmp_path / "inputs.json", [
+        {"sample_id": "sample", "pdf": pdf.name, "abstract_file": abstract.name, "claims": [
+            {"claim_id": "a", "text": "Dataset A uses a fixed test split for the primary evaluation."},
+        ]},
+    ])
+    output = tmp_path / "benchmark"
+    args = ["--data-dir", str(tmp_path / "runs"), "bench", "run", "--engine", "openai",
+            "--input-manifest", str(inputs), "--output-dir", str(output)]
+    attempted = []
+
+    def responses(self, report, **kwargs):
+        configuration = report["configuration"]
+        attempted.append((report["run_id"], configuration["max_requests"], configuration["max_seconds"]))
+        if len(attempted) == 1:
+            raise ModelUnavailable("test pause")
+        return None
+
+    monkeypatch.setattr(ReviewService, "_responses", responses)
+    assert main([*args, "--model", "pinned"]) == 0
+    first, = json.loads((output / "run.json").read_bytes())["samples"]
+    checkpoints = output / "sample-checkpoints.json"
+    paused = json.loads(checkpoints.read_bytes())["sample"]
+    assert paused["pause"] == {key: first[key] for key in ("run_id", "run_status", "report_version_id")}
+    assert first["run_status"] == "paused"
+
+    assert main([*args, "--model", "different", "--resume"]) == 1
+    assert "inputs or configuration changed" in capsys.readouterr().err
+    assert len(attempted) == 1 and json.loads(checkpoints.read_bytes())["sample"] == paused
+
+    assert main([*args, "--model", "pinned", "--resume"]) == 0
+    completed, = json.loads((output / "run.json").read_bytes())["samples"]
+    assert completed["run_status"] == "report_ready" and completed["run_id"] == first["run_id"]
+    assert attempted == [(first["run_id"], 80, 900)] * 2
+    checkpoint = json.loads(checkpoints.read_bytes())["sample"]
+    assert checkpoint["input_digest"] == paused["input_digest"] and "pause" not in checkpoint
+    assert checkpoint["result"] == completed
 
 
 def test_cost_only_prices_recorded_tokens_and_keeps_unknown_requests_visible():

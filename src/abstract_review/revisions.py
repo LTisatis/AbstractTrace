@@ -57,11 +57,9 @@ class AbstractCheck(Schema):
     issues: list[AbstractIssue]
 
 
-_POINTS = re.compile(r"(?P<value>[+−-]?\d+(?:\.\d+)?)\s*(?:percentage points?\b|个?百分点|pp\b)", re.I)
-_RELATIVE = re.compile(
-    r"(?:relative(?:ly)?\s+(?:increase\s+of\s+)?|相对(?:提高|增加)?)\s*(?P<value>\d+(?:\.\d+)?)\s*%",
-    re.I,
-)
+_AMOUNT = r"(?<![a-z0-9.])(?P<value>[+−-]?(?:\d+(?:\.\d+)?|\.\d+))"
+_POINTS = re.compile(rf"{_AMOUNT}\s*(?:percentage points?\b|个?百分点|pp\b)", re.I)
+_PERCENT = re.compile(rf"{_AMOUNT}\s*%", re.I)
 _VISUAL_REFERENCE = re.compile(r"\b(?:fig(?:ure)?\.?|table|experiment|exp\.)\s+[a-z]?\d+(?:\.\d+)*|(?:图|表|实验)\s*[a-z]?\d+", re.I)
 _FIGURE_NUMBER = re.compile(r"(?<![A-Za-z0-9])(?:\d+(?:\.\d+)?|\.\d+)(?![A-Za-z0-9])")
 
@@ -136,10 +134,10 @@ def _numeric_draft(source: str, evidence: list[dict]) -> RevisionDraft | None:
     if comparison is None:
         return None
     calculation, stated = comparison
-    expected = Decimal(calculation["result"])
-    if expected == stated or expected == 0 or (expected < 0) != (stated < 0):
+    expected = Decimal(calculation["rounded_result"])
+    if calculation["verification"] == "matched" or expected == 0 or (expected < 0) != (stated < 0):
         return None
-    pattern = _POINTS if calculation["operation"] == "percentage_points" else _RELATIVE
+    pattern = _POINTS if calculation["operation"] == "percentage_points" else _PERCENT
     matches = list(pattern.finditer(source))
     if len(matches) != 1:
         return None
@@ -165,7 +163,8 @@ def _verify_numbers(check: SentenceCheck, source: str, replacement: str, evidenc
     mismatch = next((item for item in calculations if item["verification"] == "mismatch"), None)
     if mismatch:
         result.update(status="returned", reason=mismatch.get("reason") or (
-            f"Recalculation gave {mismatch['result']} {mismatch['unit']}, but the revision states {mismatch['stated']}."
+            f"Recalculation at the stated precision gave {mismatch['rounded_result']} {mismatch['unit']}. "
+            f"The revision states {mismatch['stated']}."
         ))
     elif check.status == "passed" and (unresolved := next((item for item in calculations if item["verification"] == "unresolved"), None)):
         result.update(status="manual_review", reason=unresolved["reason"])
