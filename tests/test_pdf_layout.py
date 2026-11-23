@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pymupdf
@@ -55,6 +56,8 @@ def test_continued_table_needs_an_explicit_marker_and_the_same_headers(tmp_path)
     results = [entry for entry in parsed.evidence if entry["kind"] == "table_cell"
                and entry["locator"]["row_index"] == 1 and entry["locator"]["column_index"] == 2]
     first, matching, different_header, no_confirmed_predecessor, separate = results
+    anchor = f"pymupdf-{pymupdf.__version__}-v2/{parsed.document['doc_id']}/table_cell/0/0/1/2"
+    assert first["evidence_id"] == "ev-" + hashlib.sha256(anchor.encode("utf-8")).hexdigest()
     assert first["table_label"] == matching["table_label"] == "2"
     assert first["locator"]["table_group_id"] == matching["locator"]["table_group_id"]
     assert matching["locator"]["continued_from"] == {
@@ -249,6 +252,55 @@ def test_detects_left_column_before_right_column_and_keeps_their_coordinates(tmp
     with pymupdf.open(path) as original:
         for item in parsed.evidence:
             assert original[0].get_textbox(pymupdf.Rect(item["locator"]["bbox"])) == item["text"]
+
+
+@pytest.mark.parametrize(("body_x", "sidebar_x"), [(200, 36), (36, 455)])
+def test_abstract_keeps_the_main_column_and_excludes_first_page_sidebar(tmp_path, body_x, sidebar_x):
+    main = (
+        "However, this original paragraph records the scientific result and all source conditions.\n"
+        "This controlled benchmark tests independent extraction. How-\n"
+        "ever, this is a zero-\nshot evaluation."
+    )
+    with pymupdf.open() as paper:
+        page = paper.new_page(width=612, height=792)
+        page.insert_text((body_x, 65), "Abstract", fontsize=14)
+        page.insert_text((body_x, 96), main, fontsize=10)
+        page.insert_text((sidebar_x, 107), "OPEN ACCESS", fontsize=8)
+        page.insert_text((sidebar_x, 125), "Background", fontsize=8)
+        page.insert_text((sidebar_x, 141), "Citation: sidebar record", fontsize=8)
+        page.insert_text((body_x, 170), "Introduction", fontsize=14)
+        page.insert_text((body_x, 192), "This sentence belongs to the paper body.", fontsize=10)
+        path = save(paper, tmp_path / "sidebar.pdf")
+
+    parsed = parse_pdf(path)
+    assert parsed.abstract == (
+        "However, this original paragraph records the scientific result and all source conditions. "
+        "This controlled benchmark tests independent extraction. However, this is a zero-shot evaluation."
+    )
+    body, = [entry for entry in parsed.evidence if entry["text"] == "This sentence belongs to the paper body."]
+    assert body["locator"]["section"] == "Introduction"
+
+
+def test_abstract_can_continue_into_a_second_regular_column(tmp_path):
+    with pymupdf.open() as paper:
+        page = paper.new_page(width=612, height=792)
+        for position, text in (
+            ((36, 65), "Abstract"),
+            ((36, 96), "Left abstract first."),
+            ((36, 118), "Left abstract second."),
+            ((332, 96), "Right abstract continuation."),
+            ((332, 118), "Right abstract conclusion."),
+            ((332, 150), "Introduction"),
+            ((332, 171), "This sentence belongs to the paper body."),
+        ):
+            page.insert_text(position, text, fontsize=10)
+        path = save(paper, tmp_path / "abstract-columns.pdf")
+
+    parsed = parse_pdf(path)
+    assert parsed.abstract == (
+        "Left abstract first. Left abstract second. Right abstract continuation. Right abstract conclusion."
+    )
+    assert [entry["text"] for entry in parsed.evidence] == ["This sentence belongs to the paper body."]
 
 
 def test_optional_ocr_records_success_and_does_not_touch_native_pages(tmp_path, monkeypatch):
