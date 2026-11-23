@@ -74,3 +74,42 @@ def test_upper_bound_probe_requires_contiguous_number_and_supported_count_unit()
                                       [{"doc_id": "paper", "role": "main"}]) == (None, None)
     assert _probe("The intervention continues up to 64 hours.") is None
     assert _probe("The dataset contains at least 64k tokens.") is None
+
+
+def test_failure_role_routes_to_the_main_papers_printed_error_analysis():
+    claim = "The experimental results demonstrate failures under demanding conditions."
+    observed = ["The longest tests contained several errors.", "The failure categories were missing or repeated output.",
+                "The evaluation counted both failures."]
+    rows = [*_lines(0, ["The abstract summarizes failures.", "Other failures are reported elsewhere.", "A summary follows."]),
+            *_lines(2, observed), *_lines(2, observed, doc="supplement")]
+    document = {"doc_id": "paper", "role": "main", "pages": [
+        {"page_index": 0, "source_headings": ["1 Introduction"]},
+        {"page_index": 2, "source_headings": ["4.3 Error Breakdown"]},
+    ]}
+    with closing(EvidenceIndex(rows)) as index:
+        window, scope = focused_source_context(index, claim, [document, {"doc_id": "supplement", "role": "supplement"}])
+        ablation = "The ablation experiment identifies several errors under demanding conditions."
+        assert focused_source_context(index, ablation, [document]) == (None, None)
+
+    assert window.evidence_ids == ("paper-2-0", "paper-2-1", "paper-2-2")
+    assert scope["focused_source_heading"] == "4.3 Error Breakdown"
+    assert scope["routing_role"] == "error_analysis"
+    assert scope["mode"] == "ranked" and "complete" not in scope
+
+
+def test_unambiguous_printed_results_route_requires_a_relevant_claim_and_passage():
+    rows = _lines(2, ["Experimental Results report a small improvement.", "The technique alone improves the score modestly.",
+                      "Across tasks the gains are similar."])
+    document = {"doc_id": "paper", "role": "main", "pages": [
+        {"page_index": 2, "source_headings": ["4 Experimental Results"]},
+    ]}
+    with closing(EvidenceIndex(rows)) as index:
+        standalone = "We find that applying the technique naïvely produces only marginal improvements."
+        generalization = "The performance gains generalize to a wide range of tasks."
+        for claim, role in ((standalone, "standalone_results"), (generalization, "comparative_results")):
+            window, scope = focused_source_context(index, claim, [document])
+            assert window.evidence_ids == ("paper-2-0", "paper-2-1", "paper-2-2")
+            assert scope["routing_role"] == role
+        assert focused_source_context(index, "The software reports output in blocks.", [document]) == (None, None)
+        document["pages"].append({"page_index": 3, "source_headings": ["5 Main Results"]})
+        assert focused_source_context(index, standalone, [document]) == (None, None)

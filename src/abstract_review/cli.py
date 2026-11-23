@@ -180,24 +180,53 @@ def run_benchmark(args: argparse.Namespace) -> None:
     results = []
     output_path = args.output_dir / "predictions.json"
     record_path = args.output_dir / "run.json"
-    checkpoints = args.output_dir / "sample-checkpoints.json"
+    online_scifact = args.dataset == "scifact" and args.engine == "openai"
+    checkpoints = args.output_dir / ("sample-checkpoints.sqlite3" if online_scifact else "sample-checkpoints.json")
     files = {output_path.resolve(), record_path.resolve(), checkpoints.resolve(), args.input_manifest.resolve()}
     if len(files) != 4:
         raise ValueError("benchmark outputs and input manifest must use distinct files")
-    manifest_hash = hashlib.sha256(args.input_manifest.read_bytes()).hexdigest()
+    manifest_bytes = args.input_manifest.read_bytes()
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
     retrieval_options = {"embed_model": args.embed_model, "rerank_model": args.rerank_model}
     if any(retrieval_options.values()) and (args.dataset or not args.engine):
         raise ValueError("local retrieval models require a PDF benchmark engine without --dataset")
+    batch_limits = {key: value for key, value in (("max_requests", args.max_requests), ("max_seconds", args.max_seconds))
+                    if value is not None}
+    if batch_limits and not online_scifact:
+        raise ValueError("benchmark-wide limits are available for online SciFact")
+
+    def finish(predictions: list[dict], configuration: dict, batch: dict | None = None) -> None:
+        if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
+            raise ValueError("benchmark input manifest changed during review")
+        write_json(output_path, {"schema_version": 1, "predictions": predictions})
+        record = {"schema_version": 1, "input_manifest_sha256": manifest_hash, "configuration": configuration,
+                  "wall_seconds": round(time.perf_counter() - started, 6), "prediction_count": len(predictions),
+                  "samples": results}
+        summary = {"predictions_path": str(output_path), "prediction_count": len(predictions)}
+        if batch is not None:
+            record["batch"] = summary["batch"] = batch
+        write_json(record_path, record)
+        emit(summary)
 
     if args.dataset == "scifact":
         from .benchmark import benchmark_configuration
-        from .scifact import run_scifact
+        from .scifact import run_scifact, scifact_checkpoint
 
-        if args.resume:
-            raise ValueError("--resume is available for local PDF benchmarks")
         engine = args.engine or "offline"
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scifact-cited-abstracts"
+        if online_scifact:
+            try:
+                manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"{args.input_manifest}: invalid UTF-8 JSON ({exc})") from exc
+            with scifact_checkpoint(checkpoints, manifest_hash, configuration, resume=args.resume, **batch_limits) as batch:
+                predictions = run_scifact(manifest, engine, args.model, batch=batch)
+                results.extend(batch.results)
+                finish(predictions, configuration, batch.summary(len(manifest["samples"])))
+            return
+        if args.resume:
+            raise ValueError("--resume is available for PDF benchmarks and online SciFact")
         predictions = run_scifact(read_json(args.input_manifest), engine, args.model)
     elif args.dataset == "scitabalign":
         from .benchmark import benchmark_configuration
@@ -241,15 +270,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
                     "verdict": finding["verdict"],
                     "evidence_ids": finding["evidence_ids"],
                 })
-    if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
-        raise ValueError("benchmark input manifest changed during review")
-    write_json(output_path, {"schema_version": 1, "predictions": predictions})
-    write_json(record_path, {
-        "schema_version": 1, "input_manifest_sha256": manifest_hash, "configuration": configuration,
-        "wall_seconds": round(time.perf_counter() - started, 6), "prediction_count": len(predictions),
-        "samples": results,
-    })
-    emit({"predictions_path": str(output_path), "prediction_count": len(predictions)})
+    finish(predictions, configuration)
 
 
 def score_benchmark(args: argparse.Namespace) -> None:
@@ -440,7 +461,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     run.add_argument("--embed-model", type=Path, help="path to an installed local Sentence Transformers model")
     run.add_argument("--rerank-model", type=Path, help="path to an installed local CrossEncoder")
-    run.add_argument("--resume", action="store_true", help="reuse matching persisted PDF sample checkpoints")
+    run.add_argument("--resume", action="store_true", help="reuse matching PDF or online SciFact checkpoints")
+    run.add_argument("--max-requests", type=int, help="total online SciFact provider attempts, including resumed runs (default: 8)")
+    run.add_argument("--max-seconds", type=int, help="total online SciFact elapsed seconds, including resumed runs (default: 180)")
     run.set_defaults(handler=run_benchmark)
 
     score = bench_commands.add_parser("score", help="score predictions independently of review")

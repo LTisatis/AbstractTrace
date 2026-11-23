@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import unicodedata
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 _VERDICTS = ("supported", "refuted", "insufficient")
 _REVIEW_STATUSES = ("completed", "pending", "manual_conflict")
 _DEFAULT_RANK_CUTOFFS = (1, 3, 5, 8)
+_JUDGE_ATTEMPT_STATUSES = {"checked", "model_reference_error", "citation_error", "model_paused", "model_unavailable"}
 type _CaseKey = tuple[str, str]
 type _Ratio = dict[str, int | float | None]
 
@@ -28,6 +30,7 @@ class _Prediction:
     candidate_ids: tuple[str, ...] | None
     anchor: _Anchor | None
     stop_reason: str | None
+    decision_trace: dict | None
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,8 @@ def _score_aligned(
             row["split"] = label.split
         if prediction is not None and prediction.stop_reason is not None:
             row["stop_reason"] = prediction.stop_reason
+        if prediction is not None and prediction.decision_trace is not None:
+            row["decision_trace"] = prediction.decision_trace
         cases.append(row)
         phase = _failure_phase(prediction, label, correct, evidence_hit)
         if phase is not None:
@@ -205,10 +210,17 @@ def _failure_phase(prediction: _Prediction | None, gold: _GoldLabel,
         return "parsing"
     if prediction.stop_reason in {"budget_exhausted", "model_unavailable", "interrupted", "time_limit"}:
         return "execution"
+    if prediction.stop_reason == "invalid_judge_reference":
+        return "citation_validation"
     if prediction.candidate_ids is not None and gold.evidence_groups:
         if not _contains_evidence(gold.evidence_groups, prediction.candidate_ids):
             return "retrieval"
     if prediction.status != "completed":
+        if prediction.decision_trace:
+            if prediction.decision_trace["blocker_codes"]:
+                return "verdict_blocked"
+            if prediction.decision_trace["attempts"][-1]["proposed_verdict"] == "pending":
+                return "model_pending"
         return "verification_pending"
     if gold.evidence_groups and prediction.candidate_ids is None and not evidence_hit:
         return "unknown"
@@ -220,10 +232,31 @@ def _contains_evidence(groups: tuple[frozenset[str], ...], candidates: tuple[str
     return any(group <= present for group in groups)
 
 
+def _decision_trace(value: object, location: str) -> dict:
+    if not isinstance(value, dict) or value.keys() != {"attempts", "blocker_codes", "missing_requirements"}:
+        raise ValueError(f"{location} must contain the structured decision trace")
+    attempts = value["attempts"]
+    if not isinstance(attempts, list) or not attempts:
+        raise ValueError(f"{location}.attempts must be a nonempty list")
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or attempt.keys() != {"material_sha256", "repair", "proposed_verdict", "status"}:
+            raise ValueError(f"{location}.attempts contains an invalid decision attempt")
+        digest, proposed, status = attempt["material_sha256"], attempt["proposed_verdict"], attempt["status"]
+        if (not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or type(attempt["repair"]) is not bool or not isinstance(status, str) or status not in _JUDGE_ATTEMPT_STATUSES
+                or proposed not in (None, *_VERDICTS, "pending", "manual_conflict")
+                or (proposed is not None) != (status in {"checked", "citation_error"})):
+            raise ValueError(f"{location}.attempts contains an invalid decision attempt")
+    _ordered_ids(value["blocker_codes"], f"{location}.blocker_codes")
+    _ordered_ids(value["missing_requirements"], f"{location}.missing_requirements")
+    return value
+
+
 def _parse_predictions(document: object) -> dict[_CaseKey, _Prediction]:
     fields = {"sample_id", "claim_id", "review_status", "verdict", "evidence_ids"}
     predictions = {}
-    for key, row, location in _rows(document, "predictions", fields, {"candidate_ids", "claim_anchor", "stop_reason"}):
+    for key, row, location in _rows(document, "predictions", fields,
+                                   {"candidate_ids", "claim_anchor", "stop_reason", "decision_trace"}):
         status = row["review_status"]
         verdict = row["verdict"]
         if not isinstance(status, str) or status not in _REVIEW_STATUSES:
@@ -239,7 +272,8 @@ def _parse_predictions(document: object) -> dict[_CaseKey, _Prediction]:
             candidates = _ordered_ids(row["candidate_ids"], f"{location}.candidate_ids")
         anchor = _anchor(row["claim_anchor"], f"{location}.claim_anchor") if "claim_anchor" in row else None
         reason = _identifier(row["stop_reason"], f"{location}.stop_reason") if "stop_reason" in row else None
-        predictions[key] = _Prediction(status, verdict, evidence_ids, candidates, anchor, reason)
+        trace = _decision_trace(row["decision_trace"], f"{location}.decision_trace") if "decision_trace" in row else None
+        predictions[key] = _Prediction(status, verdict, evidence_ids, candidates, anchor, reason, trace)
     return predictions
 
 

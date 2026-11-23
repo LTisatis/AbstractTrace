@@ -80,6 +80,8 @@ PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `ab
 
 SciFact 适配器读取作者发布的 JSONL，将每条断言与它的给定引用摘要配对，并保留原始文档和句子 ID。这组指标的适用范围是给定引用摘要。 [SciFact 数据和评估协议](https://github.com/allenai/scifact#dataset)
 
+SciFact 在线批跑默认最多预留 8 次请求和 180 秒，可用 `--max-requests` 与 `--max-seconds` 调整。预算内的预测逐样本保存到输出目录。使用相同输入、模型和输出目录并加上 `--resume` 可以续跑，两项限额均按累计用量计算。`run.json` 记录暂停原因和样本用量，`batch.last_paused_sample` 保留最近一次已捕获暂停的详细诊断。
+
 ```powershell
 uv run abstract-review bench prepare-scifact --corpus data/corpus.jsonl --claims data/claims_dev.jsonl --split dev --dataset-version author-release-2020 --output-dir .review-data/scifact
 uv run abstract-review bench run --dataset scifact --engine offline --input-manifest .review-data/scifact/inputs.json --output-dir .review-data/scifact/out

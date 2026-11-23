@@ -202,11 +202,12 @@ def test_scifact_provider_adapter_preserves_original_sentence_indices_and_separa
 
     assert [row["sample_id"] for row in predictions] == [f"scifact:{claim_id}:11", f"scifact:{claim_id}:13"]
     assert [row["claim_id"] for row in predictions] == [str(claim_id)] * 2
-    assert predictions[0]["evidence_ids"] == ["scifact:11:1"]
+    assert predictions[0]["review_status"] == "pending"
+    assert predictions[0]["candidate_ids"] == ["scifact:11:1"]
     assert predictions[1]["review_status"] == "pending"
     scored = score_scifact({"schema_version": 1, "predictions": predictions}, gold)
-    assert scored["scifact_cited_abstracts"]["sentence_label"]["f1"]["value"] == 1
-    assert scored["completed_coverage"]["value"] == 0.5
+    assert scored["evidence_group_recall_at_k"]["8"]["value"] == 1
+    assert scored["completed_coverage"]["value"] == 0
     inputs["samples"][-1]["evidence"] = {"label": "FORBIDDEN"}
     with pytest.raises(ValueError, match="only sample_id"):
         run_scifact(inputs, "openai", "unused", make_model=lambda *_a, **_kw: pytest.fail("started inference"))

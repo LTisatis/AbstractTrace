@@ -4,7 +4,7 @@ import pytest
 
 from abstract_review.audit import audit_version, extract_claims, review_claim, sentences, targeted_evidence
 from abstract_review.evidence import EvidenceIndex
-from abstract_review.models import ModelPaused
+from abstract_review.models import InvalidJudgeReference, ModelPaused
 
 
 CLAIM = {
@@ -38,6 +38,50 @@ class Model:
         if isinstance(result, Exception):
             raise result
         return schema.model_validate(result)
+
+
+def test_offline_verbatim_quote_is_a_candidate_even_when_context_disputes_it():
+    rows = [_source("quote", CLAIM["quote"], "Related Work"),
+            _source("result", "Our primary trial found no biodiversity tracking effect.")]
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index)
+    assert finding["review_status"] == "pending" and finding["verdict"] is None
+    assert finding["verbatim_candidate_ids"] == ["quote"] and finding["evidence_ids"] == []
+    assert {"quote", "result"} <= set(finding["sent_candidate_ids"])
+
+
+@pytest.mark.parametrize(("verdict", "roles", "blocker"), [
+    ("supported", ["support", "refute"], "opposing_evidence"),
+    ("refuted", ["refute"], "missing_direct_contradiction"),
+])
+def test_fulltext_does_not_finalize_opposing_or_unproved_judgements(verdict, roles, blocker):
+    rows = [_source("support", "Biodiversity increased on the tested plot."),
+            _source("refute", "Biodiversity decreased on the tested plot.")]
+    output = _judgement(verdict=verdict, missing=[], groups=[{"role": role, "evidence_ids": [role]} for role in roles],
+                        observations=[{"requirement": CLAIM["requirements"][0], "status": "found", "evidence_ids": roles}])
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, Model(output), documents=[{"doc_id": "paper", "role": "main"}])
+    assert finding["review_status"] == "pending" and finding["verdict"] is None
+    assert finding["evidence_ids"] == roles
+    assert blocker in finding["decision_trace"]["blocker_codes"]
+    assert finding["decision_trace"]["attempts"][0]["proposed_verdict"] == verdict
+
+
+def test_trace_distinguishes_wire_references_from_citation_checks_and_budget():
+    rows = [_source("known", "Biodiversity was measured twice.")]
+    output = _judgement(verdict="pending", groups=[{"role": "limit", "evidence_ids": ["invented"]}])
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, Model(InvalidJudgeReference("invalid alias"), output))
+    assert finding["stop_reason"] == "invalid_judge_reference"
+    attempts = finding["decision_trace"]["attempts"]
+    assert [(a["status"], a["proposed_verdict"], a["repair"]) for a in attempts] == [
+        ("model_reference_error", None, False), ("citation_error", "pending", True),
+    ]
+    assert attempts[0]["material_sha256"] != attempts[1]["material_sha256"]
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, Model(InvalidJudgeReference("invalid alias"), ModelPaused("model budget exhausted")))
+    assert finding["stop_reason"] == "budget_exhausted" and finding["retryable"]
+    assert finding["decision_trace"]["attempts"][-1]["status"] == "model_paused"
 
 
 def test_academic_abbreviations_preserve_citation_offsets_and_later_sentence_ids():
@@ -317,10 +361,14 @@ def test_followup_ranks_named_methods_and_keeps_nearby_refutation_lines():
         {"query": "overflow flags", "requirement": "measurement definition", "section": "Appendix"},
     ]
     refutation = [eid for eid, _ in lines]
-    model = Model(_judgement(verdict="pending", targets=targets), _judgement(
+    reviewed = _judgement(
         verdict="refuted", missing=[], groups=[{"role": "refute", "evidence_ids": refutation}],
         observations=[{"requirement": "measurement definition", "status": "found", "evidence_ids": refutation}],
-    ))
+    )
+    reviewed["direct_contradiction"] = {"evidence_ids": refutation, "subject_and_conditions": "same",
+                                         "relation": "opposite_result", "scope_reason": "Same prototype and condition.",
+                                         "supplementary_fields": []}
+    model = Model(_judgement(verdict="pending", targets=targets), reviewed)
     with closing(EvidenceIndex(rows)) as index:
         finding, _ = review_claim(CLAIM, index, model)
 

@@ -145,6 +145,8 @@ def _prediction(sample_id: str, claim_id: str, finding: dict, claim: dict | None
         row["claim_anchor"] = {key: claim[key] for key in _ANCHOR_FIELDS}
     if finding.get("stop_reason"):
         row["stop_reason"] = finding["stop_reason"]
+    if finding.get("decision_trace"):
+        row["decision_trace"] = finding["decision_trace"]
     return row
 
 

@@ -1,6 +1,7 @@
 """Evidence retrieval, scoped calculations, and independent original verdicts."""
 
 import hashlib
+import json
 import re
 from base64 import b64encode
 from collections.abc import Callable, Iterable, Sequence
@@ -498,6 +499,10 @@ def _direct_refutation_blocker(claim: dict, output: ScopedJudgement, coverage: l
 
 
 _SENTENCE_BOUNDARY = re.compile(r"[!?。！？](?=\s|[^a-zA-Z0-9]|$)|[。！？]|\.(?=\s|$)|\n+")
+# Some PDF layouts emit a footnote callout followed by the same standalone marker.
+_TRAILING_FOOTNOTE = re.compile(
+    r"(?<=[^\W\d_]{2}\.)(?:(?P<marker>[1-9]\d?)[ \t]+(?P=marker)|[⁰¹²³⁴⁵⁶⁷⁸⁹]{1,2})$"
+)
 _ABBREVIATION_CONTINUATIONS = (
     (re.compile(r"\bet[ \t]+al\.$", re.I), re.compile(r"[ \t]+(?:\(?[12]\d{3}[a-zA-Z]?(?=[.,;)\]])|[a-z])")),
     (re.compile(r"\b(?:e\.g|i\.e)\.$", re.I), re.compile(r"[ \t]+(?=\w)")),
@@ -567,8 +572,18 @@ def _compound_claims(part: dict, split: tuple[list[tuple[int, int, str]], str]) 
     return atoms if all("compound" in atom for atom in atoms) else []
 
 
+def _claim_sentence(part: dict) -> dict:
+    """Keep the raw sentence span available to references and revision callers."""
+    text = part["text"]
+    if footnote := _TRAILING_FOOTNOTE.search(text):
+        end = footnote.start()
+        if not any(suffix.search(text, max(0, end - 24), end) for suffix, _ in _ABBREVIATION_CONTINUATIONS):
+            return {**part, "text": text[:end], "end": part["start"] + end}
+    return part
+
+
 def extract_claims(text: str, model=None) -> list[dict]:
-    parts = sentences(text)
+    parts = [_claim_sentence(part) for part in sentences(text)]
     if model is None:
         results = []
         for part in parts:
@@ -726,6 +741,26 @@ def _checked_judgement(
     return output, ids, resolved
 
 
+def _judge_attempt(model, material: dict, sent: list[str], scoped: dict[str, dict], attempts: list[dict], *, repair=False):
+    payload = json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    attempt = {"material_sha256": hashlib.sha256(payload).hexdigest(), "repair": repair,
+               "proposed_verdict": None, "status": "model_unavailable"}
+    attempts.append(attempt)
+    try:
+        output = model.call("judge", material, ScopedJudgement)
+    except InvalidJudgeReference:
+        attempt["status"] = "model_reference_error"
+        raise
+    except ModelPaused:
+        attempt["status"] = "model_paused"
+        raise
+    attempt["proposed_verdict"] = output.verdict
+    attempt["status"] = "citation_error"
+    result = _checked_judgement(output, material, sent, scoped)
+    attempt["status"] = "checked"
+    return result
+
+
 def _sent_paths(paths: list[dict], sent_ids: list[str]) -> list[dict]:
     sent = set(sent_ids)
     unique = {}
@@ -761,10 +796,9 @@ def _offline(claim: dict, candidates: list[dict], comparison) -> dict:
     matches = [item for item in candidates if item.get("kind") == "body_text"
                and quote and quote == " ".join(item["text"].split()).strip(".。")]
     if matches:
-        ids = [matches[0]["evidence_id"]]
-        return {**claim, "review_status": "completed", "verdict": "supported",
-                "reason": "The supplied wording occurs verbatim in the paper body.", "evidence_ids": ids,
-                "evidence_groups": [{"role": "support", "evidence_ids": ids}], "missing_fields": []}
+        finding = _pending(claim, "Matching wording was located. Its source role and context still need review.")
+        finding["verbatim_candidate_ids"] = [item["evidence_id"] for item in matches]
+        return finding
     return _pending(claim, "The offline reviewer could not determine a verdict from the located evidence.")
 
 
@@ -876,6 +910,8 @@ def review_claim(
     sent_table_region = None
     sent_priority = []
     inspected_body_windows = []
+    decision_attempts = []
+    decision_blockers = []
     output = None
     stop = None
 
@@ -1151,7 +1187,7 @@ def review_claim(
         material.update(figure_material(candidates, documents, data_dir))
         try:
             try:
-                output = model.call("judge", material, ScopedJudgement)
+                output, ids, citation_ranges = _judge_attempt(model, material, packet_order, scoped, decision_attempts)
             except InvalidJudgeReference:
                 output = None
             sent_candidate_ids = packet_order
@@ -1160,17 +1196,21 @@ def review_claim(
             sent_passages = passages
             sent_table_context = table_context
             sent_table_region = table_region
-            try:
-                if output is None:
-                    raise InvalidJudgeReference("model cited evidence outside the supplied scope")
-                output, ids, citation_ranges = _checked_judgement(output, material, sent_candidate_ids, scoped)
-            except InvalidJudgeReference:
-                output = model.call("judge", {**material, "retry": "Review the supplied IDs and citation ranges carefully."},
-                                    ScopedJudgement)
-                output, ids, citation_ranges = _checked_judgement(output, material, sent_candidate_ids, scoped)
+            if output is None:
+                repair = {**material, "retry": "Review the supplied IDs and citation ranges carefully."}
+                output, ids, citation_ranges = _judge_attempt(model, repair, sent_candidate_ids, scoped,
+                                                               decision_attempts, repair=True)
         except ModelUnavailable as exc:
             finding = _pending(claim, str(exc))
             finding["retryable"] = isinstance(exc, ModelPaused)
+            if isinstance(exc, InvalidJudgeReference):
+                stop = "invalid_judge_reference"
+            elif isinstance(exc, ModelPaused) and str(exc) in {
+                "model budget exhausted", "model time budget exhausted", "request_budget_exhausted", "time_budget_exhausted",
+            }:
+                stop = "budget_exhausted"
+            else:
+                stop = "model_unavailable"
             break
 
         coverage = _coverage(requirements, output, examined_scopes, sent_candidate_ids)
@@ -1214,31 +1254,42 @@ def review_claim(
         role = {"supported": "support", "refuted": "refute"}.get(verdict)
         has_evidence = any(group.role == role and group.evidence_ids for group in output.evidence_groups)
         conflicting = {group.role for group in output.evidence_groups if group.evidence_ids}
+        opposing = {"support", "refute"} <= conflicting
         checked = {field["status"] for field in coverage}
         follow_up_requested = bool(output.follow_up_queries or output.follow_up_targets)
         decisive_fields_checked = checked <= {"found"} and not follow_up_requested
-        invalid_contradiction = (verdict == "refuted" and output.direct_contradiction is not None
-                                 and (proof_error is not None or proof_blocker in {
-                                     "missing_scope_coverage", "conflicting_support",
-                                 }))
-        invalid_contradiction = invalid_contradiction or (cited_abstract and verdict == "refuted" and not direct_proof)
+        invalid_contradiction = verdict == "refuted" and not direct_proof
         can_call_insufficient = (
             "searched_missing" in checked and checked <= {"found", "searched_missing"}
-            and not follow_up_requested
+            and not follow_up_requested and not conflicting & {"support", "refute"}
         )
         if cited_abstract:
             required = {_field_key(field) for field in requirements}
             marked_missing = any(check.status == "searched_missing" and _field_key(check.requirement) in required
                                  and set(sent_candidate_ids).issuperset(check.evidence_ids) for check in output.coverage)
-            can_call_insufficient = (can_call_insufficient and full_abstract and marked_missing
-                                     and not conflicting & {"support", "refute"})
-        if ((verdict == "supported" and empirical_blocker) or invalid_contradiction
-                or (role and not (has_evidence and (decisive_fields_checked or direct_proof)))
-                or (verdict == "insufficient" and not can_call_insufficient)
-                or (verdict == "manual_conflict" and not {"support", "refute"} <= conflicting)):
+            can_call_insufficient = can_call_insufficient and full_abstract and marked_missing
+        if role and opposing:
+            decision_blockers.append("opposing_evidence")
+        if verdict == "supported" and output.direct_contradiction is not None:
+            decision_blockers.append("opposite_proof_unresolved")
+        if verdict == "supported" and empirical_blocker:
+            decision_blockers.append(empirical_blocker)
+        if invalid_contradiction:
+            decision_blockers.append(proof_blocker)
+        if role and not has_evidence:
+            decision_blockers.append("missing_directional_evidence")
+        if role and not (decisive_fields_checked or direct_proof):
+            decision_blockers.append("unchecked_requirements")
+        if verdict == "insufficient" and not can_call_insufficient:
+            decision_blockers.append("unverified_insufficiency")
+        if verdict == "manual_conflict" and not opposing:
+            decision_blockers.append("unpaired_conflicting_evidence")
+        if decision_blockers:
             verdict = "pending"
         status = verdict if verdict in {"pending", "manual_conflict"} else "completed"
-        if invalid_contradiction:
+        if opposing and role:
+            reason = "The assessment supplied both supporting and contradicting evidence. Their scopes need review."
+        elif invalid_contradiction:
             reason = f"The proposed refutation did not pass the evidence checks. Proposed assessment: {output.reason}"
         elif empirical_blocker == "unconfirmed_matched_comparison" and output.verdict == "supported":
             reason = f"The comparison between tested conditions needs further verification. Proposed assessment: {output.reason}"
@@ -1268,6 +1319,10 @@ def review_claim(
     candidate_ids = [item["evidence_id"] for item in candidates]
     finding["candidate_ids"] = candidate_ids
     finding["sent_candidate_ids"] = sent_candidate_ids
+    if decision_attempts:
+        unchecked = [field["requirement"] for field in finding.get("coverage", ()) if field["status"] != "found"]
+        finding["decision_trace"] = {"attempts": decision_attempts, "blocker_codes": decision_blockers,
+                                     "missing_requirements": list(dict.fromkeys(unchecked))}
     if cited_abstract:
         finding["evidence_boundary"] = evidence_boundary(sent_candidate_ids)
     if documents:

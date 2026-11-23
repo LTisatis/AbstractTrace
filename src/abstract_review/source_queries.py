@@ -30,6 +30,41 @@ _INTERVENTION = re.compile(
     r"(?P<outcome>[^.,;!?]+)", re.I,
 )
 _STOP = frozenset({"a", "an", "and", "of", "the", "to"})
+_HEADING_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*|[ivxlcdm]+)[.)]?\s+", re.I)
+_FAILURE_HEADING = re.compile(
+    r"(?:errors? (?:analys[ie]s|breakdowns?|categories)|failures? (?:analys[ie]s|breakdowns?|modes?|cases)|"
+    r"analysis of (?:errors|failures)|错误分析|失败分析|错误分类)", re.I,
+)
+_RESULT_HEADING = re.compile(
+    r"(?:(?:main|primary|overall|experimental|evaluation) )?results(?: and discussion)?|(?:主要|总体|实验|评估)?结果", re.I,
+)
+_FAILURE = re.compile(r"\b(?:errors?|fail(?:s|ed|ure[s]?)?|limitations?|shortcomings?)\b|错误|失败|局限", re.I)
+_EMPIRICAL = re.compile(r"\b(?:evaluat\w*|experiments?|analys[ie]s|observ\w*|results?)\b|实验|评估|测得", re.I)
+_ABLATION = re.compile(r"\bablation\b|消融", re.I)
+_RESULT_EFFECT = re.compile(
+    r"\b(?:improv\w*|outperform\w*|gains?|accuracy|precision|recall|scores?|performance)\b|提高|改进|优于|得分", re.I,
+)
+_ACROSS_TASKS = re.compile(
+    r"\b(?:across|generaliz\w*|wide range|multiple|various|all)\b.{0,64}\b(?:tasks?|benchmarks?|datasets?)\b|"
+    r"(?:跨|多个|所有|不同)(?:任务|基准|数据集)", re.I,
+)
+_STANDALONE = re.compile(r"\b(?:alone|naively|naïvely|standalone|in isolation)\b|单独|仅使用", re.I)
+_SMALL_EFFECT = re.compile(r"\b(?:small|marginal|modest|limited|minor)\b.{0,28}\b(?:improv\w*|gains?|effects?)\b|有限提升|小幅提升", re.I)
+
+
+@dataclass(frozen=True)
+class _HeadingRoute:
+    role: str
+    label: re.Pattern[str]
+    passage_terms: re.Pattern[str]
+    cue: str = ""
+
+
+_FAILURE_ROUTE = _HeadingRoute("error_analysis", _FAILURE_HEADING, _FAILURE,
+                               "evaluation failure cases and error categories")
+_GENERALIZATION_ROUTE = _HeadingRoute("comparative_results", _RESULT_HEADING, _RESULT_EFFECT)
+_STANDALONE_ROUTE = _HeadingRoute("standalone_results", _RESULT_HEADING, _RESULT_EFFECT,
+                                  "standalone small marginal improvement over baseline")
 
 
 def _count_key(match: re.Match) -> tuple[str, str, str]:
@@ -75,20 +110,69 @@ def _probe(proposition: str) -> _Probe | None:
     return None
 
 
-def focused_source_context(index, proposition: str, documents):
-    """Select a same-page span only after finding and confirming its lexical anchor."""
-    probe = _probe(proposition)
-    main = [doc["doc_id"] for doc in documents if doc.get("role") == "main"]
-    if probe is None or len(main) != 1:
+def _heading_role(proposition: str) -> _HeadingRoute | None:
+    text = _normalize(proposition)
+    if _ABLATION.search(text):
+        return None  # An explicitly named study design needs its own source, not the general results page.
+    if _EMPIRICAL.search(text) and _FAILURE.search(text):
+        return _FAILURE_ROUTE
+    if _RESULT_EFFECT.search(text):
+        if _STANDALONE.search(text) and _SMALL_EFFECT.search(text):
+            return _STANDALONE_ROUTE
+        if _ACROSS_TASKS.search(text):
+            return _GENERALIZATION_ROUTE
+    return None
+
+
+def _heading_context(index, route: _HeadingRoute, document: dict):
+    matches = []
+    for page in document.get("pages", ()):
+        if not isinstance(page, dict) or page.get("status") in {"unreadable", "no_text"}:
+            continue
+        page_index, headings = page.get("page_index"), page.get("source_headings")
+        if type(page_index) is not int or page_index < 0 or not isinstance(headings, (list, tuple)):
+            continue
+        for printed in headings:
+            if not isinstance(printed, str) or not 0 < len(printed) <= 100:
+                continue
+            title = _HEADING_NUMBER.sub("", " ".join(printed.split())).rstrip(":.：")
+            if route.label.fullmatch(title):
+                matches.append((page_index, printed, title))
+    if len({page for page, _, _ in matches}) != 1:
         return None, None
-    result = index.search(probe.query, limit=12, expand=False, doc_id=main[0])
+    page, heading, title = matches[0]
+    query = f"{title} {route.cue}".strip()
+    doc_id = document["doc_id"]
+    windows = index.ranked_body_context([query], doc_id=doc_id, page_index=page)
+    for window in windows:
+        if route.passage_terms.search(window.text):
+            scope = {"mode": "ranked", "query": query, "doc_id": doc_id, "document_ids": [doc_id],
+                     "focused_page_index": page, "focused_source_heading": heading, "routing_role": route.role,
+                     "examined_evidence_ids": list(window.evidence_ids)}
+            return window, scope
+    return None, None
+
+
+def focused_source_context(index, proposition: str, documents):
+    """Select at most one same-page context window from an anchor or a matching printed heading."""
+    probe = _probe(proposition)
+    main = [doc for doc in documents if doc.get("role") == "main"]
+    if len(main) != 1:
+        return None, None
+    document, = main
+    if probe is None:
+        if route := _heading_role(proposition):
+            return _heading_context(index, route, document)
+        return None, None
+    doc_id = document["doc_id"]
+    result = index.search(probe.query, limit=12, expand=False, doc_id=doc_id)
     visited = set()
     for anchor in result["evidence"]:
         page = anchor["locator"]["page_index"]
         if page in visited or anchor.get("kind") != "body_text" or not probe.has_anchor(anchor["text"]):
             continue
         visited.add(page)
-        windows = index.ranked_body_context([probe.query], doc_id=main[0], page_index=page)
+        windows = index.ranked_body_context([probe.query], doc_id=doc_id, page_index=page)
         for window in windows:
             anchor_id = anchor["evidence_id"]
             if anchor_id in window.evidence_ids and probe.has_context(window.text):

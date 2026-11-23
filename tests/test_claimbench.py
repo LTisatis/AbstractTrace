@@ -82,7 +82,8 @@ def test_flat_claimbench_format_cli_runs_normal_pdf_core_then_localization_score
         "--gold-manifest", str(manifests / "gold.json"), "--output", str(score_file),
     ]) == 0
     score = json.loads(score_file.read_text(encoding="utf-8"))
-    assert score["cited_passage_recall"]["value"] == 1
+    assert score["cited_passage_recall"]["value"] == 0
+    assert score["quoted_passage_recall_at_k"]["8"]["value"] == 1
     assert score["diagnostics"]["sent_packet_passage_recall"]["value"] == 1
     assert "accuracy" not in score
 

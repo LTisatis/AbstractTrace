@@ -2,17 +2,24 @@
 
 import hashlib
 import json
+import sqlite3
+import time
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from .audit import review_claim, supplied_claims
 from .benchmark import _prediction
 from .evidence import EvidenceIndex
-from .models import ModelUnavailable, ResponsesModel
+from .models import ModelPaused, ModelUnavailable, ResponsesModel
 from .scoring import _ratio, score_predictions
 
 
 _DATASET = "scifact-cited-abstracts"
 _VERDICTS = {"SUPPORT": "supported", "CONTRADICT": "refuted"}
+_BATCH_DEFAULT_REQUESTS = 8
+_BATCH_DEFAULT_SECONDS = 180
+_BATCH_SAMPLE_SECONDS = 45
+_TOKEN_COUNT_FIELDS = ("input_tokens", "output_tokens", "total_tokens")
 
 
 def _jsonl(path: Path, source: bytes):
@@ -157,14 +164,160 @@ def _load_inputs(manifest: object) -> tuple[dict, list[dict]]:
     return documents, samples
 
 
-def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=ResponsesModel) -> list[dict]:
+def _digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _token_totals(requests: int, events: list[dict]) -> dict:
+    tokens = {}
+    for field in _TOKEN_COUNT_FIELDS:
+        known = [event[field] for event in events if type(event.get(field)) is int and event[field] >= 0]
+        tokens[field] = sum(known) if len(known) == requests else None
+    return tokens
+
+
+class _SciFactBatch:
+    def __init__(self, db: sqlite3.Connection, identity: str, used: int, seconds: float,
+                 max_requests: int, max_seconds: int) -> None:
+        self.db = db
+        self.identity = identity
+        self.requests_used = used
+        self.previous_seconds = seconds
+        self.max_requests = max_requests
+        self.max_seconds = max_seconds
+        self.started = time.monotonic()
+        self.stop_reason = None
+        self.results = []
+
+    @property
+    def elapsed(self) -> float:
+        return self.previous_seconds + (time.monotonic() - self.started)
+
+    @property
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.max_seconds - self.elapsed)
+
+    def exhaustion(self) -> str | None:
+        if self.requests_used >= self.max_requests:
+            return "request_budget_exhausted"
+        if self.remaining_seconds <= 0:
+            return "time_budget_exhausted"
+        return None
+
+    def reserve(self) -> None:
+        if reason := self.exhaustion():
+            raise ModelPaused(reason)
+        with self.db:
+            # The sample can stop before its outcome is known. Reserve its remaining processing
+            # window before transport, then settle to actual elapsed time when the sample returns.
+            self.db.execute("UPDATE scifact_batch SET requests = ?, seconds = ?",
+                            (self.requests_used + 1, min(self.max_seconds, self.elapsed + _BATCH_SAMPLE_SECONDS)))
+        self.requests_used += 1
+        if self.remaining_seconds <= 0:
+            raise ModelPaused("time_budget_exhausted")
+
+    def _settle(self) -> None:
+        seconds = max(self.previous_seconds, min(self.max_seconds, self.elapsed))
+        self.db.execute("UPDATE scifact_batch SET seconds = ?", (seconds,))
+
+    def saved(self, sample_id: str, digest: str) -> dict | None:
+        row = self.db.execute("SELECT prediction, result FROM scifact_samples WHERE sample_id = ? AND input_digest = ?",
+                              (sample_id, digest)).fetchone()
+        if row is None:
+            return None
+        prediction, result = map(json.loads, row)
+        self.results.append({**result, "cache_hit": True})
+        return prediction
+
+    def record(self, sample_id: str, digest: str, prediction: dict, requests: int, events: list[dict]) -> None:
+        result = {"sample_id": sample_id, "input_digest": digest, "model_requests": requests,
+                  "tokens": _token_totals(requests, events), "cache_hit": False}
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO scifact_samples VALUES (?, ?, ?, ?)",
+                            (sample_id, digest, json.dumps(prediction, ensure_ascii=False), json.dumps(result)))
+            self._settle()
+        self.results.append(result)
+
+    def pause(self, sample_id: str, digest: str, requests: int, events: list[dict], *, finding: dict | None = None) -> None:
+        self.stop_reason = self.exhaustion() or "model_paused"
+        diagnostics = {"sample_id": sample_id, "input_digest": digest, "model_requests": requests,
+                       "tokens": _token_totals(requests, events), "stop_reason": self.stop_reason}
+        if finding is not None:
+            diagnostics["finding_stop_reason"] = finding["stop_reason"]
+            if "decision_trace" in finding:
+                diagnostics["decision_trace"] = finding["decision_trace"]
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO scifact_pause VALUES (1, ?)",
+                            (json.dumps(diagnostics, ensure_ascii=False),))
+            self._settle()
+
+    def summary(self, sample_count: int) -> dict:
+        with self.db:
+            self._settle()
+        seconds, = self.db.execute("SELECT seconds FROM scifact_batch").fetchone()
+        last_pause = self.db.execute("SELECT diagnostics FROM scifact_pause WHERE slot = 1").fetchone()
+        return {"status": "paused" if self.stop_reason else "completed", "stop_reason": self.stop_reason,
+                "sample_count": sample_count, "processed_samples": len(self.results),
+                "max_requests": self.max_requests, "requests_used": self.requests_used,
+                "requests_without_sample_checkpoint": self.requests_used - sum(row["model_requests"] for row in self.results),
+                "max_seconds": self.max_seconds, "elapsed_seconds": round(seconds, 3),
+                "last_paused_sample": json.loads(last_pause[0]) if last_pause else None}
+
+
+@contextmanager
+def scifact_checkpoint(path: Path, manifest_sha256: str, configuration: dict, *, resume: bool,
+                       max_requests: int = _BATCH_DEFAULT_REQUESTS, max_seconds: int = _BATCH_DEFAULT_SECONDS):
+    """Open a single-writer checkpoint and its cumulative budget for this exact batch."""
+    if any(type(value) is not int or value <= 0 for value in (max_requests, max_seconds)):
+        raise ValueError("SciFact batch limits must be positive integers")
+    identity = _digest([1, manifest_sha256, configuration])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path, timeout=0)) as db:
+        try:
+            # Exclusive locking mode retains the file lock across commits and releases it on exit.
+            db.execute("PRAGMA locking_mode = EXCLUSIVE")
+            db.execute("PRAGMA synchronous = FULL")
+            db.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, "sqlite_errorcode", None) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                raise ValueError("this SciFact benchmark is already running in this output directory") from exc
+            raise
+        with db:
+            db.execute("CREATE TABLE IF NOT EXISTS scifact_batch (identity TEXT PRIMARY KEY, requests INTEGER NOT NULL, seconds REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS scifact_samples (sample_id TEXT PRIMARY KEY, input_digest TEXT NOT NULL, prediction TEXT NOT NULL, result TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS scifact_pause (slot INTEGER PRIMARY KEY, diagnostics TEXT NOT NULL)")
+            stored = db.execute("SELECT identity, requests, seconds FROM scifact_batch").fetchone()
+            if stored is None:
+                db.execute("INSERT INTO scifact_batch VALUES (?, 0, 0)", (identity,))
+                stored = identity, 0, 0.0
+            elif not resume:
+                raise ValueError("this output directory has SciFact checkpoints; use --resume or another output directory")
+            elif stored[0] != identity:
+                raise ValueError("SciFact checkpoint inputs or configuration changed; use another output directory")
+        yield _SciFactBatch(db, *stored, max_requests, max_seconds)
+
+
+def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=ResponsesModel,
+                batch: _SciFactBatch | None = None) -> list[dict]:
     """Apply the shared claim retrieval and judge to input-only cited abstracts."""
     if engine not in {"offline", "openai"}:
         raise ValueError("SciFact benchmark engine must be offline or openai")
+    if batch is not None and engine != "openai":
+        raise ValueError("SciFact batch checkpoints are for the online engine")
     documents, samples = _load_inputs(manifest)
     predictions = []
     for sample in samples:
         claim_id, doc_id = str(sample["claim_id"]), sample["doc_id"]
+        sample_id = sample["sample_id"]
+        if batch is not None:
+            input_digest = _digest([batch.identity, sample, documents[doc_id]])
+            if previous := batch.saved(sample_id, input_digest):
+                predictions.append(previous)
+                continue
+            batch.stop_reason = batch.exhaustion()
+            if batch.stop_reason is not None:
+                break
+            before = batch.requests_used
         claim, = supplied_claims(((claim_id, sample["text"]),))
         evidence = [
             {"evidence_id": _evidence_id(doc_id, n), "doc_id": str(doc_id), "kind": "body_text", "text": text,
@@ -172,15 +325,29 @@ def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=Re
             for n, text in enumerate(documents[doc_id]) if text.strip()
         ]
         index = EvidenceIndex(evidence)
+        model = None
         try:
-            model = None if engine == "offline" else make_model(model_name, max_requests=4, max_seconds=180)
+            if batch is None:
+                model = None if engine == "offline" else make_model(model_name, max_requests=4, max_seconds=180)
+            else:
+                model = make_model(model_name, max_requests=min(4, batch.max_requests - before),
+                                   max_seconds=min(_BATCH_SAMPLE_SECONDS, batch.remaining_seconds), before_call=batch.reserve)
             source_ids = None if model is None else [row["evidence_id"] for row in evidence]
             finding, _ = review_claim(claim, index, model, cited_abstract_ids=source_ids)
         except ModelUnavailable as exc:
+            if batch is not None and isinstance(exc, ModelPaused):
+                batch.pause(sample_id, input_digest, batch.requests_used - before, getattr(model, "events", []))
+                break
             raise ValueError(f"SciFact sample {sample['sample_id']}: {exc}") from exc
         finally:
             index.close()
-        predictions.append(_prediction(sample["sample_id"], claim_id, finding))
+        if batch is not None and finding.get("retryable"):
+            batch.pause(sample_id, input_digest, batch.requests_used - before, getattr(model, "events", []), finding=finding)
+            break
+        prediction = _prediction(sample_id, claim_id, finding)
+        if batch is not None:
+            batch.record(sample_id, input_digest, prediction, batch.requests_used - before, getattr(model, "events", []))
+        predictions.append(prediction)
     return predictions
 
 

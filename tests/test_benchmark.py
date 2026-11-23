@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from abstract_review.scoring import score_predictions
+
 from abstract_review.benchmark import benchmark_configuration, run_pdf_samples, summarize_classification
 from abstract_review.benchmark_costs import score_costs
 from abstract_review.cli import main
@@ -194,10 +196,30 @@ def test_pdf_benchmark_replays_against_independently_supplied_claims(tmp_path):
     rows = run_pdf_samples(service, source, "offline", "unused")
 
     assert [row["claim_id"] for row in rows] == ["stated", "unestablished"]
-    assert rows[0]["review_status"] == "completed" and rows[0]["verdict"] == "supported"
-    assert rows[0]["evidence_ids"]
+    assert rows[0]["review_status"] == "pending" and rows[0]["verdict"] is None
+    assert rows[0]["evidence_ids"] == []
     assert rows[0]["candidate_ids"]
     assert rows[1]["review_status"] == "pending" and rows[1]["verdict"] is None
+
+
+@pytest.mark.parametrize(("proposal", "blockers", "attempt_status", "stop", "phase"), [
+    ("pending", [], "checked", "requires_review", "model_pending"),
+    ("refuted", ["missing_direct_contradiction"], "checked", "requires_review", "verdict_blocked"),
+    ("refuted", [], "citation_error", "invalid_judge_reference", "citation_validation"),
+    (None, [], "model_paused", "budget_exhausted", "execution"),
+])
+def test_score_distinguishes_decision_traces_with_the_same_final_state(proposal, blockers, attempt_status, stop, phase):
+    trace = {"attempts": [{"material_sha256": "2" * 64, "repair": False,
+                           "proposed_verdict": proposal, "status": attempt_status}],
+             "blocker_codes": blockers, "missing_requirements": ["test scope"]}
+    row = {"sample_id": "sample", **finding("claim", status="pending", verdict=None),
+           "candidate_ids": ["e1"], "stop_reason": stop, "decision_trace": trace}
+    gold = {"schema_version": 1, "labels": [
+        {"sample_id": "sample", "claim_id": "claim", "verdict": "refuted", "accepted_evidence_groups": [["e1"]]},
+    ]}
+    scored = score_predictions({"schema_version": 1, "predictions": [row]}, gold)
+    assert scored["errors"][0]["phase"] == phase
+    assert scored["cases"][0]["decision_trace"] == trace
 
 
 def test_predictions_use_sent_order_and_keep_measurement_metadata_on_sidecar(tmp_path):
