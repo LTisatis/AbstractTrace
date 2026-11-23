@@ -53,6 +53,18 @@ def test_release_coordinate_origin_and_input_isolation(tmp_path):
         run_scitabalign(altered)
 
 
+def test_comparison_keeps_each_named_row_with_the_shared_metric_header(tmp_path):
+    row = annotation("comparison", [[1, 3], [2, 1], [2, 3], [3, 1], [3, 3]])
+    row["claim"] = "Variant Blue reaches 72% accuracy, lower than Baseline Red."
+    row["table_content_values"] = [["Variant Blue", "72%", "84%"], ["Baseline Red", 8, "93%"],
+                                   ["Variant Gold", "72%", "72%"]]
+    inputs, _ = prepare(tmp_path, [row])
+    result, = run_scitabalign(inputs)
+    assert set(result["candidate_ids"][:5]) == {f"scitabalign:comparison:cell:{r}:{c}"
+                                              for r, c in [(1, 2), (1, 0), (0, 2), (2, 2), (2, 0)]}
+    assert len(result["candidate_ids"]) <= 8
+
+
 def test_score_uses_macro_cutoffs_and_preserves_excluded_case_counts(tmp_path):
     inputs, gold = prepare(tmp_path, [
         annotation("first", [[1, 3], [2, 3]]), annotation("missing", [[2, 3]]),

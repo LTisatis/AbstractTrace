@@ -19,6 +19,7 @@ from .compound import (
 )
 from .evidence import EvidenceIndex, _document_key, _terms, with_method_scope
 from .models import EvidenceGroup, Extraction, InvalidJudgeReference, Judgement, ModelPaused, ModelUnavailable, Schema
+from .source_queries import focused_source_context
 
 
 class FieldCheck(Schema):
@@ -483,17 +484,37 @@ def _direct_refutation_blocker(claim: dict, output: ScopedJudgement, coverage: l
     return None
 
 
+_SENTENCE_BOUNDARY = re.compile(r"[!?。！？](?=\s|[^a-zA-Z0-9]|$)|[。！？]|\.(?=\s|$)|\n+")
+_ABBREVIATION_CONTINUATIONS = (
+    (re.compile(r"\bet[ \t]+al\.$", re.I), re.compile(r"[ \t]+(?:\(?[12]\d{3}[a-zA-Z]?(?=[.,;)\]])|[a-z])")),
+    (re.compile(r"\b(?:e\.g|i\.e)\.$", re.I), re.compile(r"[ \t]+(?=\w)")),
+    (re.compile(r"\b(?:figs?|eqs?|secs?|refs?|nos?|pp)\.$", re.I), re.compile(r"[ \t]+\(?\d")),
+)
+
+
 def sentences(text: str) -> list[dict]:
     parts = []
     start = 0
-    boundaries = re.finditer(r"[!?。！？](?=\s|[^a-zA-Z0-9]|$)|[。！？]|\.(?=\s|$)|\n+", text)
+    ordinal = 0
+    internal_boundaries = 0
+    boundaries = _SENTENCE_BOUNDARY.finditer(text)
     for end in [*(match.end() for match in boundaries), len(text)]:
+        if text[end - 1:end] == "." and any(
+            suffix.search(text, max(start, end - 24), end) and continuation.match(text, end)
+            for suffix, continuation in _ABBREVIATION_CONTINUATIONS
+        ):
+            internal_boundaries += 1
+            continue
         segment = text[start:end]
         stripped = segment.strip()
         if stripped:
+            ordinal += 1
             offset = start + len(segment) - len(segment.lstrip())
-            parts.append({"sentence_id": f"s{len(parts) + 1}", "text": stripped,
+            parts.append({"sentence_id": f"s{ordinal}", "text": stripped,
                           "start": offset, "end": offset + len(stripped)})
+        # Keep IDs of subsequent unchanged spans stable in saved reports and gold labels.
+        ordinal += internal_boundaries
+        internal_boundaries = 0
         start = end
     return parts
 
@@ -827,6 +848,7 @@ def review_claim(
     sent_passages = []
     sent_table_context = []
     sent_table_region = None
+    sent_priority = []
     inspected_body_windows = []
     output = None
     stop = None
@@ -903,6 +925,11 @@ def review_claim(
     body_windows = []
     if model is None or claim["kind"] not in {"background", "purpose"}:
         body_windows = index.ranked_body_context(initial_queries)
+        if claim["kind"] not in {"background", "purpose"}:
+            focused_window, scope = focused_source_context(index, proposition, documents)
+            if focused_window is not None:
+                body_windows.insert(0, focused_window)
+                examined_scopes.append(scope)
     if additional_evidence:
         supplements = index.get(item["evidence_id"] for item in additional_evidence)
         prioritized.extend(item["evidence_id"] for item in supplements)
@@ -938,9 +965,14 @@ def review_claim(
             table_region = index.referenced_table_region(claim["support_query"], [*source_ids, *body_ids], scoped)
             if table_region:
                 scoped.update((row["evidence_id"], row) for row in table_region["evidence"])
+        packet_order = list(scoped)
+        if documents and claim["kind"] not in {"background", "purpose"} and not _ABSENCE_CONDITION.search(proposition):
+            packet_order = index.prioritize_packet(claim["support_query"], scoped)
+        priority = packet_order[:8] if packet_order[:8] != list(scoped)[:8] else []
         if model is None:
             finding = _offline(claim, [*candidates, *body_rows.values()], comparison)
-            sent_candidate_ids = list(scoped)
+            sent_candidate_ids = packet_order
+            sent_priority = priority
             sent_body_context = body_context
             sent_passages = passages
             sent_table_context = table_context
@@ -950,7 +982,7 @@ def review_claim(
             finding = _pending(claim, "This sentence is outside original-paper result verification.")
             break
         material = {"claim": claim["proposition"], "requirements": requirements,
-                    "evidence": blind_evidence(candidates), "calculation": calculation,
+                    "evidence": blind_evidence(candidates, preserve_order=bool(documents)), "calculation": calculation,
                     "follow_up_already_performed": followup,
                     "direct_inspections": [scope for scope in examined_scopes if scope.get("mode") == "direct"],
                     "coverage_instructions": (
@@ -985,6 +1017,12 @@ def review_claim(
                 "request a targeted check of the actual results, error analysis or methods, naming the missing item. "
                 "For qualitative claims, match the tested scope and direction; an unstated effect size or unit is "
                 "supplementary if it cannot change either."
+            )
+        if priority:
+            material["priority_evidence_ids"] = priority
+            material["coverage_instructions"] += (
+                " Start with priority_evidence_ids. They are ordered together for review, and their original text "
+                "appears in evidence, body_context, table_context or table_region. Use other supplied sources as needed."
             )
         if comparison_required:
             material["coverage_instructions"] += (
@@ -1048,12 +1086,8 @@ def review_claim(
                 output = model.call("judge", material, ScopedJudgement)
             except InvalidJudgeReference:
                 output = None
-            sent_candidate_ids = list(dict.fromkeys([
-                *(item["evidence_id"] for item in material["evidence"]),
-                *(item["evidence_id"] for group in table_context for item in group["evidence"]),
-                *body_ids,
-                *(item["evidence_id"] for item in (table_region or {}).get("evidence", ())),
-            ]))
+            sent_candidate_ids = packet_order
+            sent_priority = priority
             sent_body_context = body_context
             sent_passages = passages
             sent_table_context = table_context
@@ -1157,6 +1191,13 @@ def review_claim(
     candidate_ids = [item["evidence_id"] for item in candidates]
     finding["candidate_ids"] = candidate_ids
     finding["sent_candidate_ids"] = sent_candidate_ids
+    if documents:
+        finding["retrieval_trace"] = {
+            "retrieved_evidence_ids": list(dict.fromkeys(eid for lane in breadth for eid in lane)),
+            "body_window_evidence_ids": list(dict.fromkeys(eid for window in context_windows()
+                                                           for eid in window.expanded_ids)),
+            "priority_evidence_ids": sent_priority,
+        }
     finding["searched_scope"] = examined_scopes
     finding["retrieval_paths"] = _sent_paths([*paths, *context["paths"]], sent_candidate_ids)
     if sent_table_context:

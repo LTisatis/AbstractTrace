@@ -2,7 +2,7 @@ from contextlib import closing
 
 import pytest
 
-from abstract_review.audit import audit_version, extract_claims, review_claim, targeted_evidence
+from abstract_review.audit import audit_version, extract_claims, review_claim, sentences, targeted_evidence
 from abstract_review.evidence import EvidenceIndex
 from abstract_review.models import ModelPaused
 
@@ -38,6 +38,28 @@ class Model:
         if isinstance(result, Exception):
             raise result
         return schema.model_validate(result)
+
+
+def test_academic_abbreviations_preserve_citation_offsets_and_later_sentence_ids():
+    abstract = "  We replicated the analysis by (Lee et al. 2011).\n\n We obtained 3.14 units (see Fig. 2). Next result."
+    parts = sentences(abstract)
+    assert [part["sentence_id"] for part in parts] == ["s1", "s3", "s5"]
+    assert [part["text"] for part in parts] == [
+        "We replicated the analysis by (Lee et al. 2011).",
+        "We obtained 3.14 units (see Fig. 2).",
+        "Next result.",
+    ]
+    assert all(abstract[part["start"]:part["end"]] == part["text"] for part in parts)
+    assert extract_claims(abstract)[0]["proposition"] == parts[0]["text"]
+
+
+def test_nonterminal_abbreviations_do_not_suppress_actual_sentence_ends():
+    abstract = "A result from Lee et al. We replicated Lee et al. (2021), e.g. their first trial. Next result."
+    assert [part["text"] for part in sentences(abstract)] == [
+        "A result from Lee et al.",
+        "We replicated Lee et al. (2021), e.g. their first trial.",
+        "Next result.",
+    ]
 
 
 def _methods_target():

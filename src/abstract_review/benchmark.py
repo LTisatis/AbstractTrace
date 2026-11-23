@@ -16,7 +16,7 @@ _SAMPLE_FIELDS = {"sample_id", "pdf", "pdf_sha256", "claims", "abstract_file", "
 _ANCHOR_FIELDS = ("sentence_id", "start", "end", "proposition")
 _BENCHMARK_PIPELINE_FILES = ("audit.py", "benchmark.py", "calculations.py", "compound.py", "evidence.py",
                              "followups.py", "ingest.py", "local_ranking.py", "models.py", "review.py", "revisions.py",
-                             "run_store.py", "scifact.py", "scitabalign.py", "workflow.py")
+                             "run_store.py", "scifact.py", "scitabalign.py", "source_queries.py", "table_ranking.py", "workflow.py")
 
 
 @dataclass(frozen=True, slots=True)

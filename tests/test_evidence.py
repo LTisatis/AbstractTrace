@@ -79,6 +79,19 @@ def test_referenced_table_region_preserves_rows_and_stays_on_the_same_version_an
         assert index.referenced_table_region("101 ms latency", ["later"], {"later"}) is None
 
 
+def test_packet_priority_keeps_same_metric_and_named_operands_together():
+    wrong = node("wrong", "25", cell=(0, 1, 1), column_header="Gamma")
+    label = node("metric", "Mean response time", cell=(0, 1, 0))
+    first = node("first", "69", cell=(0, 1, 2), column_header="Alpha")
+    second = node("second", "29", cell=(0, 1, 3), column_header="Beta")
+    distant = node("unrelated", "Other experiment: Beta reported 25", page=1)
+    with closing(EvidenceIndex([wrong, label, first, second, distant])) as index:
+        supplied = ["wrong", "unrelated", "metric", "second", "first"]
+        ordered = index.prioritize_packet("Alpha response time 69 exceeds Beta response time 25", supplied, limit=3)
+        assert ordered[:3] == ["metric", "second", "first"]
+        assert set(ordered) == set(supplied)
+
+
 def test_graph_path_uses_labeled_caption_to_reach_method_with_two_hops():
     value = node("value", "37.2", page=2, cell=(0, 1, 1), bbox=[60, 100, 110, 120], column_header="Gain (%)")
     header = node("header", "Gain (%)", page=2, cell=(0, 0, 1), bbox=[60, 86, 110, 100])

@@ -176,3 +176,17 @@ def test_context_expands_contiguous_ranges_when_both_full_windows_do_not_fit():
             anchor = window.expanded_ids.index(ids[0])
             assert tuple(ids) == window.expanded_ids[anchor:anchor + len(ids)]
             assert set(ids).issuperset(window.evidence_ids)
+
+
+def test_packet_priority_keeps_a_complete_result_excerpt_ahead_of_isolated_matches():
+    before = _line("before", "The prior calibration procedure is described above.", 100)
+    passage = [
+        _line("first", "As shown in Table 2, thermal drift was", 112),
+        _line("middle", "lower during the overnight detector assay", 124),
+        _line("last", "under the prescribed operating conditions.", 136),
+    ]
+    loose = [_line("loose", "Thermal drift influenced operation.", 180)]
+    with closing(EvidenceIndex([before, *passage, *loose])) as index:
+        supplied = ["loose", "before", "middle", "first", "last"]
+        ordered = index.prioritize_packet("Lower thermal drift during the overnight detector assay", supplied, limit=3)
+        assert ordered == ["first", "middle", "last", "loose", "before"]

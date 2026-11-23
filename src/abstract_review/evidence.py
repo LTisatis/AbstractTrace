@@ -53,6 +53,12 @@ _CONTEXT_MAX_CHARS = 1800
 _CONTEXT_SHORTLIST = 12
 _TABLE_REGION_CELLS = 12
 _TABLE_REGION_CHARS = 800
+_RESULT_LANGUAGE = re.compile(
+    r"\b(?:as shown in|results? (?:indicate|show|suggest)|outperform\w*|perform\w* comparably|"
+    r"(?:increase|improve|decrease|reduce)\w* by|measured|observed)\b", re.I,
+)
+_TABLE_AXIS_QUERY = re.compile(r"\b(?:all|each|every)\s+(?:other\s+)?(?:rows?|columns?|intervals?|bins?|ranges?)\b"
+                               r"|(?:每[一个]|所有)(?:行|列|区间)", re.I)
 _SUMMARY_SECTION = re.compile(r"^(?:abstract|introduction|conclusions?|摘要|引言|结论)(?:\b|$)")
 _LINE_END = re.compile(r"[.!?。！？][\"'”’）)】\]]*$")
 _ABBREVIATION_END = re.compile(r"\b(?:e\.g|i\.e|et al|fig|eq|ref|no|vs|pp|vol|dr|prof)\.$", re.IGNORECASE)
@@ -75,6 +81,9 @@ _PASSAGE_QUERY_NOISE = frozenset(
     "a an and or both under by between can could same any whether as at be been for from in is it of on that the "
     "their this these to was were will with would which theorem proof construction paper field assumption assumptions "
     "constructive example examples witness witnesses counterexample counterexamples result results supported observed".split()
+)
+_PACKET_QUERY_NOISE = _PASSAGE_QUERY_NOISE | frozenset(
+    "also we show shows can used use our further prior earlier reported using about how much than new".split()
 )
 _SECTION_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*|[ivx]+)[.)]?\s+")
 _METHOD_NAMES = frozenset(("method", "methods", "materials and methods", "material and methods", "methodology",
@@ -1044,6 +1053,73 @@ class EvidenceIndex:
         """Link only context lines present in the current packet, using their existing evidence IDs."""
         return [{"evidence_ids": list(unit)} for unit in self.evidence_units(candidate_ids) if len(unit) > 1]
 
+    def prioritize_packet(self, query: str, evidence_ids: Iterable[str], *, limit: int = 8) -> list[str]:
+        """Give a coherent source excerpt the first review slot without dropping other supplied anchors."""
+        ordered = list(dict.fromkeys(evidence_ids))
+        tokens = _terms(query) - _PACKET_QUERY_NOISE
+        if len(tokens) < 2 or len(ordered) <= limit:
+            return ordered
+        if cells := self._comparison_packet(query, ordered, limit):
+            return list(dict.fromkeys([*cells, *ordered]))
+
+        available = set(ordered)
+        ranks = {eid: position for position, eid in enumerate(ordered)}
+        best = (0, 0, 0, 0)
+        promoted = ()
+        for eid in ordered:
+            previous = self._adjacent_line(eid, -1)
+            if previous in available and self._adjacent_line(previous, 1) == eid:
+                continue
+            run = [eid]
+            while (following := self._adjacent_line(run[-1], 1)) in available:
+                if self._adjacent_line(following, -1) != run[-1]:
+                    break
+                run.append(following)
+            for start in range(len(run) - 1):
+                span = tuple(run[start:start + limit])
+                text = "\n".join(self._records[aid]["text"] for aid in span)
+                joined = " ".join(_WRAPPED_WORD.sub("", text).split())
+                matched = tokens & _terms(joined)
+                if len(matched) < 2:
+                    continue
+                section = _section_key(_text_field(self._records[span[0]]["locator"], "section"))
+                strength = len(matched) + bool(_RESULT_LANGUAGE.search(joined))
+                if section in {"references", "bibliography"}:
+                    strength -= 2
+                following = self._adjacent_line(span[-1], 1)
+                complete_end = following is None or not self._wrap_to_next(span[-1], following)
+                score = (strength, complete_end, -min(ranks[aid] for aid in span), -len(span))
+                if score > best:
+                    best, promoted = score, span
+        return list(dict.fromkeys([*promoted, *ordered]))
+
+    def _comparison_packet(self, query: str, ordered: list[str], limit: int) -> list[str]:
+        exact, without_numbers = _exact_terms(query)
+        if sum(term.startswith("number:") for term in exact) < 2:
+            return []
+        terms = _terms(without_numbers) - _PACKET_QUERY_NOISE
+        rows = defaultdict(list)
+        for eid in ordered:
+            record = self._records[eid]
+            if (record.get("kind") == "table_cell" and (table := _table_key(record)) is not None
+                    and (position := _cell_position(record)) is not None):
+                rows[table, position[0]].append(eid)
+        best = (0, 0)
+        promoted = []
+        for row in rows.values():
+            matched = []
+            for eid in row:
+                record = self._records[eid]
+                header = _text_field(record, "column_header")
+                cell_terms = terms.intersection(_terms(header or record["text"]))
+                if cell_terms:
+                    matched.append(eid)
+            if 2 <= len(matched) <= limit:
+                score = (len(matched), len(row))
+                if score > best:
+                    best, promoted = score, matched
+        return promoted
+
     def _followup_order(
         self, ranked: list[str], active: set[str], limit: int, prior: set[str], *, passage_limit: int,
     ) -> list[str]:
@@ -1237,6 +1313,13 @@ class EvidenceIndex:
         if len(set(coordinates.values())) != len(coordinates):
             return []
         ranked, _ = self._query_rank(query, set(coordinates))
+        axis_query = bool(_TABLE_AXIS_QUERY.search(query))
+        if axis_query:
+            from .table_ranking import rank_table_cells
+
+            cells = [self._records[eid] for eid in coordinates]
+            structured = rank_table_cells(query, cells, ranked, limit=_TABLE_REGION_CELLS)
+            ranked = list(dict.fromkeys([*structured, *ranked]))
         rows = defaultdict(list)
         for eid, (row, _) in sorted(coordinates.items(), key=lambda entry: entry[1]):
             rows[row].append(eid)
@@ -1246,8 +1329,9 @@ class EvidenceIndex:
             row, _ = coordinates[seed]
             related = [edge.target_id for edge in sorted(self._graph[seed], key=self._edge_order)
                        if edge.relation in _TABLE_CONTEXT]
-            unit = dict.fromkeys([*rows[row], *related])
-            for group in (unit, dict.fromkeys([seed, *related])):
+            cell_with_context = dict.fromkeys([seed, *related])
+            row_with_context = dict.fromkeys([*rows[row], *related])
+            for group in ((cell_with_context,) if axis_query else (row_with_context, cell_with_context)):
                 fresh = [eid for eid in group if eid not in known and eid not in selected]
                 size = sum(len(self._records[eid]["text"]) for eid in fresh)
                 if len(selected) + len(fresh) <= _TABLE_REGION_CELLS and size <= remaining:

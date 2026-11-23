@@ -15,8 +15,9 @@ from collections import Counter
 from contextlib import closing
 from pathlib import Path
 
-from .evidence import EvidenceIndex
+from .evidence import EvidenceIndex, _MAX_CANDIDATES
 from .scoring import _DEFAULT_RANK_CUTOFFS, _identifier, _parse_predictions, _ratio, _rows
+from .table_ranking import rank_table_cells
 
 
 _DATASET = "scitabalign-cells"
@@ -150,11 +151,13 @@ def run_scitabalign(manifest: object) -> list[dict]:
         _shape(grid)
         if any(not isinstance(cell, str) for row in grid for cell in row):
             raise ValueError("SciTabAlign input grid may contain only text")
-        with closing(EvidenceIndex(_table_cells(sample, grid))) as index:
-            result = index.search(claim, limit=max(_DEFAULT_RANK_CUTOFFS))
+        cells = _table_cells(sample, grid)
+        with closing(EvidenceIndex(cells)) as index:
+            seeds = [item["evidence_id"] for item in index.search(claim, limit=_MAX_CANDIDATES)["evidence"]]
+        selected = rank_table_cells(claim, cells, seeds, limit=max(_DEFAULT_RANK_CUTOFFS))
         predictions.append({
             "sample_id": sample_id, "claim_id": claim_id, "review_status": "pending", "verdict": None,
-            "evidence_ids": [], "candidate_ids": [item["evidence_id"] for item in result["evidence"]],
+            "evidence_ids": [], "candidate_ids": selected,
             "stop_reason": "ranking_only",
         })
     if not predictions:
