@@ -195,6 +195,15 @@ def run_benchmark(args: argparse.Namespace) -> None:
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scifact-cited-abstracts"
         predictions = run_scifact(read_json(args.input_manifest), engine, args.model)
+    elif args.dataset == "scitabalign":
+        from .benchmark import benchmark_configuration
+        from .scitabalign import run_scitabalign
+
+        if args.resume or args.engine not in {None, "offline"}:
+            raise ValueError("SciTabAlign cell ranking uses the offline engine without --resume")
+        configuration = benchmark_configuration("offline", args.model)
+        configuration["dataset"] = "scitabalign-cells"
+        predictions = run_scitabalign(read_json(args.input_manifest))
     elif args.engine:
         from .benchmark import benchmark_configuration, run_pdf_samples
 
@@ -205,7 +214,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             raise ValueError("invalid benchmark checkpoint file")
 
         def save_sample(sample_id: str, input_digest: str, rows: list[dict]) -> None:
-            recovered[sample_id] = {"input_digest": input_digest, "predictions": rows}
+            recovered[sample_id] = {"input_digest": input_digest, "predictions": rows, "result": results[-1]}
             write_json(checkpoints, recovered)
 
         predictions = run_pdf_samples(service, args.input_manifest, args.engine, args.model,
@@ -254,8 +263,44 @@ def score_benchmark(args: argparse.Namespace) -> None:
         from .claimbench import score_claimbench
 
         result = score_claimbench(predictions, gold)
+    elif args.dataset == "scitabalign":
+        from .scitabalign import score_scitabalign
+
+        result = score_scitabalign(predictions, gold)
     else:
         result = score_predictions(predictions, gold)
+    write_json(args.output, result)
+    emit(result)
+
+
+def score_review_benchmark(args: argparse.Namespace) -> None:
+    import hashlib
+
+    from .review_quality import score_review_quality
+
+    sources = {args.run_record.resolve(), args.gold_manifest.resolve()}
+    if args.pricing:
+        sources.add(args.pricing.resolve())
+    if args.output.resolve() in sources:
+        raise ValueError("review score output must differ from its input files")
+    run_source = args.run_record.read_bytes()
+    gold_source = args.gold_manifest.read_bytes()
+    run_record = json.loads(run_source.decode("utf-8-sig"))
+    configuration = run_record.get("configuration") if isinstance(run_record, dict) else None
+    if (not isinstance(configuration, dict) or configuration.get("dataset") is not None
+            or configuration.get("engine") not in ("offline", "openai") or not run_record.get("samples")):
+        raise ValueError("score-reviews requires a PDF benchmark run record with samples")
+    result = score_review_quality(run_record, json.loads(gold_source.decode("utf-8-sig")))
+    result["input_sha256"] = {
+        "run_record": hashlib.sha256(run_source).hexdigest(),
+        "gold_manifest": hashlib.sha256(gold_source).hexdigest(),
+    }
+    if args.pricing:
+        from .benchmark_costs import score_costs
+
+        pricing_source = args.pricing.read_bytes()
+        result["estimated_cost"] = score_costs(run_record, json.loads(pricing_source.decode("utf-8-sig")))
+        result["input_sha256"]["pricing"] = hashlib.sha256(pricing_source).hexdigest()
     write_json(args.output, result)
     emit(result)
 
@@ -268,6 +313,20 @@ def prepare_scifact_benchmark(args: argparse.Namespace) -> None:
     if len({path.resolve() for path in (input_manifest, gold_manifest, args.corpus, args.claims)}) != 4:
         raise ValueError("SciFact source and output files must be distinct")
     inputs, gold = prepare_scifact(args.corpus, args.claims, split=args.split, dataset_version=args.dataset_version)
+    write_json(input_manifest, inputs)
+    write_json(gold_manifest, gold)
+    emit({"input_manifest": str(input_manifest), "gold_manifest": str(gold_manifest),
+          "sample_count": len(inputs["samples"])})
+
+
+def prepare_scitabalign_benchmark(args: argparse.Namespace) -> None:
+    from .scitabalign import prepare_scitabalign
+
+    input_manifest = args.output_dir / "inputs.json"
+    gold_manifest = args.output_dir / "gold.json"
+    if len({path.resolve() for path in (input_manifest, gold_manifest, args.annotations)}) != 3:
+        raise ValueError("SciTabAlign source and output files must be distinct")
+    inputs, gold = prepare_scitabalign(args.annotations, dataset_version=args.dataset_version)
     write_json(input_manifest, inputs)
     write_json(gold_manifest, gold)
     emit({"input_manifest": str(input_manifest), "gold_manifest": str(gold_manifest),
@@ -359,7 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--input-manifest", type=Path, required=True)
     run.add_argument("--output-dir", type=Path, required=True)
     run.add_argument("--engine", choices=("offline", "openai"), help="review a PDF or SciFact benchmark manifest")
-    run.add_argument("--dataset", choices=("scifact",), help="run the SciFact cited-abstract benchmark")
+    run.add_argument("--dataset", choices=("scifact", "scitabalign"), help="select a public benchmark adapter")
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     run.add_argument("--resume", action="store_true", help="reuse matching persisted PDF sample checkpoints")
     run.set_defaults(handler=run_benchmark)
@@ -368,8 +427,15 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--predictions", type=Path, required=True)
     score.add_argument("--gold-manifest", type=Path, required=True)
     score.add_argument("--output", type=Path, required=True)
-    score.add_argument("--dataset", choices=("scifact", "claimbench"), help="select dataset-specific metrics")
+    score.add_argument("--dataset", choices=("scifact", "claimbench", "scitabalign"), help="select dataset-specific metrics")
     score.set_defaults(handler=score_benchmark)
+
+    quality = bench_commands.add_parser("score-reviews", help="score persisted review artifacts against human checks")
+    quality.add_argument("--run-record", type=Path, required=True)
+    quality.add_argument("--gold-manifest", type=Path, required=True)
+    quality.add_argument("--pricing", type=Path, help="versioned USD token rate table for cost estimates")
+    quality.add_argument("--output", type=Path, required=True)
+    quality.set_defaults(handler=score_review_benchmark)
 
     scifact = bench_commands.add_parser("prepare-scifact", help="adapt labeled SciFact release JSONL files")
     scifact.add_argument("--corpus", type=Path, required=True)
@@ -378,6 +444,12 @@ def build_parser() -> argparse.ArgumentParser:
     scifact.add_argument("--dataset-version", required=True)
     scifact.add_argument("--output-dir", type=Path, required=True)
     scifact.set_defaults(handler=prepare_scifact_benchmark)
+
+    scitabalign = bench_commands.add_parser("prepare-scitabalign", help="adapt SciTabAlign release tables for cell retrieval")
+    scitabalign.add_argument("--annotations", type=Path, required=True)
+    scitabalign.add_argument("--dataset-version", required=True)
+    scitabalign.add_argument("--output-dir", type=Path, required=True)
+    scitabalign.set_defaults(handler=prepare_scitabalign_benchmark)
 
     claimbench = bench_commands.add_parser("prepare-claimbench", help="align local CLAIM-BENCH quotes to a PDF")
     claimbench.add_argument("--pdf", type=Path, required=True)

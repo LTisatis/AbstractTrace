@@ -60,7 +60,8 @@ def process(service, run_id: str, request_id: str | None, add_requests: int, add
             data_dir = service.database.parent
             if version.get("kind") == "selected":
                 while True:
-                    review = verify_version(report, report["original_abstract"], version, model, followups=followups)
+                    review = verify_version(report, report["original_abstract"], version, model,
+                                            followups=followups, data_dir=data_dir)
                     if not _refresh_findings(report, model, followups, embedder, data_dir):
                         report["abstract_review"] = review
                         break
@@ -159,17 +160,17 @@ def _review_candidate(report: dict, model, followups: FollowUps, embedder, data_
     original = report["original_abstract"]
     while True:
         if "candidate_proposal" not in report:
-            report["candidate_proposal"] = build_candidate(report, model, followups=followups)
+            report["candidate_proposal"] = build_candidate(report, model, followups=followups, data_dir=data_dir)
             followups.checkpoint()
         if _refresh_findings(report, model, followups, embedder, data_dir):
             continue
         candidate = report["candidate_proposal"]
-        review = verify_version(report, original, candidate or original, model, followups=followups)
+        review = verify_version(report, original, candidate or original, model, followups=followups, data_dir=data_dir)
         if _refresh_findings(report, model, followups, embedder, data_dir):
             continue
         if candidate is None or review["status"] != "returned" or model is None or report.get("whole_repair_attempted"):
             return candidate, review
-        repaired = repair_candidate(report, candidate, review, model, followups=followups)
+        repaired = repair_candidate(report, candidate, review, model, followups=followups, data_dir=data_dir)
         report["whole_repair_attempted"] = True
         if repaired is None:
             followups.checkpoint()

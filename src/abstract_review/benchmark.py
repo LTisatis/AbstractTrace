@@ -14,9 +14,9 @@ from .scoring import score_predictions
 _LABELS = ("supported", "refuted", "insufficient")
 _SAMPLE_FIELDS = {"sample_id", "pdf", "pdf_sha256", "claims", "abstract_file", "paper_family_id", "split"}
 _ANCHOR_FIELDS = ("sentence_id", "start", "end", "proposition")
-_BENCHMARK_PIPELINE_FILES = ("audit.py", "benchmark.py", "calculations.py", "evidence.py", "followups.py",
-                             "ingest.py", "models.py", "review.py", "revisions.py", "run_store.py",
-                             "scifact.py", "workflow.py")
+_BENCHMARK_PIPELINE_FILES = ("audit.py", "benchmark.py", "calculations.py", "compound.py", "evidence.py",
+                             "followups.py", "ingest.py", "models.py", "review.py", "revisions.py",
+                             "run_store.py", "scifact.py", "scitabalign.py", "workflow.py")
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,11 +239,16 @@ def run_pdf_samples(
             raise ValueError(f"benchmark sample {sample.sample_id!r}: {exc}") from exc
         result = {"sample_id": sample.sample_id, "paper_family_id": sample.paper_family_id,
                   "split": sample.split, "pdf_sha256": pdf_hash, "input_sha256": digest}
-        cached = _checkpoint_rows(sample, digest, checkpoints.get(sample.sample_id))
+        entry = checkpoints.get(sample.sample_id)
+        cached = _checkpoint_rows(sample, digest, entry)
         if cached is not None:
             predictions.extend(cached)
             if on_result is not None:
-                on_result({**result, "cache_hit": True, "prediction_count": len(cached)})
+                saved_result = entry.get("result")
+                metadata = saved_result if isinstance(saved_result, dict) and all(
+                    saved_result.get(field) == value for field, value in result.items()
+                ) and saved_result.get("prediction_count") == len(cached) else {}
+                on_result({**metadata, **result, "cache_hit": True, "prediction_count": len(cached)})
             continue
         request = PdfReviewInput(
             pdf=sample.pdf, pasted_abstract=sample.pasted_abstract,
@@ -264,29 +269,53 @@ def run_pdf_samples(
         rows = [_prediction(sample.sample_id, claim_id, findings.get(claim_id, {}), extracted.get(claim_id))
                 for claim_id in _claim_ids(sample, report, findings.values())]
         predictions.extend(rows)
-        if on_sample is not None and run.get("run_status") == "report_ready":
-            on_sample(sample.sample_id, digest, rows)
         if on_result is not None:
             on_result(_sample_result(result, run, report, rows, time.perf_counter() - started))
+        if on_sample is not None and run.get("run_status") == "report_ready":
+            on_sample(sample.sample_id, digest, rows)
     return predictions
 
 
 def _sample_result(result: dict, run: dict, report: dict, rows: list[dict], elapsed: float) -> dict:
     usage = report.get("usage", {})
+    events = usage.get("model_events", [])
     tokens = {}
     for key in ("input_tokens", "output_tokens", "total_tokens"):
-        values = [entry[key] for entry in usage.get("model_events", []) if type(entry.get(key)) is int]
+        values = [entry[key] for entry in events if type(entry.get(key)) is int]
         tokens[key] = sum(values) if values else None
-    return {
+    request_usage = []
+    for event in events:
+        input_details = event.get("input_tokens_details") or {}
+        request_usage.append({key: event.get(key) for key in ("stage", "model", "status", "input_tokens", "output_tokens")}
+                             | {"cached_input_tokens": input_details.get("cached_tokens")})
+    summary = {
         **result, "cache_hit": False, "run_id": run["run_id"], "run_status": run.get("run_status"),
         "prediction_count": len(rows), "wall_seconds": round(elapsed, 6),
-        "model_requests": usage.get("external_requests"), "tokens": tokens,
+        "model_requests": usage.get("external_requests"), "tokens": tokens, "request_usage": request_usage,
         "follow_up_count": sum(bool(row.get("follow_up_performed")) for row in report.get("findings", [])),
+        "follow_up_new_evidence": sum(len(row.get("follow_up_evidence_ids", ())) for row in report.get("findings", [])),
         "unreadable_pages": sum(page.get("status") == "unreadable" for document in report.get("documents", [])
                                 for page in document.get("pages", [])),
         "revision_count": len(report.get("revisions", [])),
         "abstract_verification_status": report.get("abstract_review", {}).get("status"),
     }
+    actual = report.get("reviewed_abstract")
+    review = report.get("abstract_review")
+    version_id = actual.get("version_id") if actual else None
+    if version_id and review and version_id == review.get("version_id") == run.get("report_version_id"):
+        calculations = report.get("calculations", [])
+        scope_ids = {eid for row in calculations for eid in [*row.get("evidence_ids", ()),
+                                                               *row.get("scope_evidence_ids", ())]}
+        summary["review"] = {
+            "version_id": version_id,
+            "original_text": report["original_abstract"]["text"], "reviewed_text": actual["text"],
+            "revision_ids": actual["revision_ids"],
+            "revisions": report.get("revisions", []), "abstract_review": review,
+            "calculations": calculations,
+            "evidence_roles": {item["evidence_id"]: item.get("cell_role") or item["kind"] for item in report["evidence"]
+                               if item["evidence_id"] in scope_ids},
+        }
+    return summary
 
 
 def summarize_classification(predictions: object, gold: object) -> dict:

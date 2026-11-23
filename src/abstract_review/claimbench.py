@@ -44,7 +44,19 @@ def _annotations(content: object):
         yield claim_id, claim, excerpts
 
 
-def _pages(evidence: list[dict]) -> dict[int, tuple[str, list[tuple[int, int, dict]]]]:
+def _line_wrap(text: str, before: dict, next_text: str, after: dict) -> bool:
+    if len(text) < 2 or not (text.endswith("-") and text[-2].isalpha() and next_text[0].isalpha()):
+        return False
+    left, right = before["locator"], after["locator"]
+    if left.get("section") != right.get("section"):
+        return False
+    x0, y0, _, y1 = left["bbox"]
+    next_x0, next_y0, _, next_y1 = right["bbox"]
+    line_height = min(y1 - y0, next_y1 - next_y0)
+    return abs(next_x0 - x0) <= line_height and 0 < next_y0 - y0 <= 1.75 * line_height
+
+
+def _pages(evidence: list[dict], *, join_line_wraps: bool = False) -> dict[int, tuple[str, list[tuple[int, int, dict]]]]:
     grouped = {}
     for item in evidence:
         if item["kind"] != "body_text":
@@ -56,15 +68,21 @@ def _pages(evidence: list[dict]) -> dict[int, tuple[str, list[tuple[int, int, di
     for page_index, parts in grouped.items():
         text_parts, spans = [], []
         offset = 0
-        for text, item in parts:
+        for index, (text, item) in enumerate(parts):
+            join = join_line_wraps and index + 1 < len(parts) and _line_wrap(text, item, *parts[index + 1])
+            if join:
+                text = text[:-1]
             text_parts.append(text)
             spans.append((offset, offset + len(text), item))
-            offset += len(text) + 1
-        pages[page_index] = (" ".join(text_parts), spans)
+            offset += len(text)
+            if not join:
+                text_parts.append(" ")
+                offset += 1
+        pages[page_index] = ("".join(text_parts), spans)
     return pages
 
 
-def _align(excerpt: str, pages: dict) -> dict:
+def _align(excerpt: str, pages: dict, *, normalization: str) -> dict:
     pattern = re.compile(r"(?<!\w)(?=(" + re.escape(_normalized(excerpt)) + r")(?!\w))")
     match = None
     for page_index, (text, spans) in pages.items():
@@ -74,11 +92,19 @@ def _align(excerpt: str, pages: dict) -> dict:
             first, last = occurrence.span(1)
             records = [item for start, end, item in spans if start < last and end > first]
             match = {
-                "status": "aligned", "evidence_ids": [item["evidence_id"] for item in records],
+                "status": "aligned", "normalization": normalization,
+                "evidence_ids": [item["evidence_id"] for item in records],
                 "anchors": [{"evidence_id": item["evidence_id"], "doc_id": item["doc_id"], "page_index": page_index,
                              "bbox": item["locator"]["bbox"]} for item in records],
             }
     return match or {"status": "unmatched", "evidence_ids": [], "anchors": []}
+
+
+def _align_passage(excerpt: str, plain: dict, joined: dict) -> dict:
+    result = _align(excerpt, plain, normalization="normalized_exact")
+    if result["status"] == "unmatched":
+        return _align(excerpt, joined, normalization="line_wrap_hyphen")
+    return result
 
 
 def prepare_claimbench(
@@ -94,6 +120,7 @@ def prepare_claimbench(
         raise ValueError(f"{annotations}: invalid UTF-8 annotation JSON") from exc
     document = parse_pdf(pdf)
     pages = _pages(document.evidence)
+    joined = _pages(document.evidence, join_line_wraps=True)
     pdf_sha256 = document.document["sha256"]
     sample_id = f"claimbench-{pdf_sha256}"
     try:
@@ -107,7 +134,7 @@ def prepare_claimbench(
     }]
     labels = [
         {"sample_id": sample_id, "claim_id": claim_id,
-         "passages": [_align(excerpt, pages) for excerpt in excerpts]}
+         "passages": [_align_passage(excerpt, pages, joined) for excerpt in excerpts]}
         for claim_id, _, excerpts in claims
     ]
     return {"schema_version": 1, "samples": samples}, {
@@ -125,6 +152,7 @@ def score_claimbench(predictions: object, gold: object) -> dict:
         raise ValueError("expected CLAIM-BENCH aligned passage gold")
     seen, cases = set(), []
     ranked_hits = dict.fromkeys(_DEFAULT_RANK_CUTOFFS, 0)
+    within_cutoff = dict.fromkeys(_DEFAULT_RANK_CUTOFFS, 0)
     totals = dict.fromkeys(("aligned", "unmatched", "ambiguous"), 0)
     cited_hits = rank_unavailable = 0
     for label in gold["labels"]:
@@ -151,6 +179,8 @@ def score_claimbench(predictions: object, gold: object) -> dict:
             cited_hits += bool(cited_hit)
             ranked = None
             if ids:
+                for k in within_cutoff:
+                    within_cutoff[k] += len(ids) <= k
                 if candidates is None:
                     rank_unavailable += 1
                 else:
@@ -159,7 +189,7 @@ def score_claimbench(predictions: object, gold: object) -> dict:
                         ranked_hits[k] += ranked[str(k)]
             cases.append({
                 "sample_id": key[0], "claim_id": key[1], "passage_number": number, "alignment_status": status,
-                "evidence_ids": sorted(ids), "citation_hit": cited_hit, "ranked_hit": ranked,
+                "evidence_ids": sorted(ids), "evidence_count": len(ids), "citation_hit": cited_hit, "ranked_hit": ranked,
             })
     if predicted.keys() - seen:
         raise ValueError("some predictions have no CLAIM-BENCH gold claim")
@@ -170,5 +200,6 @@ def score_claimbench(predictions: object, gold: object) -> dict:
         "quoted_passage_recall_at_k": {
             str(k): None if rank_unavailable else _ratio(hits, totals["aligned"]) for k, hits in ranked_hits.items()
         },
+        "passages_within_k": {str(k): _ratio(count, totals["aligned"]) for k, count in within_cutoff.items()},
         "cases": cases,
     }

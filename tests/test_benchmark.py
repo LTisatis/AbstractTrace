@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from abstract_review.benchmark import run_pdf_samples, summarize_classification
+from abstract_review.benchmark_costs import score_costs
+from abstract_review.cli import main
 from abstract_review.review import ReviewService
 
 
@@ -199,3 +201,71 @@ def test_predictions_use_sent_order_and_keep_measurement_metadata_on_sidecar(tmp
     assert results[0]["model_requests"] == 2 and results[0]["tokens"]["total_tokens"] == 21
     assert results[0]["run_id"] == "test-run"
     assert results[1]["cache_hit"] is True and "model_requests" not in results[1]
+
+
+def test_pdf_bench_resume_preserves_the_exact_version_for_independent_scoring(tmp_path):
+    pdf = tmp_path / "paper.pdf"
+    subprocess.run([sys.executable, str(GENERATOR), str(pdf)], check=True, capture_output=True, timeout=30)
+    abstract = tmp_path / "abstract.txt"
+    abstract.write_text("On dataset A, accuracy increased by 10 percentage points.", encoding="utf-8")
+    inputs = manifest(tmp_path / "inputs.json", [{"sample_id": "sample", "pdf": pdf.name, "abstract_file": abstract.name}])
+    output = tmp_path / "benchmark"
+    args = ["--data-dir", str(tmp_path / "runs"), "bench", "run", "--engine", "offline",
+            "--input-manifest", str(inputs), "--output-dir", str(output), "--resume"]
+    assert main(args) == 0
+    first, = json.loads((output / "run.json").read_bytes())["samples"]
+    review = first["review"]
+    change, = review["revisions"]
+    assert review["revision_ids"] == [change["revision_id"]]
+    assert "8 percentage points" in review["reviewed_text"] and change["status"] == "passed"
+    assert review["abstract_review"]["version_id"] == review["version_id"]
+    assert {review["evidence_roles"][eid] for eid in review["calculations"][0]["evidence_ids"]} == {"value"}
+
+    assert main(args) == 0
+    cached, = json.loads((output / "run.json").read_bytes())["samples"]
+    assert cached == {**first, "cache_hit": True}
+
+    annotations = output / "review-gold.json"
+    annotations.write_text(json.dumps({"schema_version": 1, "revision_checks": [
+        {"sample_id": "sample", "version_id": review["version_id"], "revision_id": change["revision_id"],
+         "corrected": True, "facts_preserved": True, "unsupported_added": False},
+    ]}), encoding="utf-8")
+    pricing = output / "prices.json"
+    pricing.write_text(json.dumps({"schema_version": 1, "pricing_id": "synthetic", "models": {}}), encoding="utf-8")
+    scores = output / "review-scores.json"
+    assert main(["bench", "score-reviews", "--run-record", str(output / "run.json"),
+                 "--gold-manifest", str(annotations), "--pricing", str(pricing), "--output", str(scores)]) == 0
+    assert json.loads(scores.read_bytes())["estimated_cost"]["known_cost_usd"] == "0"
+
+
+def test_cost_only_prices_recorded_tokens_and_keeps_unknown_requests_visible():
+    prices = {"schema_version": 1, "pricing_id": "synthetic-v1", "models": {
+        "fixed": {"input_per_million": "2", "cached_input_per_million": "0.5", "output_per_million": "4"},
+    }}
+    record = {"samples": [
+        {"sample_id": "live", "model_requests": 2, "request_usage": [
+            {"model": "fixed", "input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 200},
+            {"model": "fixed", "status": "outcome_unknown"},
+        ]},
+        {"sample_id": "legacy"},
+    ]}
+    result = score_costs(record, prices)
+    assert result["known_cost_usd"] == "0.0022"
+    assert (result["priced_requests"], result["unpriced_requests"], result["samples_without_usage"]) == (1, 1, 1)
+    assert result["complete"] is False
+
+
+def test_review_scoring_does_not_report_zero_cost_for_unmeasured_dataset(tmp_path, capsys):
+    record = tmp_path / "run.json"
+    record.write_text(json.dumps({"schema_version": 1, "prediction_count": 1, "samples": [],
+                                  "configuration": {"engine": "openai", "dataset": "scifact-cited-abstracts"}}),
+                      encoding="utf-8")
+    gold = tmp_path / "gold.json"
+    gold.write_text('{"schema_version": 1}', encoding="utf-8")
+    pricing = tmp_path / "rates.json"
+    pricing.write_text('{"schema_version": 1, "pricing_id": "fixture", "models": {}}', encoding="utf-8")
+    output = tmp_path / "scores.json"
+    assert main(["bench", "score-reviews", "--run-record", str(record), "--gold-manifest", str(gold),
+                 "--pricing", str(pricing), "--output", str(output)]) == 1
+    assert "requires a PDF benchmark run record" in capsys.readouterr().err
+    assert not output.exists()

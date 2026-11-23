@@ -3,13 +3,15 @@
 import hashlib
 import json
 import re
+from collections import Counter
 from decimal import Decimal
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
 
-from .audit import blind_evidence, sentences, validate_ids
+from .audit import blind_evidence, figure_material, sentences, validate_ids
 from .calculations import check_revision_numbers, comparison_for_claim
 from .evidence import EvidenceIndex, with_method_scope
 from .followups import FollowUps
@@ -60,6 +62,8 @@ _RELATIVE = re.compile(
     r"(?:relative(?:ly)?\s+(?:increase\s+of\s+)?|相对(?:提高|增加)?)\s*(?P<value>\d+(?:\.\d+)?)\s*%",
     re.I,
 )
+_VISUAL_REFERENCE = re.compile(r"\b(?:fig(?:ure)?\.?|table|experiment|exp\.)\s+[a-z]?\d+(?:\.\d+)*|(?:图|表|实验)\s*[a-z]?\d+", re.I)
+_FIGURE_NUMBER = re.compile(r"(?<![A-Za-z0-9])(?:\d+(?:\.\d+)?|\.\d+)(?![A-Za-z0-9])")
 
 
 def _digest(payload: object) -> str:
@@ -122,6 +126,11 @@ def _scope(report: dict, findings: list[dict], additional_ids=(), *, additional_
     return with_method_scope(scope.values(), paths)
 
 
+def _figure_documents(report: dict) -> tuple[dict, ...]:
+    return (*report.get("documents", ()), *(check["document"] for check in report.get("external_checks", ())
+             if check.get("support_status") == "not_supported" and isinstance(check.get("document"), dict)))
+
+
 def _numeric_draft(source: str, evidence: list[dict]) -> RevisionDraft | None:
     comparison = comparison_for_claim(source, evidence)
     if comparison is None:
@@ -160,14 +169,38 @@ def _verify_numbers(check: SentenceCheck, source: str, replacement: str, evidenc
         ))
     elif check.status == "passed" and (unresolved := next((item for item in calculations if item["verification"] == "unresolved"), None)):
         result.update(status="manual_review", reason=unresolved["reason"])
+    elif check.status == "passed" and _unproven_visual_numbers(check.evidence_ids, replacement, evidence, calculations):
+        result.update(status="manual_review", reason="The visual source does not independently establish the revised numeric values.")
     if mismatch or result["status"] == "passed":
         ids = [eid for item in calculations for eid in [*item["evidence_ids"], *item.get("scope_evidence_ids", ())]]
         result["evidence_ids"] = list(dict.fromkeys([*result["evidence_ids"], *ids]))
     return SentenceVerification(**result, calculations=calculations)
 
 
+def _unproven_visual_numbers(ids: list[str], replacement: str, evidence: list[dict], calculations: list[dict]) -> bool:
+    cited = [item for item in evidence if item["evidence_id"] in ids]
+    if not any(item.get("kind") == "figure" for item in evidence):
+        return False
+    numbers = Counter(Decimal(value) for value in _FIGURE_NUMBER.findall(_VISUAL_REFERENCE.sub("", replacement)))
+    if not numbers:
+        return False
+    verified = Counter(abs(Decimal(item["stated"])) for item in calculations if item["verification"] == "matched")
+    if not numbers - verified:
+        return False
+    normalized = " ".join(replacement.casefold().split()).rstrip(".。")
+    return not any(item.get("kind") == "body_text"
+                   and " ".join(item["text"].casefold().split()).rstrip(".。") == normalized for item in cited)
+
+
+def _only_unavailable_figures(ids: list[str], material: dict) -> bool:
+    unavailable = {row["evidence_id"] for row in material.get("figure_observations", ())
+                   if row["status"] != "available"}
+    return bool(ids) and unavailable.issuperset(ids)
+
+
 def _verify_sentence(source: str, replacement: str, evidence: list[dict], model, *,
-                     followups: FollowUps | None = None, keys: list[str] | None = None, target=None) -> SentenceVerification:
+                     followups: FollowUps | None = None, keys: list[str] | None = None, target=None,
+                     documents: tuple[dict, ...] = (), data_dir: Path | None = None) -> SentenceVerification:
     if model is None:
         correction = _numeric_draft(source, evidence)
         if correction is not None and replacement == correction.replacement:
@@ -182,9 +215,12 @@ def _verify_sentence(source: str, replacement: str, evidence: list[dict], model,
         material = {"original_sentence": source, "revised_sentence": replacement}
 
         def check(rows: list[dict]) -> SentenceCheck:
-            output = _call_step(model, "verify_sentence", {**material, "evidence": blind_evidence(rows)}, SentenceCheck,
+            packet = {**material, "evidence": blind_evidence(rows), **figure_material(rows, documents, data_dir)}
+            output = _call_step(model, "verify_sentence", packet, SentenceCheck,
                                 followups, target)
             validate_ids(output.evidence_ids, rows)
+            if output.status == "passed" and _only_unavailable_figures(output.evidence_ids, packet):
+                return output.model_copy(update={"status": "manual_review", "reason": "The cited figure crops were unavailable."})
             return output
 
         output = check(evidence)
@@ -215,7 +251,8 @@ def _validate_draft(draft: RevisionDraft, source: str, evidence: list[dict]) -> 
 
 
 def _review_proposal(part: dict, findings: list[dict], evidence: list[dict], model, *,
-                     followups: FollowUps, keys: list[str], target: str) -> tuple[RevisionDraft | None, list[SentenceCheck]]:
+                     followups: FollowUps, keys: list[str], target: str, documents: tuple[dict, ...] = (),
+                     data_dir: Path | None = None) -> tuple[RevisionDraft | None, list[SentenceCheck]]:
     source = part["text"]
     attempts = []
     material = {"original_sentence": source, "evidence": blind_evidence(evidence), "findings": [
@@ -239,7 +276,7 @@ def _review_proposal(part: dict, findings: list[dict], evidence: list[dict], mod
         except ModelUnavailable as exc:
             return None, [*attempts, SentenceCheck(status="manual_review", reason=str(exc), evidence_ids=[])]
         check = _verify_sentence(source, draft.replacement, evidence, model, followups=followups, keys=keys,
-                                 target=[target, attempt])
+                                 target=[target, attempt], documents=documents, data_dir=data_dir)
         attempts.append(check)
         if check.status != "returned" or attempt:
             break
@@ -296,7 +333,8 @@ def _has_revision_reason(finding: dict, compounds: dict[str, dict]) -> bool:
     return True
 
 
-def build_candidate(report: dict, model=None, *, followups: FollowUps | None = None) -> dict | None:
+def build_candidate(report: dict, model=None, *, followups: FollowUps | None = None,
+                    data_dir: Path | None = None) -> dict | None:
     """Record proposed replacements, then merge only independently checked sentences."""
     original = report["original_abstract"]
     revisions = report.setdefault("revisions", [])
@@ -324,7 +362,8 @@ def build_candidate(report: dict, model=None, *, followups: FollowUps | None = N
             draft, attempts = None, []
         else:
             keys = _followup_keys(original, [row for row in rows if not row.get("extension")], part["start"], part["end"])
-            draft, attempts = _review_proposal(part, rows, evidence, model, followups=followups, keys=keys, target=step)
+            draft, attempts = _review_proposal(part, rows, evidence, model, followups=followups, keys=keys, target=step,
+                                                documents=_figure_documents(report), data_dir=data_dir)
         if draft is None:
             reason = attempts[-1].reason if attempts else "A draft could not be grounded in local evidence."
             unresolved.append({"code": "revision_manual_review", "sentence_id": part["sentence_id"], "reason": reason})
@@ -382,7 +421,7 @@ def _whole_targets(candidate_text: str, patches: list[dict], issues: list[dict])
 
 
 def repair_candidate(report: dict, candidate: dict, whole_review: dict, model, *,
-                     followups: FollowUps | None = None) -> dict | None:
+                     followups: FollowUps | None = None, data_dir: Path | None = None) -> dict | None:
     """Try one repair per unambiguous position, sharing the sentence repair limit."""
     original = report["original_abstract"]
     if (model is None or whole_review.get("status") != "returned"
@@ -454,7 +493,8 @@ def repair_candidate(report: dict, candidate: dict, whole_review: dict, model, *
             continue
 
         check = _verify_sentence(patch["original_text"], draft.replacement, evidence, model,
-                                 followups=followups, keys=keys, target=target)
+                                 followups=followups, keys=keys, target=target,
+                                 documents=_figure_documents(report), data_dir=data_dir)
         attempt.update(status=check.status, reason=check.reason, calculations=check.calculations)
         if check.status != "passed":
             followups.checkpoint()
@@ -512,7 +552,8 @@ def _location_keys(report: dict, original: dict, revised: dict, source: dict, ta
     return _followup_keys(original, findings, source["start"], source["end"], insertion=insertion)
 
 
-def _check_changes(report: dict, original: dict, revised: dict, model, followups: FollowUps) -> list[dict]:
+def _check_changes(report: dict, original: dict, revised: dict, model, followups: FollowUps,
+                   data_dir: Path | None = None) -> list[dict]:
     known = {row["revision_id"]: row for row in report.get("verifications", []) if row.get("scope") == "sentence"
              and row.get("original_version_id") == original["version_id"] and row["status"] == "passed"}
     reusable = [known[rid] for rid in revised["revision_ids"] if rid in known]
@@ -540,7 +581,8 @@ def _check_changes(report: dict, original: dict, revised: dict, model, followups
                 finding_revision = len(report.get("finding_history", []))
                 result = _verify_sentence(source["text"], target["text"], evidence, model,
                                           followups=followups, keys=keys,
-                                          target=[revised["version_id"], source, target, finding_revision]).model_dump()
+                                          target=[revised["version_id"], source, target, finding_revision],
+                                          documents=_figure_documents(report), data_dir=data_dir).model_dump()
             checks.append({"version_id": revised["version_id"], "original": source, "revised": target, **result})
     finally:
         if index is not None:
@@ -549,10 +591,10 @@ def _check_changes(report: dict, original: dict, revised: dict, model, followups
 
 
 def verify_version(report: dict, original: dict, revised: dict, model=None, *,
-                   followups: FollowUps | None = None) -> dict:
+                   followups: FollowUps | None = None, data_dir: Path | None = None) -> dict:
     """Check this exact version, including cross-sentence constraints and all changed text."""
     followups = followups or FollowUps(report)
-    checks = _check_changes(report, original, revised, model, followups)
+    checks = _check_changes(report, original, revised, model, followups, data_dir)
     summary = {"version_id": revised["version_id"], "sentence_checks": checks, "evidence_ids": [], "issues": []}
     if model is None:
         return {**summary, "status": "manual_review", "reason": "Offline checks do not establish whole-abstract consistency."}
@@ -567,16 +609,21 @@ def verify_version(report: dict, original: dict, revised: dict, model=None, *,
     evidence.extend(followups.material(all_keys, evidence))
 
     def check(rows: list[dict]) -> AbstractCheck:
-        result = _call_step(model, "verify_abstract", {
+        packet = {
             "version_id": revised["version_id"], "original_abstract": original["text"],
             "revised_abstract": revised["text"], "revised_sentences": list(by_sentence.values()),
             "evidence": blind_evidence(rows), "unresolved_items": report.get("unresolved_items", []),
-        }, AbstractCheck, followups, [revised["version_id"], len(report.get("finding_history", []))])
+            **figure_material(rows, _figure_documents(report), data_dir),
+        }
+        result = _call_step(model, "verify_abstract", packet, AbstractCheck, followups,
+                            [revised["version_id"], len(report.get("finding_history", []))])
         validate_ids(result.evidence_ids, rows)
         for item in result.issues:
             validate_ids(item.evidence_ids, rows)
             if not item.sentence_ids or not by_sentence.keys() >= set(item.sentence_ids):
                 raise ModelUnavailable("whole-abstract verification did not supply valid sentence locations")
+        if result.status == "passed" and _only_unavailable_figures(result.evidence_ids, packet):
+            return result.model_copy(update={"status": "manual_review", "reason": "The cited figure crops were unavailable."})
         return result
 
     try:

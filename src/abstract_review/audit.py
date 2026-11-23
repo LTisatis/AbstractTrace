@@ -5,6 +5,7 @@ import re
 from base64 import b64encode
 from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
+from math import isfinite
 from pathlib import Path
 from typing import Literal
 
@@ -369,32 +370,76 @@ def _offline(claim: dict, candidates: list[dict], comparison) -> dict:
     return _pending(claim, "The offline reviewer could not determine a verdict from the located evidence.")
 
 
-def _figure_images(candidates: list[dict], documents: list[dict], data_dir: Path) -> list[dict]:
+def _figure_images(candidates: list[dict], documents: Iterable[dict], data_dir: Path) -> list[dict]:
     import pymupdf
 
-    paths = {item["doc_id"]: item["blob_path"] for item in documents}
+    from .ingest import MAX_PDF_BYTES
+
+    by_id = {doc["doc_id"]: doc for doc in documents}
+    root = data_dir.resolve()
     figures = []
-    for evidence in (row for row in candidates if row["kind"] == "figure"):
-        archive = paths.get(evidence["doc_id"])
-        if archive is None:
+    for evidence in candidates:
+        document = by_id.get(evidence.get("doc_id"), {})
+        checksum = document.get("sha256")
+        role = document.get("role")
+        locator = evidence.get("locator", {})
+        index, coords = locator.get("page_index"), locator.get("bbox")
+        if (not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+                or role in {"main", "supplement", "external"} and document["doc_id"] != f"{role}-{checksum}"
+                or type(index) is not int or index < 0
+                or not any(page.get("page_index") == index for page in document.get("pages", []))
+                or not isinstance(coords, (list, tuple)) or len(coords) != 4
+                or not all(type(value) in (int, float) and isfinite(value) for value in coords)):
             continue
-        source = (data_dir / archive).resolve()
-        if not source.is_relative_to(data_dir.resolve()):
+        relative = Path("blobs", f"{checksum}.pdf")
+        if document.get("blob_path") != relative.as_posix():
             continue
         try:
-            with pymupdf.open(source) as pdf:
-                page = pdf[evidence["locator"]["page_index"]]
+            source = (root / relative).resolve()
+            if source.parent != root / "blobs":
+                continue
+            with source.open("rb") as stream:
+                payload = stream.read(MAX_PDF_BYTES + 1)
+            if len(payload) > MAX_PDF_BYTES or hashlib.sha256(payload).hexdigest() != checksum:
+                continue
+            with pymupdf.open(stream=payload, filetype="pdf") as pdf:
+                page = pdf[index]
                 page.set_rotation(0)
-                rect = pymupdf.Rect(evidence["locator"]["bbox"])
+                rect = pymupdf.Rect(coords)
+                if rect.is_empty or not page.rect.contains(rect):
+                    continue
                 scale = min(2, 1400 / max(rect.width, rect.height))
-                image = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=rect, alpha=False)
+                image = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=rect, alpha=False, annots=False)
                 data = b64encode(image.tobytes("png")).decode("ascii")
-        except (OSError, RuntimeError, ValueError, IndexError):
+        except (OSError, RuntimeError, ValueError, IndexError, pymupdf.mupdf.FzErrorBase):
             continue
         figures.append({"evidence_id": evidence["evidence_id"], "image_url": f"data:image/png;base64,{data}"})
         if len(figures) == 2:
             break
     return figures
+
+
+def figure_material(evidence: Iterable[dict], documents: Iterable[dict], data_dir: Path | None) -> dict:
+    """Describe visual availability without promoting a pixel reading to an exact value."""
+    candidates = list({row["evidence_id"]: row for row in evidence if row.get("kind") == "figure"}.values())
+    if not candidates:
+        return {}
+    images = _figure_images(candidates, documents, data_dir) if data_dir is not None else []
+    rendered = {row["evidence_id"] for row in images}
+    sent = 0
+    observations = []
+    for row in candidates:
+        eid = row["evidence_id"]
+        if eid in rendered:
+            status, precision = "available", "approximate"
+            sent += 1
+        else:
+            status, precision = "not_sent" if sent == 2 else "missing", None
+        observations.append({"evidence_id": eid, "status": status, "numeric_precision": precision})
+    material = {"figure_observations": observations}
+    if images:
+        material["figure_images"] = images
+    return material
 
 
 def review_claim(
@@ -412,6 +457,7 @@ def review_claim(
     by_id = {}
     breadth = []
     prioritized = []
+    follow_up_evidence_ids = []
     sent_candidate_ids = []
     output = None
     stop = None
@@ -435,6 +481,7 @@ def review_claim(
         examined_scopes.extend(results["scopes"])
         remember(results)
         prioritized.extend(item["evidence_id"] for item in results["evidence"])
+        follow_up_evidence_ids.extend(item["evidence_id"] for item in results["evidence"] if item["evidence_id"] not in known)
         return bool(set(by_id) - known) or any(scope.get("complete") for scope in results["scopes"])
 
     gather([claim["support_query"], claim["counter_query"]])
@@ -480,8 +527,7 @@ def review_claim(
                     )}
         if table_context:
             material["table_context"] = table_context
-        if data_dir and any(item["kind"] == "figure" for item in candidates):
-            material["figure_images"] = _figure_images(candidates, documents, data_dir)
+        material.update(figure_material(candidates, documents, data_dir))
         try:
             output = model.call("judge", material, ScopedJudgement)
             sent_candidate_ids = list(dict.fromkeys(
@@ -550,6 +596,8 @@ def review_claim(
             for group in table_context
         ]
     finding["follow_up_performed"] = followup
+    if follow_up_evidence_ids:
+        finding["follow_up_evidence_ids"] = list(dict.fromkeys(follow_up_evidence_ids))
     if "coverage" not in finding:
         offline_ids = finding["evidence_ids"] if model is None and finding["review_status"] == "completed" else ()
         if calculation and offline_ids:
