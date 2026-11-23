@@ -50,6 +50,8 @@ def test_alignment_uses_exact_contiguous_page_records_and_refuses_ambiguous_quot
     assert score["alignment_coverage"]["value"] == 1 / 4
     assert score["quoted_passage_recall_at_k"]["1"]["value"] == 0
     assert score["quoted_passage_recall_at_k"]["3"]["value"] == 1
+    assert score["passages_within_k"]["1"] == {"numerator": 0, "denominator": 1, "value": 0.0}
+    assert score["passages_within_k"]["3"] == {"numerator": 1, "denominator": 1, "value": 1.0}
     assert score["cited_passage_recall"]["value"] == 0
 
 
@@ -88,3 +90,30 @@ def test_flat_claimbench_format_cli_runs_normal_pdf_core_then_localization_score
         "--data-dir", str(tmp_path / "state"), "bench", "run", "--engine", "offline", "--resume",
         "--input-manifest", str(manifests / "inputs.json"), "--output-dir", str(results),
     ]) == 1
+
+
+def test_layout_only_dehyphenation_keeps_original_boxes_and_does_not_join_columns(tmp_path):
+    pdf = tmp_path / "split.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page()
+        page.insert_text((60, 60), "1. Methods")
+        page.insert_text((60, 90), "The inter-")
+        page.insert_text((60, 104), "action estimate.")
+        page.insert_text((60, 130), "The mis-")
+        page.insert_text((340, 144), "aligned estimate.")
+        document.save(pdf)
+    annotations = tmp_path / "source.json"
+    annotations.write_text(json.dumps({"annotations": [{
+        "claim": "The estimate was reported.", "evidences": ["The interaction estimate.", "The misaligned estimate."],
+    }]}), encoding="utf-8")
+
+    _, gold = prepare_claimbench(
+        pdf, annotations, output_dir=tmp_path, paper_family_id="family", split="dev", dataset_version="fixture",
+    )
+    found, cross_column = gold["labels"][0]["passages"]
+    assert found["status"] == "aligned" and found["normalization"] == "line_wrap_hyphen"
+    originals = {item["evidence_id"]: item for item in parse_pdf(pdf).evidence}
+    assert [originals[anchor["evidence_id"]]["text"] for anchor in found["anchors"]] == [
+        "The inter-", "action estimate.",
+    ]
+    assert cross_column["status"] == "unmatched"

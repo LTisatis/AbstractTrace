@@ -85,3 +85,25 @@ uv run abstract-review bench prepare-claimbench --pdf paper.pdf --annotations an
 uv run abstract-review bench run --engine offline --input-manifest .review-data/claimbench/inputs.json --output-dir .review-data/claimbench/out
 uv run abstract-review bench score --dataset claimbench --predictions .review-data/claimbench/out/predictions.json --gold-manifest .review-data/claimbench/gold.json --output .review-data/claimbench/out/scores.json
 ```
+
+SciTabAlign 适配器读取作者发布的表格和单元格标注。运行器在给定表格内排列单元格，评分输出固定 K 的精确率、召回率和 F1，并单列空标注和越界坐标的覆盖情况。这个指标适用于本项目的候选排序。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
+
+```powershell
+uv run abstract-review bench prepare-scitabalign --annotations data/data.json --dataset-version author-release --output-dir .review-data/scitabalign
+uv run abstract-review bench run --dataset scitabalign --input-manifest .review-data/scitabalign/inputs.json --output-dir .review-data/scitabalign/out
+uv run abstract-review bench score --dataset scitabalign --predictions .review-data/scitabalign/out/predictions.json --gold-manifest .review-data/scitabalign/gold.json --output .review-data/scitabalign/out/scores.json
+```
+
+PDF 批跑的 `run.json` 保留每篇的版本、修订、复算和调用用量。恢复批跑时复用同配置下已保存的记录。人工复核后，可以把标注单独交给评分器。
+
+```powershell
+uv run abstract-review bench score-reviews --run-record out/run.json --gold-manifest review-gold.json --output out/review-scores.json
+```
+
+`review-gold.json` 使用 `schema_version: 1`。每条人工记录包含 `sample_id` 和 `version_id`。按评测范围提供以下数组。
+
+- `revision_checks` 使用 `revision_id` 定位修改，以布尔值记录 `corrected`、`facts_preserved` 和 `unsupported_added`。人工尚无法判定的项填 `null`。
+- `abstract_checks` 使用布尔值 `has_conflict` 记录该版本是否存在整篇冲突。
+- `table_checks` 使用 `claim_id`、`operation` 定位复算，并记录有序的 `operand_ids`、`header_ids`、`note_ids`、十进制字符串 `result` 和 `unit`。
+
+如需估算成本，可加 `--pricing prices.json`。价格文件包含 `schema_version: 1`、`pricing_id` 和按实际返回模型名索引的 `models`。每个模型用十进制字符串填写每百万词元的美元费率 `input_per_million`、`cached_input_per_million` 和 `output_per_million`。费用结果单列缺少用量或费率的请求。
