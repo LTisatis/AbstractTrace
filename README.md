@@ -86,7 +86,9 @@ uv run abstract-review bench run --dataset scifact --engine offline --input-mani
 uv run abstract-review bench score --dataset scifact --predictions .review-data/scifact/out/predictions.json --gold-manifest .review-data/scifact/gold.json --output .review-data/scifact/out/scores.json
 ```
 
-CLAIM-BENCH 适配器需要本地标注文件及其对应的 PDF。它把能在单一原页上唯一匹配的标注片段绑定到证据 ID。输出会列出无法定位和存在多个匹配的片段，单独记录对齐覆盖率。评分衡量原文片段定位。 [CLAIM-BENCH 作者数据](https://github.com/shashidharjavaji/CLAIM_BENCH)
+CLAIM-BENCH 适配器需要本地标注文件及其对应的 PDF。它把能在单一原页上唯一匹配的正文或表格片段绑定到证据 ID，并单独记录对齐覆盖率。评分衡量原文片段定位。原有的严格 `quoted_passage_recall_at_k` 继续要求前 K 条覆盖全部金标锚点。`diagnostics` 另外报告锚点召回、前 K 条可容纳片段的完整召回，以及完整证据包的召回。 [CLAIM-BENCH 作者数据](https://github.com/shashidharjavaji/CLAIM_BENCH)
+
+审稿器保留八条主候选，并可附上按同页同栏组装的正文。补查有明确页码或章节时，优先在该范围内检索段落。每个证据包最多附加 24 行、1,800 个原文字符，原始证据 ID 和页坐标可用于回链。
 
 ```powershell
 uv run abstract-review bench prepare-claimbench --pdf paper.pdf --annotations annotations.json --paper-family-id paper --split dev --dataset-version local-release --output-dir .review-data/claimbench

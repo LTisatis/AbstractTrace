@@ -196,6 +196,57 @@ def test_methods_hint_prefers_alias_in_current_document_without_claiming_complet
     assert direct["matching_count"] == 1 and direct["complete"] is False
 
 
+def test_judge_can_cite_adjacent_body_context_within_original_source():
+    claim = {**CLAIM, "support_query": "coastal signal calibration", "counter_query": "coastal signal calibration",
+             "requirements": ["measurement definition"]}
+    rows = []
+    for number in range(14):
+        text = "Routine operation was recorded." if number else "Coastal signal calibration."
+        if number == 12:
+            text = "The target was a validated pulse."
+        row = _source(f"line-{number}", text, "Methods")
+        row["locator"]["bbox"] = [20, 50 + number * 12, 190, 60 + number * 12]
+        rows.append(row)
+    rows.append({**rows[-1], "doc_id": "other", "evidence_id": "out-of-scope"})
+    model = Model(_judgement(
+        verdict="supported", missing=[],
+        observations=[{"requirement": "measurement definition", "status": "found", "evidence_ids": ["line-12"]}],
+        groups=[{"role": "support", "evidence_ids": ["line-12"]}],
+    ))
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(claim, index, model)
+    assert len(model.calls) == 1
+    packet, = model.calls[0]["body_context"]
+    assert packet["doc_id"] == "paper" and packet["page_index"] == 0
+    assert [item[0] for item in packet["lines"]] == [f"line-{number}" for number in range(14)]
+    assert ["line-12", "The target was a validated pulse."] in packet["lines"]
+    assert "line-12" not in finding["candidate_ids"]
+    assert "line-12" in finding["sent_candidate_ids"]
+    assert "out-of-scope" not in finding["sent_candidate_ids"]
+    assert finding["verdict"] == "supported"
+
+
+def test_ranked_body_context_reserves_both_query_cores_and_obeys_page_scope():
+    rows = []
+    for page, topic in enumerate(("coastal calibration", "thermal saturation")):
+        for number in range(26):
+            row = _source(f"p{page}-{number}", topic if number == 8 else f"Routine observation {number}.",
+                          page=page)
+            row["locator"]["bbox"] = [20, 50 + number * 12, 190, 60 + number * 12]
+            rows.append(row)
+    with closing(EvidenceIndex(rows)) as index:
+        ranges = index.ranked_body_context(["coastal calibration", "thermal saturation"])
+        supported, counter = index.pack_body_context(ranges, [])
+        restricted = index.ranked_body_context(["thermal saturation", "coastal calibration"], page_index=1)
+        restricted_groups = index.pack_body_context(restricted, [])
+    assert all(eid.startswith("p0-") for eid in supported["evidence_ids"])
+    assert all(eid.startswith("p1-") for eid in counter["evidence_ids"])
+    assert "p0-8" in supported["new_evidence_ids"]
+    assert "p1-8" in counter["new_evidence_ids"]
+    assert len(supported["new_evidence_ids"] + counter["new_evidence_ids"]) <= 24
+    assert restricted_groups and all(eid.startswith("p1-") for group in restricted_groups for eid in group["evidence_ids"])
+
+
 def test_completing_named_section_can_mark_requirement_searched_missing():
     methods = _source("methods", "We visited known sites.", "2. Methods", 1)
     index = EvidenceIndex([_source("results", "Biodiversity changed."), methods])

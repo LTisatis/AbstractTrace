@@ -83,6 +83,7 @@ def test_flat_claimbench_format_cli_runs_normal_pdf_core_then_localization_score
     ]) == 0
     score = json.loads(score_file.read_text(encoding="utf-8"))
     assert score["cited_passage_recall"]["value"] == 1
+    assert score["diagnostics"]["sent_packet_passage_recall"]["value"] == 1
     assert "accuracy" not in score
 
     pdf.write_bytes(pdf.read_bytes() + b"\n% changed after annotation preparation\n")
@@ -90,6 +91,65 @@ def test_flat_claimbench_format_cli_runs_normal_pdf_core_then_localization_score
         "--data-dir", str(tmp_path / "state"), "bench", "run", "--engine", "offline", "--resume",
         "--input-manifest", str(manifests / "inputs.json"), "--output-dir", str(results),
     ]) == 1
+
+
+def test_retrieval_diagnostics_distinguish_rank_cutoff_full_packet_and_missing_traces():
+    large = [f"long-{i}" for i in range(9)]
+    groups = {
+        "oversize": large, "complete": ["s1", "s2"], "partial": ["p1", "p2", "p3"],
+        "untraced": ["u1"], "no-prediction": ["m1"],
+    }
+    gold = {"schema_version": 1, "dataset": "claimbench-quoted-passages", "labels": [
+        {"sample_id": "paper", "claim_id": claim_id,
+         "passages": [{"status": "aligned", "evidence_ids": ids}]
+         + ([{"status": "unmatched", "evidence_ids": []}] if claim_id == "complete" else [])}
+        for claim_id, ids in groups.items()
+    ]}
+    traces = {"oversize": ["noise", *large], "complete": ["noise", "s1", "s2"], "partial": ["p1"]}
+    predictions = {"schema_version": 1, "predictions": [
+        {"sample_id": "paper", "claim_id": claim_id, "review_status": "pending", "verdict": None,
+         "evidence_ids": [], "candidate_ids": ids} for claim_id, ids in traces.items()
+    ] + [{"sample_id": "paper", "claim_id": "untraced", "review_status": "pending", "verdict": None,
+          "evidence_ids": ["u1"]}]}
+
+    score = score_claimbench(predictions, gold)
+    assert score["alignment"] == {"aligned": 5, "unmatched": 1, "ambiguous": 0}
+    assert score["cited_passage_recall"] == {"numerator": 1, "denominator": 5, "value": 0.2}
+    assert score["quoted_passage_recall_at_k"] == dict.fromkeys(("1", "3", "5", "8"))
+    assert score["passages_within_k"]["8"] == {"numerator": 4, "denominator": 5, "value": 0.8}
+    diagnostics = score["diagnostics"]
+    assert diagnostics["candidate_trace_coverage"] == {"numerator": 3, "denominator": 5, "value": 0.6}
+    assert diagnostics["candidate_anchor_recall_at_k"]["8"] == {"numerator": 10, "denominator": 14, "value": 10 / 14}
+    assert diagnostics["eligible_passage_recall_at_k"]["1"] == {"numerator": 0, "denominator": 0, "value": None}
+    assert diagnostics["eligible_passage_recall_at_k"]["8"] == {"numerator": 1, "denominator": 2, "value": 0.5}
+    assert diagnostics["sent_packet_passage_recall"] == {"numerator": 2, "denominator": 3, "value": 2 / 3}
+    assert diagnostics["sent_packet_anchor_recall"] == {"numerator": 12, "denominator": 14, "value": 12 / 14}
+
+    cases = {(row["claim_id"], row["passage_number"]): row["diagnostics"] for row in score["cases"]}
+    assert cases["oversize", 1] == {
+        "candidate_count": 10, "matched_anchor_count_at_k": {"1": 0, "3": 2, "5": 4, "8": 7},
+        "eligible_at_k": dict.fromkeys(("1", "3", "5", "8"), False),
+        "sent_packet_matched_anchor_count": 9, "sent_packet_hit": True,
+    }
+    assert cases["complete", 2]["eligible_at_k"] is None
+    for key in ("untraced", "no-prediction"):
+        assert cases[key, 1]["candidate_count"] is None
+        assert cases[key, 1]["sent_packet_hit"] is None
+
+
+def test_empty_candidate_trace_counts_as_a_known_miss():
+    predictions = {"schema_version": 1, "predictions": [
+        {"sample_id": "paper", "claim_id": "1", "review_status": "pending", "verdict": None,
+         "evidence_ids": [], "candidate_ids": []},
+    ]}
+    gold = {"schema_version": 1, "dataset": "claimbench-quoted-passages", "labels": [
+        {"sample_id": "paper", "claim_id": "1", "passages": [{"status": "aligned", "evidence_ids": ["e1"]}]},
+    ]}
+    score = score_claimbench(predictions, gold)
+    diagnostics = score["diagnostics"]
+    assert diagnostics["candidate_trace_coverage"] == {"numerator": 1, "denominator": 1, "value": 1.0}
+    assert diagnostics["sent_packet_passage_recall"] == {"numerator": 0, "denominator": 1, "value": 0.0}
+    assert score["cases"][0]["diagnostics"]["candidate_count"] == 0
 
 
 def test_layout_only_dehyphenation_keeps_original_boxes_and_does_not_join_columns(tmp_path):

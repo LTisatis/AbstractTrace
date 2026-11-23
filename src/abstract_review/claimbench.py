@@ -5,9 +5,12 @@ import json
 import os
 import re
 import unicodedata
+from collections import defaultdict
 from pathlib import Path
 
-from .ingest import PARSER_VERSION, parse_pdf
+import pymupdf
+
+from .ingest import MAX_PDF_BYTES, PARSER_VERSION, parse_pdf
 from .scoring import _DEFAULT_RANK_CUTOFFS, _ordered_ids, _parse_predictions, _ratio
 
 
@@ -107,6 +110,92 @@ def _align_passage(excerpt: str, plain: dict, joined: dict) -> dict:
     return result
 
 
+def _word_anchor(word: tuple, candidates: list[tuple[pymupdf.Rect, dict]]) -> dict | None:
+    box = pymupdf.Rect(word[:4])
+    center = (box.tl + box.br) / 2
+    area = box.get_area()
+    if not area:
+        return None
+    # A glyph can extend a fraction of a point beyond a cell border.
+    covered = [item for bbox, item in candidates if center in bbox and (bbox & box).get_area() >= 0.95 * area]
+    return covered[0] if len(covered) == 1 else None
+
+
+def _table_reading_ranges(pdf: Path, evidence: list[dict], pdf_sha256: str) -> list[tuple[int, list[str], list[dict | None]]]:
+    by_page = defaultdict(list)
+    tables = defaultdict(list)
+    for item in evidence:
+        if item["kind"] not in {"body_text", "table_cell"}:
+            continue
+        locator = item["locator"]
+        page_index = locator["page_index"]
+        by_page[page_index].append(item)
+        if item["kind"] == "table_cell":
+            tables[page_index, locator["table_index"]].append(item)
+    if not tables:
+        return []
+
+    with pdf.open("rb") as source:
+        pdf_bytes = source.read(MAX_PDF_BYTES + 1)
+    if hashlib.sha256(pdf_bytes).hexdigest() != pdf_sha256:
+        raise ValueError(f"{pdf.name}: PDF changed during passage alignment")
+
+    ranges = []
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as native:
+        for (page_index, table_index), cells in tables.items():
+            page = native[page_index]
+            if page.rotation:
+                page.set_rotation(0)
+            items = by_page[page_index]
+            captions = [item for item in items if item["kind"] == "body_text"
+                        and item["locator"].get("table_index") == table_index]
+            column = pymupdf.Rect(cells[0]["locator"]["bbox"])
+            for item in [*cells[1:], *captions]:
+                column |= pymupdf.Rect(item["locator"]["bbox"])
+            margin = max((pymupdf.Rect(item["locator"]["bbox"]).height / 2 for item in captions), default=0)
+            clip = pymupdf.Rect(column.x0 - margin, 0, column.x1 + margin, page.rect.height)
+
+            by_token = defaultdict(list)
+            for item in items:
+                bbox = pymupdf.Rect(item["locator"]["bbox"])
+                for token in set(_normalized(item["text"]).split()):
+                    by_token[token].append((bbox, item))
+            full_words = {word[:5] for word in page.get_text("words")}
+            tokens, anchors = [], []
+            # Sort within the column. Reading the whole page can interleave adjacent columns.
+            for word in page.get_text("words", sort=True, clip=clip):
+                for token in _normalized(word[4]).split():
+                    tokens.append(token)
+                    anchors.append(_word_anchor(word, by_token[token]) if word[:5] in full_words else None)
+            ranges.append((table_index, tokens, anchors))
+    return ranges
+
+
+def _align_table_passage(excerpt: str, ranges: list[tuple[int, list[str], list[dict | None]]]) -> dict:
+    target = _normalized(excerpt).split()
+    found = None
+    for table_index, tokens, anchors in ranges:
+        for start, token in enumerate(tokens):
+            end = start + len(target)
+            if token != target[0] or tokens[start:end] != target:
+                continue
+            matched = anchors[start:end]
+            if (any(item is None for item in matched)
+                    or not any(item["kind"] == "table_cell" for item in matched)
+                    or any(item["locator"].get("table_index", table_index) != table_index for item in matched)):
+                continue
+            if found is not None:
+                return {"status": "ambiguous", "evidence_ids": [], "anchors": []}
+            records = {item["evidence_id"]: item for item in matched}
+            found = {
+                "status": "aligned", "normalization": "table_layout_exact", "evidence_ids": list(records),
+                "anchors": [{"evidence_id": eid, "doc_id": item["doc_id"],
+                             "page_index": item["locator"]["page_index"], "bbox": item["locator"]["bbox"]}
+                            for eid, item in records.items()],
+            }
+    return found or {"status": "unmatched", "evidence_ids": [], "anchors": []}
+
+
 def prepare_claimbench(
     pdf: Path, annotations: Path, *, output_dir: Path, paper_family_id: str, split: str, dataset_version: str,
 ) -> tuple[dict, dict]:
@@ -137,10 +226,51 @@ def prepare_claimbench(
          "passages": [_align_passage(excerpt, pages, joined) for excerpt in excerpts]}
         for claim_id, _, excerpts in claims
     ]
+    if any(passage["status"] == "unmatched" for label in labels for passage in label["passages"]):
+        table_ranges = _table_reading_ranges(pdf, document.evidence, pdf_sha256)
+        for (_, _, excerpts), label in zip(claims, labels):
+            for index, excerpt in enumerate(excerpts):
+                if label["passages"][index]["status"] == "unmatched":
+                    label["passages"][index] = _align_table_passage(excerpt, table_ranges)
     return {"schema_version": 1, "samples": samples}, {
         "schema_version": 1, "dataset": _DATASET, "dataset_version": dataset_version.strip(),
         "parser_version": PARSER_VERSION, "pdf_sha256": pdf_sha256,
         "annotations_sha256": hashlib.sha256(content).hexdigest(), "labels": labels,
+    }
+
+
+def _passage_diagnostics(ids: set[str], trace: tuple[str, ...] | None) -> dict:
+    known = bool(ids) and trace is not None
+    packet_matches = len(ids.intersection(trace)) if known else None
+    return {
+        "candidate_count": len(trace) if trace is not None else None,
+        "matched_anchor_count_at_k": {
+            str(k): len(ids.intersection(trace[:k])) for k in _DEFAULT_RANK_CUTOFFS
+        } if known else None,
+        "eligible_at_k": {str(k): len(ids) <= k for k in _DEFAULT_RANK_CUTOFFS} if ids else None,
+        "sent_packet_matched_anchor_count": packet_matches,
+        "sent_packet_hit": packet_matches == len(ids) if known else None,
+    }
+
+
+def _retrieval_diagnostics(cases: list[dict], aligned_count: int) -> dict:
+    traced = [case for case in cases if case["diagnostics"]["sent_packet_hit"] is not None]
+    anchor_count = sum(case["evidence_count"] for case in traced)
+    anchor_at_k = {}
+    eligible_at_k = {}
+    for k in map(str, _DEFAULT_RANK_CUTOFFS):
+        anchor_hits = sum(case["diagnostics"]["matched_anchor_count_at_k"][k] for case in traced)
+        eligible = [case for case in traced if case["diagnostics"]["eligible_at_k"][k]]
+        anchor_at_k[k] = _ratio(anchor_hits, anchor_count)
+        eligible_at_k[k] = _ratio(sum(case["ranked_hit"][k] for case in eligible), len(eligible))
+    return {
+        "candidate_trace_coverage": _ratio(len(traced), aligned_count),
+        "candidate_anchor_recall_at_k": anchor_at_k,
+        "eligible_passage_recall_at_k": eligible_at_k,
+        "sent_packet_passage_recall": _ratio(sum(case["diagnostics"]["sent_packet_hit"] for case in traced), len(traced)),
+        "sent_packet_anchor_recall": _ratio(
+            sum(case["diagnostics"]["sent_packet_matched_anchor_count"] for case in traced), anchor_count,
+        ),
     }
 
 
@@ -190,6 +320,7 @@ def score_claimbench(predictions: object, gold: object) -> dict:
             cases.append({
                 "sample_id": key[0], "claim_id": key[1], "passage_number": number, "alignment_status": status,
                 "evidence_ids": sorted(ids), "evidence_count": len(ids), "citation_hit": cited_hit, "ranked_hit": ranked,
+                "diagnostics": _passage_diagnostics(ids, prediction.candidate_ids if prediction else None),
             })
     if predicted.keys() - seen:
         raise ValueError("some predictions have no CLAIM-BENCH gold claim")
@@ -201,5 +332,6 @@ def score_claimbench(predictions: object, gold: object) -> dict:
             str(k): None if rank_unavailable else _ratio(hits, totals["aligned"]) for k, hits in ranked_hits.items()
         },
         "passages_within_k": {str(k): _ratio(count, totals["aligned"]) for k, count in within_cutoff.items()},
+        "diagnostics": _retrieval_diagnostics(cases, totals["aligned"]),
         "cases": cases,
     }
