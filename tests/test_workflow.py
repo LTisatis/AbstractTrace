@@ -4,9 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from abstract_review.audit import refresh_compound_findings
+from abstract_review.followups import FollowUps
 from abstract_review.models import ModelPaused, ModelUnavailable, ResponsesModel, SmokeResult
 from abstract_review.reporting import render_markdown
 from abstract_review.review import PdfReviewInput, ReviewService
+from abstract_review.revisions import build_candidate, new_version
+from abstract_review.workflow import _refresh_findings
 
 
 SAMPLE = Path(__file__).resolve().parents[1] / "examples" / "d02" / "make_sample.py"
@@ -30,9 +34,14 @@ def test_numeric_refutation_suggested_edit_and_selected_version(tmp_path):
     evidence = {item["evidence_id"]: item for item in candidate["evidence"]}
     assert all(evidence[eid]["locator"]["page_index"] == 1 for eid in calculation["evidence_ids"])
     assert candidate["reviewed_abstract"]["text"] == RIGHT
-    assert candidate["abstract_review"]["sentence_checks"][0]["status"] == "passed"
+    sentence_check, = candidate["abstract_review"]["sentence_checks"]
+    assert sentence_check["status"] == "passed"
+    revised_calculation, = sentence_check["calculations"]
+    assert (revised_calculation["verification"], revised_calculation["result"]) == ("matched", "8")
+    assert revised_calculation["evidence_ids"] == calculation["evidence_ids"]
     assert candidate["abstract_review"]["status"] == "manual_review"
-    assert RIGHT in render_markdown(candidate)
+    markdown = render_markdown(candidate)
+    assert RIGHT in markdown and "## Revised numerical verification" in markdown
 
     resumed_service = ReviewService(state)
     revision_ids = tuple(candidate["reviewed_abstract"]["revision_ids"])
@@ -45,6 +54,16 @@ def test_numeric_refutation_suggested_edit_and_selected_version(tmp_path):
     assert resumed_service.export(run["run_id"], run["report_version_id"]) == candidate
     with pytest.raises(ValueError, match="stale base version"):
         resumed_service.submit_selection(run["run_id"], run["report_version_id"], "selection-2", (), WRONG)
+
+    manual = RIGHT.replace("8 percentage points", "12 percentage points")
+    amended = resumed_service.submit_selection(run["run_id"], selected["report_version_id"], "selection-3",
+                                               edited_text=manual)
+    manual_report = resumed_service.export(run["run_id"], amended["report_version_id"])
+    assert manual_report["reviewed_abstract"]["text"] == manual
+    manual_check, = manual_report["abstract_review"]["sentence_checks"]
+    assert manual_check["status"] == "returned"
+    assert manual_check["calculations"][0]["verification"] == "mismatch"
+    assert resumed_service.export(run["run_id"], selected["report_version_id"]) == confirmed
 
 
 def test_unconfigured_online_run_keeps_report_and_idempotent_budget_extension(tmp_path, monkeypatch):
@@ -120,3 +139,61 @@ def test_late_model_pause_resumes_without_repeating_completed_sentence_check(tmp
     assert result["run_status"] == "report_ready"
     assert result["report_version_id"] == selected["report_version_id"]
     assert calls == ["verify_abstract"]
+
+
+def test_verification_supplement_updates_saved_compound_verdict(tmp_path, monkeypatch):
+    text = "Accuracy increased on dataset A and on dataset B."
+    group = {"compound_id": "group", "operator": "and", "member_claim_ids": ["a", "b"],
+             "sentence_id": "s1", "text": text, "start": 0, "end": len(text)}
+    claims = [{"claim_id": key, "sentence_id": "s1", "text": key.upper(), "compound": group,
+               "proposition": f"Accuracy increased on dataset {key.upper()}.",
+               "start": text.index(key.upper(), 1), "end": text.index(key.upper(), 1) + 1} for key in ("a", "b")]
+    evidence = [{"evidence_id": "new", "doc_id": "paper", "kind": "body_text",
+                 "text": "The updated analysis shows an increase on dataset B.", "locator": {"page_index": 1}}]
+    report = {
+        "original_abstract": {"version_id": "original"}, "claims": claims, "evidence": evidence,
+        "documents": [], "calculations": [], "unresolved_items": [], "revisions": [],
+        "findings": [
+            {**claim, "review_status": "completed", "verdict": verdict, "evidence_ids": [claim["claim_id"]]}
+            for claim, verdict in zip(claims, ("supported", "refuted"), strict=True)
+        ],
+    }
+    followups = FollowUps(report)
+    followups.rounds["b"] = {"stage": "verify_sentence", "evidence_ids": ["new"]}
+    refresh_compound_findings(report)
+    assert report["compound_findings"][0]["verdict"] == "refuted"
+
+    def recheck(claim, index, model, **kwargs):
+        assert claim["claim_id"] == "b" and kwargs["additional_evidence"] == evidence
+        return {**claim, "review_status": "completed", "verdict": "supported", "evidence_ids": ["new"]}, None
+
+    monkeypatch.setattr("abstract_review.workflow.review_claim", recheck)
+    assert _refresh_findings(report, object(), followups, None, tmp_path)
+    assert report["compound_findings"][0]["verdict"] == "supported"
+    assert "new" in report["compound_findings"][0]["evidence_ids"]
+
+
+def test_refuted_alternative_does_not_trigger_rewriting_a_supported_disjunction():
+    text = "Accuracy increased on dataset A or on dataset B."
+    group = {"compound_id": "group", "operator": "or", "member_claim_ids": ["a", "b"],
+             "sentence_id": "s1", "text": text, "start": 0, "end": len(text)}
+    claims = [{"claim_id": key, "sentence_id": "s1", "text": key.upper(), "compound": group,
+               "proposition": f"Accuracy increased on dataset {key.upper()}.",
+               "start": text.index(key.upper(), 1), "end": text.index(key.upper(), 1) + 1} for key in ("a", "b")]
+    report = {
+        "original_abstract": new_version(text, "pasted", "", []), "claims": claims,
+        "findings": [
+            {**claim, "review_status": "completed", "verdict": verdict, "evidence_ids": [claim["claim_id"]]}
+            for claim, verdict in zip(claims, ("supported", "refuted"), strict=True)
+        ],
+        "evidence": [],
+    }
+
+    class UnexpectedModelCall:
+        def call(self, *_args):
+            pytest.fail("an already supported disjunction does not require an edit")
+
+    refresh_compound_findings(report)
+    assert report["compound_findings"][0]["verdict"] == "supported"
+    assert build_candidate(report, UnexpectedModelCall()) is None
+    assert report["revisions"] == []

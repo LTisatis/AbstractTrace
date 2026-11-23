@@ -6,7 +6,7 @@ import time
 from base64 import b64encode
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 
 
 class Schema(BaseModel):
@@ -23,8 +23,15 @@ class ExtractedClaim(Schema):
     counter_query: str
 
 
+class ExtractedCompound(Schema):
+    sentence_id: str
+    operator: Literal["and", "or"]
+    claim_indexes: list[StrictInt]
+
+
 class Extraction(Schema):
     claims: list[ExtractedClaim]
+    compounds: list[ExtractedCompound] = Field(default_factory=list)
 
 
 class EvidenceGroup(Schema):
@@ -58,7 +65,7 @@ class ModelPaused(ModelUnavailable):
 
 
 ROLE_PROMPTS = {
-    "extract": "Extract atomic verifiable claims from numbered abstract sentences. Quote exact substrings, preserve qualifications and quantifiers, and provide concise support and counter-evidence queries. Omit no verifiable material claim.",
+    "extract": "Extract atomic verifiable claims from numbered abstract sentences. Quote exact substrings, preserve qualifications and quantifiers, and provide concise support and counter-evidence queries. Omit no verifiable material claim. For a compound assertion, emit its independently verifiable operands with distinct, non-overlapping exact quotes and self-contained propositions preserving shared conditions. In compounds, give the source sentence ID, operator and/or, and zero-based indexes into claims. Use or only for an actual disjunction in the author's statement, not a list within one subject, contrast, alias, conditional, or a comparison with two operands. Do not flatten mixed or ambiguous logical structure. Each compound must cover the full asserted relationship in its sentence.",
     "judge": "Judge the claim against the supplied original paper evidence. Compare study conditions and units. Cite only supplied IDs. Distinguish refutation, evidence insufficiency after checks, and pending when potentially decisive evidence is not checked. Treat visually estimated or OCR-uncertain values as approximate. Identify conflicting evidence and bounded follow-up queries. Any calculation supplied is authoritative for the specified operands only.",
     "revise": "Propose a minimal revision of the supplied sentence based on cited paper evidence. Preserve supported facts and conditions, identify substantiated semantic changes, and leave unsupported changes unresolved.",
     "verify_sentence": "Independently verify the exact revised sentence against the paper evidence, including counterevidence and limitations. Check for lost constraints and new factual claims. Cite only supplied IDs. If a missing fact would change the result, request at most two targeted checks of named sources and identify the missing requirement.",

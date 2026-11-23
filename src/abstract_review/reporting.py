@@ -36,8 +36,39 @@ def render_markdown(report: dict) -> str:
     for item in report["findings"]:
         label = item.get("verdict") or item["review_status"]
         ids = ", ".join(f"`{eid}`" for eid in item["evidence_ids"])
-        lines.extend([f"- **{label}** · {_plain(item['text'])}",
+        text = item.get("proposition", item["text"]) if item.get("compound") else item["text"]
+        lines.extend([f"- **{label}** · {_plain(text)}",
                       f"  {_plain(item['reason'])}", f"  {ids}" if ids else ""])
+    if groups := report.get("compound_findings"):
+        lines.extend(["", "## Compound findings", ""])
+        for group in groups:
+            label = group.get("verdict") or group["review_status"]
+            operator = group["operator"].upper()
+            lines.append(f"- **{label}** · {operator} · {_plain(group['text'])}")
+            if reason := group.get("reason"):
+                lines.append(f"  {_plain(reason)}")
+            if ids := group.get("evidence_ids"):
+                lines.append("  " + ", ".join(f"`{eid}`" for eid in ids))
+
+    checked_numbers = [check for check in report["abstract_review"].get("sentence_checks", ())
+                       if check.get("calculations")]
+    if checked_numbers:
+        lines.extend(["", "## Revised numerical verification", ""])
+        for check in checked_numbers:
+            lines.append(f"- **{_plain(check['status'])}** · {_plain(check['revised']['text'] or check['original']['text'])}")
+            for calculation in check["calculations"]:
+                values = [calculation["verification"]]
+                if calculation.get("stated") is not None:
+                    values.append(f"stated {calculation['stated']}")
+                if calculation.get("result") is not None:
+                    values.append(f"{calculation['formula']} = {calculation['result']} {calculation['unit']}")
+                if calculation.get("reason"):
+                    values.append(calculation["reason"])
+                lines.append("  - " + " · ".join(_plain(value) for value in values))
+                ids = list(dict.fromkeys([*calculation.get("evidence_ids", ()),
+                                          *calculation.get("scope_evidence_ids", ())]))
+                if ids:
+                    lines.append("    " + ", ".join(f"`{eid}`" for eid in ids))
     lines.extend(["", "## Evidence locations", ""])
     docs = {doc["doc_id"]: doc for doc in display_documents(report)}
     for item in display_evidence(report):

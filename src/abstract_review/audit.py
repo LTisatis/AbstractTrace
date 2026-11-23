@@ -11,6 +11,7 @@ from typing import Literal
 from pydantic import Field
 
 from .calculations import comparison_for_claim
+from .compound import aggregate_compound_findings, attach_compound, offline_compound_parts, requires_whole_sentence
 from .evidence import EvidenceIndex
 from .models import Extraction, Judgement, ModelPaused, ModelUnavailable, Schema
 
@@ -191,28 +192,112 @@ def sentences(text: str) -> list[dict]:
     return parts
 
 
+def _anchor_claim(part: dict, claim: dict, offset: int | None = None, *, prefer_token: bool = False) -> dict:
+    quote = claim["quote"]
+    if offset is None:
+        offset = part["text"].find(quote)
+        if prefer_token and re.fullmatch(r"[A-Za-z0-9_]+", quote):
+            token = re.search(rf"(?<![A-Za-z0-9_]){re.escape(quote)}(?![A-Za-z0-9_])", part["text"])
+            offset = token.start() if token else -1
+    if not quote.strip() or offset < 0 or part["text"][offset:offset + len(quote)] != quote:
+        raise ModelUnavailable("claim extraction returned an invalid abstract anchor")
+    start = part["start"] + offset
+    claim_id = hashlib.sha256(f"{start}:{quote}:{claim['proposition']}".encode()).hexdigest()[:20]
+    return {**claim, "claim_id": claim_id, "start": start, "end": start + len(quote),
+            "sentence_start": part["start"], "sentence_end": part["end"], "text": quote}
+
+
+def _plain_claim(part: dict, offset: int = 0, end: int | None = None, proposition: str | None = None) -> dict:
+    quote = part["text"][offset:end]
+    text = proposition or quote
+    whole = requires_whole_sentence(text)
+    kind = "quantitative" if re.search(r"\d+(?:[.,]\d+)?\s*%|百分点|percentage points?", text, re.I) else "result"
+    claim = {"sentence_id": part["sentence_id"], "quote": quote, "proposition": text,
+             "kind": "scope" if whole else kind, "requirements": ["observed result and scope"],
+             "support_query": text, "counter_query": "limitation exception subgroup " + text}
+    if whole:
+        claim["logic_review_required"] = True
+    return _anchor_claim(part, claim, offset)
+
+
 def extract_claims(text: str, model=None) -> list[dict]:
     parts = sentences(text)
     if model is None:
-        extracted = [{"sentence_id": part["sentence_id"], "quote": part["text"], "proposition": part["text"],
-                      "kind": "quantitative" if re.search(r"\d+(?:[.,]\d+)?\s*%|百分点|percentage points?", part["text"], re.I) else "result",
-                      "requirements": ["observed result and scope"], "support_query": part["text"],
-                      "counter_query": "limitation exception subgroup " + part["text"]} for part in parts]
-    else:
-        parsed = model.call("extract", {"sentences": parts}, Extraction)
-        extracted = [claim.model_dump() for claim in parsed.claims]
+        results = []
+        for part in parts:
+            split = offline_compound_parts(part["text"])
+            if split is None:
+                results.append(_plain_claim(part))
+                continue
+            operands, operator = split
+            atoms = [_plain_claim(part, start, end, proposition) for start, end, proposition in operands]
+            attach_compound(part, atoms, operator)
+            results.extend(atoms if all("compound" in atom for atom in atoms) else [_plain_claim(part)])
+        return results
+
+    parsed = model.call("extract", {"sentences": parts}, Extraction)
     by_sentence = {part["sentence_id"]: part for part in parts}
-    results = {}
-    for claim in extracted:
+    groups = getattr(parsed, "compounds", [])
+    compound_indexes = {index for group in groups for index in group.claim_indexes}
+    anchored = []
+    whole_sentences = {part["sentence_id"] for part in parts if requires_whole_sentence(part["text"])}
+    for index, row in enumerate(parsed.claims):
+        claim = row.model_dump()
         part = by_sentence.get(claim["sentence_id"])
-        quote = claim["quote"]
-        if part is None or not quote.strip() or quote not in part["text"]:
+        if part is None:
             raise ModelUnavailable("claim extraction returned an invalid abstract anchor")
-        start = part["start"] + part["text"].index(quote)
-        claim_id = hashlib.sha256(f"{start}:{quote}:{claim['proposition']}".encode()).hexdigest()[:20]
-        results[claim_id] = {**claim, "claim_id": claim_id, "start": start, "end": start + len(quote),
-                             "sentence_start": part["start"], "sentence_end": part["end"], "text": quote}
-    return list(results.values())
+        try:
+            anchored.append(_anchor_claim(part, claim, prefer_token=index in compound_indexes))
+        except ModelUnavailable:
+            if index not in compound_indexes:
+                raise
+            whole_sentences.add(part["sentence_id"])
+            anchored.append(_plain_claim(part))
+    for group in groups:
+        sentence_id, operands = group.sentence_id, group.claim_indexes
+        part = by_sentence.get(sentence_id)
+        referenced = {anchored[i]["sentence_id"] for i in operands if 0 <= i < len(anchored)}
+        if part is None:
+            whole_sentences.update(referenced)
+            continue
+        if sentence_id in whole_sentences:
+            continue
+        scoped = {i for i, atom in enumerate(anchored) if (
+            atom["sentence_id"] == sentence_id and atom["kind"] not in {"background", "purpose"}
+        )}
+        if len(operands) != len(scoped) or set(operands) != scoped:
+            whole_sentences.update({sentence_id, *referenced})
+            continue
+        atoms = [anchored[i] for i in operands]
+        present = {atom["compound"]["operator"] for atom in atoms if "compound" in atom}
+        if not present:
+            attach_compound(part, atoms, group.operator)
+        if not all(atom.get("compound", {}).get("operator") == group.operator for atom in atoms):
+            whole_sentences.add(sentence_id)
+
+    result = {}
+    for atom in anchored:
+        part = by_sentence[atom["sentence_id"]]
+        if atom["sentence_id"] in whole_sentences:
+            atom = _plain_claim(part)
+            atom["logic_review_required"] = True
+        result[atom["claim_id"]] = atom
+    missing = whole_sentences - {atom["sentence_id"] for atom in anchored}
+    for part in parts:
+        if part["sentence_id"] in missing:
+            atom = _plain_claim(part)
+            atom["logic_review_required"] = True
+            result[atom["claim_id"]] = atom
+    return list(result.values())
+
+
+def refresh_compound_findings(report: dict) -> None:
+    compounds = aggregate_compound_findings(report.get("claims", []), report.get("findings", []))
+    if compounds:
+        version = report.get("original_abstract", {}).get("version_id")
+        report["compound_findings"] = [{**group, "original_version_id": version} for group in compounds]
+    else:
+        report.pop("compound_findings", None)
 
 
 def supplied_claims(source: tuple[tuple[str, str], ...]) -> list[dict]:
@@ -247,6 +332,8 @@ def _pending(claim: dict, reason: str, *, status: str = "pending") -> dict:
 
 
 def _offline(claim: dict, candidates: list[dict], comparison) -> dict:
+    if claim.get("logic_review_required"):
+        return _pending(claim, "This logical relationship needs a scope-aware review.")
     if claim["kind"] in {"background", "purpose"}:
         return _pending(claim, "This sentence is outside original-paper result verification.")
     if comparison is not None:
@@ -350,7 +437,7 @@ def review_claim(
         interleaved = (eid for tier in range(8) for column in breadth for eid in column[tier:tier + 1])
         balanced_ids = list(dict.fromkeys((*prioritized, *interleaved)))
         candidates = [by_id[eid] for eid in balanced_ids[:8]]
-        comparison = comparison_for_claim(claim["proposition"], candidates)
+        comparison = None if claim.get("logic_review_required") else comparison_for_claim(claim["proposition"], candidates)
         calculation = comparison[0] if comparison else None
         if model is None:
             finding = _offline(claim, candidates, comparison)
@@ -449,6 +536,7 @@ def audit_version(
     version = report["reviewed_abstract"]
     if "claims" not in report:
         report["claims"] = extract_claims(version["text"], model)
+        refresh_compound_findings(report)
         commit()
     index = EvidenceIndex(report["evidence"], embedder=embedder)
     followups = report.setdefault("claim_followups", {})
@@ -472,6 +560,7 @@ def audit_version(
             report["calculations"] = [row for row in report["calculations"] if row["claim_id"] != claim_id]
             if calculation is not None:
                 report["calculations"].append({**calculation, "claim_id": claim_id})
+            refresh_compound_findings(report)
             commit()
     finally:
         close = getattr(index, "close", None)
@@ -480,3 +569,4 @@ def audit_version(
     report["unresolved_items"] = [{"claim_id": row["claim_id"], "reason": row["reason"]}
                                   for row in report["findings"]
                                   if row["review_status"] != "completed" or row["verdict"] == "insufficient"]
+    refresh_compound_findings(report)

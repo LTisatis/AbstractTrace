@@ -1,7 +1,9 @@
 import hashlib
+import runpy
 import sqlite3
 import time
 from contextlib import closing
+from pathlib import Path
 from threading import Event
 
 import pymupdf
@@ -13,6 +15,9 @@ from abstract_review.models import ModelUnavailable
 from abstract_review.review import PdfReviewInput, ReviewService
 from abstract_review.run_store import RunStore
 from abstract_review.web import create_app
+
+
+SAMPLE = Path(__file__).resolve().parents[1] / "examples" / "d02" / "make_sample.py"
 
 
 def _pdf_bytes():
@@ -154,6 +159,30 @@ def test_version_bound_manual_edit_and_stale_form(client, monkeypatch):
     finally:
         release.set()
     assert wait_for_run(client, run_id)["report_version_id"] == version
+
+
+def test_revised_numeric_check_is_displayed_for_the_requested_version(tmp_path, client):
+    source = tmp_path / "numeric.pdf"
+    runpy.run_path(str(SAMPLE))["make_paper"](source)
+    upload = client.post("/api/v1/reviews", files={"pdf": (source.name, source.read_bytes(), "application/pdf")},
+                         data={"abstract_source": "pasted",
+                               "pasted_abstract": "On dataset A, accuracy increased by 10 percentage points."})
+    assert upload.status_code == 202, upload.text
+    run_id = upload.json()["run_id"]
+    candidate = wait_for_run(client, run_id)["report_version_id"]
+    report_url = f"/runs/{run_id}"
+    assert "复算一致" in client.get(report_url, params={"version_id": candidate}).text
+
+    selection = client.post(f"/api/v1/reviews/{run_id}/selection", data={
+        "base_version_id": candidate, "submission_id": "numeric-edit",
+        "edited_text": "On dataset A, accuracy increased by 12 percentage points.",
+    })
+    assert selection.status_code == 202, selection.text
+    edited = wait_for_run(client, run_id)["report_version_id"]
+    assert edited != candidate
+    current = client.get(report_url, params={"version_id": edited})
+    assert current.status_code == 200 and "复算不一致" in current.text
+    assert "复算不一致" not in client.get(report_url, params={"version_id": candidate}).text
 
 
 def test_intake_returns_accepted_without_waiting_for_pdf_parsing(tmp_path, client, monkeypatch):
