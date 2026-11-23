@@ -1,3 +1,5 @@
+from contextlib import closing
+
 from abstract_review.audit import audit_version, review_claim, targeted_evidence
 from abstract_review.evidence import EvidenceIndex
 from abstract_review.models import ModelPaused
@@ -76,6 +78,74 @@ def test_truncated_named_source_is_not_exhaustive_even_with_ranked_hits():
     assert finding["coverage"][0]["status"] == "unchecked"
     assert model.calls[-1]["direct_inspections"][0]["matching_count"] == 10
     assert len(finding["sent_candidate_ids"]) == 8
+
+
+def test_followup_ranks_named_methods_and_keeps_nearby_refutation_lines():
+    rows = [_source(f"a{i:02}", f"Routine instrumentation note {i}", "Materials and methods", 1)
+            for i in range(12)]
+    lines = [
+        ("z-condition", "For units submerged before each calibration,"),
+        ("z-result", "the optical sensor saturated"),
+        ("z-effect", "and did not produce usable readings."),
+    ]
+    for i, (eid, text) in enumerate(lines):
+        row = _source(eid, text, "Materials and methods", 1)
+        row["locator"]["bbox"] = [30, 230 + 12 * i, 170, 240 + 12 * i]
+        rows.append(row)
+    rows.append(_source("audit", "All overflow flags were retained in the case log.", "Appendix", 3))
+    rows.append(_source("initial", "Biodiversity changed after prototype deployment."))
+    targets = [
+        {"query": "optical sensor saturated", "requirement": "measurement definition", "section": "Methods"},
+        {"query": "overflow flags", "requirement": "measurement definition", "section": "Appendix"},
+    ]
+    refutation = [eid for eid, _ in lines]
+    model = Model(_judgement(verdict="pending", targets=targets), _judgement(
+        verdict="refuted", missing=[], groups=[{"role": "refute", "evidence_ids": refutation}],
+        observations=[{"requirement": "measurement definition", "status": "found", "evidence_ids": refutation}],
+    ))
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, model)
+
+    assert finding["verdict"] == "refuted"
+    assert set(refutation) | {"audit"} <= set(finding["sent_candidate_ids"])
+    assert set(refutation) <= set(finding["follow_up_evidence_ids"])
+    first, second = model.calls[-1]["direct_inspections"]
+    assert (first["matching_count"], first["complete"], second["complete"]) == (15, False, True)
+    assert len(finding["sent_candidate_ids"]) == 8
+
+
+def test_missing_named_section_falls_back_to_same_document_without_claiming_completion():
+    evidence = _source("relevant", "The negative control saturated.", "Body", 2)
+    outside = {**evidence, "doc_id": "unrelated", "evidence_id": "outside"}
+    with closing(EvidenceIndex([evidence, outside])) as index:
+        received = targeted_evidence(index, [
+            {"query": "negative control saturated", "section": "Results", "doc_id": "paper"},
+        ])
+    assert [row["evidence_id"] for row in received["evidence"]] == ["relevant"]
+    direct, = [scope for scope in received["scopes"] if scope["mode"] == "direct"]
+    assert direct["matching_count"] == 0 and direct["complete"] is False
+
+
+def test_partial_followup_keeps_initial_result_in_the_second_judge_packet():
+    rows = [_source(f"m{i}", f"Measurement definition note {i}", "Methods", 1) for i in range(12)]
+    result = _source("result", "Biodiversity changed.")
+    model = Model(_judgement(targets=[_methods_target()]), _judgement())
+    with closing(EvidenceIndex([result, *rows])) as index:
+        finding, _ = review_claim(CLAIM, index, model)
+    assert finding["review_status"] == "pending"
+    assert "result" in finding["sent_candidate_ids"] and len(finding["sent_candidate_ids"]) == 8
+
+
+def test_unqualified_page_scope_accounts_for_unreadable_attached_documents():
+    docs = [
+        {"doc_id": "paper", "pages": [{"page_index": 0, "status": "parsed"}]},
+        {"doc_id": "appendix", "pages": [{"page_index": 0, "status": "unreadable"}]},
+    ]
+    with closing(EvidenceIndex([_source("e1", "Biodiversity changed.")])) as index:
+        result = targeted_evidence(index, [{"query": "biodiversity", "page_index": 0}], documents=docs)
+    direct, = [scope for scope in result["scopes"] if scope["mode"] == "direct"]
+    assert direct["complete"] is False
+    assert direct["unreadable_locations"] == [{"doc_id": "appendix", "page_index": 0, "status": "unreadable"}]
 
 
 def test_unreadable_targeted_page_is_not_proof_of_missing_evidence():

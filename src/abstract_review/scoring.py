@@ -1,3 +1,5 @@
+import hashlib
+import json
 import unicodedata
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -38,8 +40,9 @@ class _GoldLabel:
 
 def score_predictions(
     predictions: object, gold: object, *, rank_cutoffs: tuple[int, ...] = _DEFAULT_RANK_CUTOFFS,
+    semantic_matches: object = None,
 ) -> dict[str, object]:
-    """Score stored predictions against a separately supplied gold manifest."""
+    """Score stored predictions and optionally add independently annotated semantic scores."""
     if not rank_cutoffs or any(type(k) is not int or k <= 0 for k in rank_cutoffs):
         raise ValueError("rank cutoffs must be positive integers")
     cutoffs = tuple(sorted(set(rank_cutoffs)))
@@ -52,6 +55,29 @@ def score_predictions(
         sample_id, claim_id = unexpected[0]
         raise ValueError(f"Prediction has no gold label for {sample_id}/{claim_id}")
 
+    result = _score_aligned(predicted, gold_labels, extraction_samples, matches, cutoffs)
+    if semantic_matches is not None:
+        annotations, provenance = _parse_semantic_matches(
+            semantic_matches, predictions, gold, predicted, gold_labels, extraction_samples, matches,
+        )
+        combined = matches | annotations
+        result["semantic_extraction"] = {
+            **_extraction_metrics(predicted, gold_labels, extraction_samples, combined),
+            "matches": [
+                {"sample_id": key[0], "gold_claim_id": key[1], "predicted_claim_id": prediction_key[1],
+                 "source": "exact" if key in matches else "annotation"}
+                for key, prediction_key in sorted(combined.items())
+            ],
+            "provenance": provenance,
+        }
+        result["semantic_scoring"] = _score_aligned(predicted, gold_labels, extraction_samples, combined, cutoffs)
+    return result
+
+
+def _score_aligned(
+    predicted: dict[_CaseKey, _Prediction], gold_labels: dict[_CaseKey, _GoldLabel],
+    extraction_samples: frozenset[str], matches: dict[_CaseKey, _CaseKey], cutoffs: tuple[int, ...],
+) -> dict[str, object]:
     completed_count = correct_count = evidence_count = evidence_hits = joint_hits = known_ranks = 0
     unknown_ranks = False
     rank_hits = dict.fromkeys(cutoffs, 0)
@@ -299,6 +325,70 @@ def _extraction_samples(gold: dict, labels: dict[_CaseKey, _GoldLabel]) -> froze
     return samples
 
 
+def semantic_manifest_sha256(document: object) -> str:
+    """Fingerprint parsed JSON using sorted keys, UTF-8, and compact separators."""
+    canonical = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _parse_semantic_matches(
+    document: object, predictions: object, gold: object, predicted: dict[_CaseKey, _Prediction],
+    labels: dict[_CaseKey, _GoldLabel], samples: frozenset[str], exact: dict[_CaseKey, _CaseKey],
+) -> tuple[dict[_CaseKey, _CaseKey], dict[str, str]]:
+    fields = {"schema_version", "annotation_id", "annotator_type", "predictions_sha256", "gold_sha256", "matches"}
+    if not isinstance(document, dict) or document.keys() != fields:
+        raise ValueError(f"Semantic matches must contain exactly {', '.join(sorted(fields))}")
+    if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+        raise ValueError("Unsupported semantic matches schema_version")
+    if not samples:
+        raise ValueError("Semantic matches require gold extraction samples")
+    annotation_id = _identifier(document["annotation_id"], "annotation_id")
+    annotator_type = document["annotator_type"]
+    if annotator_type not in ("human", "ai"):
+        raise ValueError("annotator_type must be human or ai")
+    provenance = {
+        "annotation_id": annotation_id,
+        "annotator_type": annotator_type,
+        "predictions_sha256": semantic_manifest_sha256(predictions),
+        "gold_sha256": semantic_manifest_sha256(gold),
+        "annotation_sha256": semantic_manifest_sha256(document),
+    }
+    for field in ("predictions_sha256", "gold_sha256"):
+        if document[field] != provenance[field]:
+            raise ValueError(f"Semantic matches {field} does not match the supplied manifest")
+    rows = document["matches"]
+    if not isinstance(rows, list):
+        raise ValueError("Semantic matches must be a list")
+
+    exact_by_prediction = {prediction_key: gold_key for gold_key, prediction_key in exact.items()}
+    matches = {}
+    used_predictions: set[_CaseKey] = set()
+    for index, row in enumerate(rows):
+        location = f"matches[{index}]"
+        if not isinstance(row, dict) or row.keys() != {"sample_id", "predicted_claim_id", "gold_claim_id"}:
+            raise ValueError(f"{location} must contain exactly sample_id, predicted_claim_id, and gold_claim_id")
+        sample = _identifier(row["sample_id"], f"{location}.sample_id")
+        gold_key = sample, _identifier(row["gold_claim_id"], f"{location}.gold_claim_id")
+        prediction_key = sample, _identifier(row["predicted_claim_id"], f"{location}.predicted_claim_id")
+        if sample not in samples or gold_key not in labels or prediction_key not in predicted:
+            raise ValueError(f"{location} must reference an existing prediction and gold claim in one extraction sample")
+        if gold_key in matches or prediction_key in used_predictions:
+            raise ValueError(f"{location} violates one-to-one matching by repeating a prediction or gold claim")
+        gold_anchor, prediction_anchor = labels[gold_key].anchor, predicted[prediction_key].anchor
+        if gold_anchor is None or prediction_anchor is None or not _same_source_span(gold_anchor, prediction_anchor):
+            raise ValueError(f"{location} must link overlapping source intervals in the same sentence")
+        if (exact.get(gold_key, prediction_key) != prediction_key
+                or exact_by_prediction.get(prediction_key, gold_key) != gold_key):
+            raise ValueError(f"{location} conflicts with an existing exact match")
+        matches[gold_key] = prediction_key
+        used_predictions.add(prediction_key)
+    return matches, provenance
+
+
+def _same_source_span(left: _Anchor, right: _Anchor) -> bool:
+    return left.sentence_id == right.sentence_id and max(left.start, right.start) < min(left.end, right.end)
+
+
 def _match_extractions(predicted: dict, labels: dict, samples: frozenset[str]) -> dict[_CaseKey, _CaseKey]:
     # Candidate links require the same sample, sentence, and normalized proposition,
     # as well as overlapping original offsets. Labels and evidence never affect the assignment.
@@ -316,8 +406,7 @@ def _match_extractions(predicted: dict, labels: dict, samples: frozenset[str]) -
         key = pred_key[0], anchor.sentence_id, anchor.proposition
         overlaps = []
         for gold_key, gold_anchor in gold_by_sentence.get(key, ()):
-            overlap = min(anchor.end, gold_anchor.end) - max(anchor.start, gold_anchor.start)
-            if overlap > 0:
+            if _same_source_span(anchor, gold_anchor):
                 distance = abs(anchor.start - gold_anchor.start) + abs(anchor.end - gold_anchor.end)
                 overlaps.append((distance, gold_key))
         links[pred_key] = [key for _, key in sorted(overlaps)]

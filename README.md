@@ -70,6 +70,10 @@ uv run abstract-review bench score --predictions .review-data/d11/out/prediction
 
 PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `abstract_file`、`paper_family_id`、`split` 和给定 `claims`。给定断言每项含 `claim_id` 与 `text`，省略时由引擎从摘要抽取。金标从独立清单载入评分器。`run.json` 记录输入和配置指纹、用量与耗时。评分区分已完成项的分类成绩和所有金标的交付比例，并按实际送审顺序计算完整证据组的 `Recall@K`。样例为合成的多个论文族，跨学科质量评测需要独立标注的全文留出集。
 
+自主抽取的严格评分按同句区间和规范化命题匹配。独立核对等义命题后，可以向 `bench score` 增加 `--semantic-matches equivalents.json`。原严格结果保留在顶层，`semantic_extraction` 记录补充匹配，`semantic_scoring` 记录相应的判定、覆盖和取证指标。
+
+等义清单使用 `schema_version: 1`、`annotation_id`、`annotator_type`（`human` 或 `ai`）、`predictions_sha256`、`gold_sha256` 及 `matches`。每个匹配填写 `sample_id`、`predicted_claim_id` 和 `gold_claim_id`。哈希可用 `abstract_review.scoring.semantic_manifest_sha256` 计算。核对时应保留事实、极性、条件和数量。评分器要求同句区间重叠、一对一对应，并优先采用已有的严格匹配。推理过程只读取输入清单。
+
 SciFact 适配器读取作者发布的 JSONL，将每条断言与它的给定引用摘要配对，并保留原始文档和句子 ID。这组指标的适用范围是给定引用摘要。 [SciFact 数据和评估协议](https://github.com/allenai/scifact#dataset)
 
 ```powershell

@@ -39,6 +39,8 @@ _UNIT = r"%|百分点|percentage\s+points?|p\.?p\.?\b"
 _NUMBER = re.compile(rf"(?<![a-z0-9_.])([+-]?(?:\d+(?:\.\d+)?|\.\d+))(?:\s*({_UNIT}))?")
 _MAX_CANDIDATES = 24
 _SECTION_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*|[ivx]+)[.)]?\s+")
+_METHOD_NAMES = frozenset(("method", "methods", "materials and methods", "material and methods", "methodology",
+                           "方法", "材料与方法"))
 _LINK_PRIORITY = {
     "same_experiment": 0,
     "table_reference": 1,
@@ -120,6 +122,11 @@ def _document_key(record: dict) -> tuple[str, str]:
 
 def _section_key(section: str) -> str:
     return _SECTION_NUMBER.sub("", _normalize(section).strip()).rstrip(":：")
+
+
+def _inspection_section(section: str) -> str:
+    name = _section_key(section)
+    return "methods" if name in _METHOD_NAMES else name
 
 
 def _table_key(record: dict) -> tuple[tuple[str, str], int, int] | None:
@@ -231,12 +238,15 @@ class EvidenceIndex:
         self._named_tables: dict[str, set[str]] = defaultdict(set)
         self._row_headers: dict[str, str] = {}
         self._column_families: dict[str, tuple[str, ...]] = {}
+        self._body_lines: dict[tuple, list[tuple[str, tuple]]] = defaultdict(list)
         self._embedder = embedder
         texts = []
         lexical_rows = []
         for raw in evidence:
             record = deepcopy(raw)
             eid = self._register(record)
+            if record.get("kind") == "body_text" and (box := _bbox(record)):
+                self._body_lines[self._line_location(record)].append((eid, box))
             text_parts = [record["text"], _text_field(record, "row_header"), _text_field(record, "column_header")]
             text = " ".join(part for part in text_parts if part)
             texts.append(text)
@@ -621,6 +631,57 @@ class EvidenceIndex:
         )
         return [eid for (eid,) in rows if eid in active]
 
+    def _query_rank(self, query: str, active: set[str]) -> tuple[list[str], list[str]]:
+        exact, query_without_exact = _exact_terms(query)
+        lexical = _terms(query_without_exact if exact else query)
+        ranks = {
+            "lexical": self._lexical_rank(lexical, active),
+            "exact": self._rank(self._exact, exact, active),
+        }
+        if self._embedder is not None:
+            ranks["semantic"] = self._semantic_rank(query, active)
+        scores: dict[str, float] = defaultdict(float)
+        for channel in ranks.values():
+            for rank, eid in enumerate(channel[:_MAX_CANDIDATES], start=1):
+                scores[eid] += 1 / (60 + rank)
+        return sorted(scores, key=lambda eid: (-scores[eid], eid))[:_MAX_CANDIDATES], list(ranks)
+
+    @staticmethod
+    def _line_location(record: dict) -> tuple:
+        locator = record["locator"]
+        return _document_key(record), locator["page_index"], _text_field(locator, "section")
+
+    def _adjacent_line(self, eid: str, direction: int, active: set[str]) -> str | None:
+        record = self._records[eid]
+        box = _bbox(record)
+        if record.get("kind") != "body_text" or box is None:
+            return None
+        left, top, right, bottom = box
+        height = bottom - top
+        nearby = []
+        for other, (x0, y0, x1, y1) in self._body_lines[self._line_location(record)]:
+            if other not in active:
+                continue
+            gap = direction * (y0 - top)
+            overlap = min(right, x1) - max(left, x0)
+            if (0.45 * height <= gap <= 1.8 * height and 0.65 * height <= y1 - y0 <= 1.5 * height
+                    and overlap >= 0.6 * min(right - left, x1 - x0) and abs(x0 - left) <= 2.5 * height):
+                nearby.append((gap, abs(x0 - left), other))
+        return min(nearby)[2] if nearby else None
+
+    def _followup_order(self, ranked: list[str], active: set[str], limit: int, prior: set[str]) -> list[str]:
+        chosen, deferred = {}, {}
+        for eid in ranked:
+            previous = self._adjacent_line(eid, -1, active)
+            following = self._adjacent_line(eid, 1, active)
+            group = [item for item in (eid, previous, following) if item]
+            selected = chosen if prior.intersection(group) != set(group) else deferred
+            selected.update(dict.fromkeys(group))
+            if len(chosen) >= limit:
+                break
+        chosen.update(deferred)
+        return list(chosen)[:limit]
+
     def _compatible_walk(self, seed: str, target: str) -> bool:
         origin, other = self._records[seed], self._records[target]
         origin_refs, _ = self._experiment_anchors[seed]
@@ -750,6 +811,7 @@ class EvidenceIndex:
     def search(
         self, query: str, *, limit: int = 8, section: str | None = None, expand: bool = True,
         doc_id: str | None = None, doc_version_id: str | None = None,
+        followup: bool = False, prior_ids: Iterable[str] = (),
     ) -> dict:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("evidence query must be nonempty text")
@@ -765,19 +827,9 @@ class EvidenceIndex:
             and (doc_version_id is None or _document_key(record)[1] == doc_version_id)
             and (section_key is None or section_key in _normalize(_text_field(record["locator"], "section")))
         }
-        exact, query_without_exact = _exact_terms(query)
-        lexical = _terms(query_without_exact if exact else query)
-        ranks = {
-            "lexical": self._lexical_rank(lexical, active),
-            "exact": self._rank(self._exact, exact, active),
-        }
-        if self._embedder is not None:
-            ranks["semantic"] = self._semantic_rank(query, active)
-        scores: dict[str, float] = defaultdict(float)
-        for channel in ranks.values():
-            for rank, eid in enumerate(channel[:_MAX_CANDIDATES], start=1):
-                scores[eid] += 1 / (60 + rank)
-        ranked = sorted(scores, key=lambda eid: (-scores[eid], eid))[:_MAX_CANDIDATES]
+        ranked, channels = self._query_rank(query, active)
+        if followup:
+            ranked = self._followup_order(ranked, active, _MAX_CANDIDATES, set(prior_ids))
         chosen, paths = self._expand(ranked, limit, active) if expand else (ranked[:limit], [])
         locations = {
             (self._records[eid]["doc_id"], self._records[eid]["locator"]["page_index"],
@@ -798,7 +850,7 @@ class EvidenceIndex:
                     for doc_id, page, section_name in sorted(locations)
                 ],
                 "examined_evidence_ids": sorted(active),
-                "channels": list(ranks),
+                "channels": channels,
                 "lexical_engine": "sqlite_fts5_unicode61",
                 "candidate_limit": limit,
             },
@@ -807,16 +859,16 @@ class EvidenceIndex:
     def inspect(
         self, *, section: str | None = None, table_label: str | None = None,
         page_index: int | None = None, doc_id: str | None = None, doc_version_id: str | None = None,
-        limit: int = 8,
+        limit: int = 8, query: str | None = None, prior_ids: Iterable[str] = (),
     ) -> dict:
-        """Read a named local source directly, independent of relevance ranking."""
+        """Read a named source, ranking partial results only when a query is provided."""
         if section is None and table_label is None and page_index is None:
             raise ValueError("direct inspection needs a section, table label or page")
         if not 0 <= limit <= _MAX_CANDIDATES:
             raise ValueError("invalid direct inspection limit")
         label = _printed_table_label(table_label) if table_label else None
         table_ids = self._named_tables.get(label, set())
-        section_key = _section_key(section) if section is not None else None
+        section_key = _inspection_section(section) if section is not None else None
         ids = []
         for eid, record in self._records.items():
             locator = record["locator"]
@@ -826,7 +878,7 @@ class EvidenceIndex:
                 continue
             if page_index is not None and locator["page_index"] != page_index:
                 continue
-            if section_key is not None and _section_key(_text_field(locator, "section")) != section_key:
+            if section_key is not None and _inspection_section(_text_field(locator, "section")) != section_key:
                 continue
             if table_label is not None and eid not in table_ids:
                 continue
@@ -834,7 +886,13 @@ class EvidenceIndex:
         ids.sort(key=lambda eid: (
             self._records[eid]["doc_id"], self._records[eid]["locator"]["page_index"], eid,
         ))
-        chosen = self.get(ids[:limit])
+        ordered = ids
+        if query and len(ids) > limit:
+            active = set(ids)
+            ranked, _ = self._query_rank(query, active)
+            focused = self._followup_order(ranked, active, limit, set(prior_ids))
+            ordered = list(dict.fromkeys((*focused, *ids)))
+        chosen = self.get(ordered[:limit])
         locators = {
             (record["doc_id"], record["locator"]["page_index"], _text_field(record["locator"], "section"))
             for record in chosen
