@@ -48,9 +48,9 @@ uv run abstract-review review export $run.run_id --format md --output .review-da
 uv run abstract-review serve
 ```
 
-网页从 `http://127.0.0.1:8000` 打开，可提交 PDF、查看原页和高亮、下载报告、选择改句或提交手改版本。命令行支持 `review submit-selection`。每次提交携带当前版本 ID，旧报告仍可按旧 ID 导出。
+网页从 `http://127.0.0.1:8000` 打开，可提交 PDF、查看原页和高亮、下载报告、选择改句或提交手改版本。Web 审稿和改后核验进入 SQLite 队列，页面会显示排队、运行和完成状态。服务重启后会接手续跑任务和租约已过期的任务。命令行支持 `review submit-selection`。每次提交携带当前版本 ID，旧报告仍可按旧 ID 导出。
 
-`--engine openai` 显式使用 `OPENAI_API_KEY` 和 Responses API。先运行 `uv run abstract-review doctor --online` 验证权限。模型默认 `gpt-6.2-sol`，可用 `--model` 指定。运行暂挂后用 `review resume RUN_ID` 从检查点继续。扩额时使用新 `--request-id` 和 `--add-requests` 或 `--add-seconds`。同一请求 ID 重试沿用原值。
+`--engine openai` 显式使用 `OPENAI_API_KEY` 和 Responses API。`uv run abstract-review doctor --online` 用自拟文本和合成裁图检查结构化响应，并记录模型、耗时和用量。也可以用 `uv run pytest -m live --run-live` 进行显式联调。模型默认 `gpt-6.2-sol`，可用 `--model` 指定。运行暂挂后用 `review resume RUN_ID` 从检查点继续。扩额时使用新 `--request-id` 和 `--add-requests` 或 `--add-seconds`。同一请求 ID 重试沿用原值。
 
 原页没有可读文本时，可用 `--ocr-language eng` 启用本机 Tesseract。需要语言数据时，按安装方式配置 `TESSDATA_PREFIX`。检索默认使用 SQLite FTS5、精确词元和图扩展。`uv sync --locked --extra embeddings` 后，`--embed-model PATH` 读取本地模型目录。跨页关联仅用于有明确续表标记且表头对齐的表格。
 
@@ -64,4 +64,20 @@ uv run abstract-review bench run --engine offline --input-manifest .review-data/
 uv run abstract-review bench score --predictions .review-data/d11/out/predictions.json --gold-manifest .review-data/d11/gold.json --output .review-data/d11/out/scores.json
 ```
 
-PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `abstract_file`、`paper_family_id`、`split` 和给定 `claims`。给定断言每项含 `claim_id` 与 `text`，省略时由引擎从摘要抽取。金标从独立清单载入评分器。样例为合成的多个论文族，完整跨学科质量评测需要独立标注的论文留出集。
+PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `abstract_file`、`paper_family_id`、`split` 和给定 `claims`。给定断言每项含 `claim_id` 与 `text`，省略时由引擎从摘要抽取。金标从独立清单载入评分器。`run.json` 记录输入和配置指纹、用量与耗时。评分区分已完成项的分类成绩和所有金标的交付比例，并按实际送审顺序计算完整证据组的 `Recall@K`。样例为合成的多个论文族，跨学科质量评测需要独立标注的全文留出集。
+
+SciFact 适配器读取作者发布的 JSONL，将每条断言与它的给定引用摘要配对，并保留原始文档和句子 ID。这组指标的适用范围是给定引用摘要。 [SciFact 数据和评估协议](https://github.com/allenai/scifact#dataset)
+
+```powershell
+uv run abstract-review bench prepare-scifact --corpus data/corpus.jsonl --claims data/claims_dev.jsonl --split dev --dataset-version author-release-2020 --output-dir .review-data/scifact
+uv run abstract-review bench run --dataset scifact --engine offline --input-manifest .review-data/scifact/inputs.json --output-dir .review-data/scifact/out
+uv run abstract-review bench score --dataset scifact --predictions .review-data/scifact/out/predictions.json --gold-manifest .review-data/scifact/gold.json --output .review-data/scifact/out/scores.json
+```
+
+CLAIM-BENCH 适配器需要本地标注文件及其对应的 PDF。它把能在单一原页上唯一匹配的标注片段绑定到证据 ID。输出会列出无法定位和存在多个匹配的片段，单独记录对齐覆盖率。评分衡量原文片段定位。 [CLAIM-BENCH 作者数据](https://github.com/shashidharjavaji/CLAIM_BENCH)
+
+```powershell
+uv run abstract-review bench prepare-claimbench --pdf paper.pdf --annotations annotations.json --paper-family-id paper --split dev --dataset-version local-release --output-dir .review-data/claimbench
+uv run abstract-review bench run --engine offline --input-manifest .review-data/claimbench/inputs.json --output-dir .review-data/claimbench/out
+uv run abstract-review bench score --dataset claimbench --predictions .review-data/claimbench/out/predictions.json --gold-manifest .review-data/claimbench/gold.json --output .review-data/claimbench/out/scores.json
+```

@@ -194,17 +194,18 @@ class FakeModel:
 
 
 class ReviewService:
-    """Run the synthetic fixture path and store each immutable report in SQLite."""
+    """Review local inputs and store versioned reports in SQLite."""
 
     def __init__(self, database: Path, model: ReviewModel | None = None) -> None:
         self.database = database
         self.store = RunStore(database)
         self.model = model if model is not None else FakeModel()
 
-    def start(self, review_input: ReviewInput | PdfReviewInput) -> dict:
+    def start(self, review_input: ReviewInput | PdfReviewInput, *, run_id: str | None = None,
+              lease_token: str | None = None, execute: bool = True) -> dict:
+        run_id = run_id or uuid4().hex
         if isinstance(review_input, PdfReviewInput):
-            return self._start_pdf(review_input)
-        run_id = uuid4().hex
+            return self._start_pdf(review_input, run_id, lease_token, execute)
         abstract = review_input.abstract
         version_key = json.dumps((review_input.sample_id, abstract), ensure_ascii=False)
         version_id = hashlib.sha256(version_key.encode("utf-8")).hexdigest()
@@ -263,9 +264,9 @@ class ReviewService:
             "unresolved_items": unresolved,
             "usage": {"external_requests": 0, "local_model_calls": len(review_input.claims)},
         }
-        return self._persist_report(report)
+        return self._persist_report(report, lease_token)
 
-    def _start_pdf(self, request: PdfReviewInput) -> dict:
+    def _start_pdf(self, request: PdfReviewInput, run_id: str, lease_token: str | None, execute: bool) -> dict:
         from .ingest import parse_pdf
 
         if request.pasted_abstract is not None and not request.pasted_abstract.strip():
@@ -314,7 +315,7 @@ class ReviewService:
         report = {
             "schema_version": 1,
             "mode": "pdf",
-            "run_id": uuid4().hex,
+            "run_id": run_id,
             "report_version_id": version["version_id"],
             "original_abstract": version,
             "reviewed_abstract": version,
@@ -349,8 +350,8 @@ class ReviewService:
             }
         elif request.check_omissions or request.check_external:
             raise ValueError("optional checks require --engine offline or --engine openai")
-        started = self._persist_report(report)
-        return self.resume(started["run_id"]) if request.engine else started
+        started = self._persist_report(report, lease_token)
+        return self.resume(run_id, lease_token=lease_token) if request.engine and execute else started
 
     def _store_pdf(self, data: bytes, sha256: str) -> str:
         relative_path = Path("blobs") / f"{sha256}.pdf"
@@ -368,12 +369,12 @@ class ReviewService:
                     temporary_path.unlink(missing_ok=True)
         return relative_path.as_posix()
 
-    def _persist_report(self, report: dict) -> dict:
-        self.store.save(report, new=True)
+    def _persist_report(self, report: dict, lease_token: str | None = None) -> dict:
+        self.store.save(report, lease_token, new=True)
         return self._run_ref(report)
 
     def status(self, run_id: str) -> dict:
-        return self._run_ref(self.store.read(run_id))
+        return self.store.status(run_id)
 
     def export(self, run_id: str, version_id: str) -> dict:
         return self.store.read(run_id, version_id)
@@ -389,18 +390,19 @@ class ReviewService:
                               previous_attempts=usage["external_requests"], previous_seconds=usage.get("elapsed_seconds", 0),
                               before_call=before_call)
 
-    def resume(self, run_id: str, request_id: str | None = None, add_requests: int = 0, add_seconds: int = 0) -> dict:
+    def resume(self, run_id: str, request_id: str | None = None, add_requests: int = 0, add_seconds: int = 0,
+               *, lease_token: str | None = None) -> dict:
         from .workflow import process
 
-        return process(self, run_id, request_id, add_requests, add_seconds)
+        return process(self, run_id, request_id, add_requests, add_seconds, lease_token=lease_token)
 
     def submit_selection(
         self, run_id: str, base_version_id: str, submission_id: str,
-        revision_ids: tuple[str, ...] = (), edited_text: str | None = None,
+        revision_ids: tuple[str, ...] = (), edited_text: str | None = None, *, enqueue: bool = False,
     ) -> dict:
         from .workflow import submit_selection
 
-        return submit_selection(self, run_id, base_version_id, submission_id, revision_ids, edited_text)
+        return submit_selection(self, run_id, base_version_id, submission_id, revision_ids, edited_text, enqueue=enqueue)
 
     @staticmethod
     def _run_ref(report: dict) -> dict:

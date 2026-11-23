@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% if report %}审阅报告{% else %}导入论文{% endif %} · AbstractTrace</title>
+  <title>{% if report %}审阅报告{% elif state %}审阅进度{% else %}导入论文{% endif %} · AbstractTrace</title>
   <style>
     :root {
       color-scheme: light;
@@ -108,11 +108,27 @@
   <header>
     <nav class="header-inner" aria-label="工作区">
       <a class="brand" href="{{ request.url_for('home') }}">AbstractTrace</a>
-      {% if report %}<a class="button" href="{{ request.url_for('home') }}">审阅新论文</a>{% endif %}
+      {% if report or state %}<a class="button" href="{{ request.url_for('home') }}">审阅新论文</a>{% endif %}
     </nav>
   </header>
 
-  {% if not report %}
+  {% if state and not report %}
+  <main class="upload">
+    <div class="intro">
+      <h1>审阅进度</h1>
+      <p class="muted">任务 {{ state.run_id[:12] }}</p>
+    </div>
+    {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
+    <section class="card" aria-live="polite">
+      <h2>{{ statuses.get(state.run_status, state.run_status) }}</h2>
+      {% if state.runtime_error %}
+      <p>{{ state.runtime_error }}</p>
+      {% else %}
+      <p>首份报告生成后会在此显示。可以关掉页面，稍后再打开这一地址。</p>
+      {% endif %}
+    </section>
+  </main>
+  {% elif not report %}
   <main class="upload">
     <div class="intro">
       <h1>导入论文</h1>
@@ -149,6 +165,7 @@
   {% set verification = abstract_review.status|default('pending') %}
   {% set selected_revision_ids = report.reviewed_abstract.revision_ids|default([]) %}
   {% set revisions = report.revisions|default([]) %}
+  {% set can_select = is_current and state.run_status in ['report_ready', 'paused'] %}
   {% macro evidence_link(id) -%}
     {% set record = evidence_by_id.get(id) %}
     {% if record %}
@@ -270,12 +287,12 @@
                   </ul>
                 </details>
               {% endif %}
-              {% if is_current and revision.status == 'passed' %}
+              {% if can_select and revision.status == 'passed' %}
                 <label><input type="checkbox" name="revision_ids" value="{{ revision.revision_id }}"{% if revision.revision_id in selected_revision_ids %} checked{% endif %}> 采用这条建议</label>
               {% endif %}
             </article>
             {% endfor %}
-            {% if is_current %}<div class="form-actions"><button class="button" type="submit">保存所选修订</button></div>{% endif %}
+            {% if can_select %}<div class="form-actions"><button class="button" type="submit">保存所选修订</button></div>{% endif %}
           </form>
           {% else %}<p class="muted">还没有生成修订建议。</p>{% endif %}
           {% if abstract_review.sentence_checks %}
@@ -288,7 +305,7 @@
             </ul>
           </details>
           {% endif %}
-          {% if is_current %}
+          {% if can_select %}
           <details class="group"><summary>手动修改摘要</summary>
             <form class="fields group" method="post" action="{{ request.url_for('select_revision', run_id=run_id) }}">
               <input type="hidden" name="base_version_id" value="{{ version_id }}">
@@ -309,7 +326,16 @@
           {% endif %}
           {% if report.external_checks %}
           <h3>外部参考文献</h3>
-          <ul>{% for item in report.external_checks %}<li><span class="pill">{{ statuses.get(item.support_status, item.support_status) }}</span> {{ item.attribution }}<p class="meta">{{ item.reason }}</p></li>{% endfor %}</ul>
+          <ul>
+            {% for item in report.external_checks %}
+            <li>
+              <span class="pill">{{ statuses.get(item.support_status, item.support_status) }}</span>
+              {{ item.attribution.text|default(item.attribution) }}
+              <p class="meta">{{ item.reason }}</p>
+              {{ evidence_links(item.evidence|default([])|map(attribute='evidence_id')|list) }}
+            </li>
+            {% endfor %}
+          </ul>
           {% endif %}
         </section>
         {% endif %}
@@ -348,6 +374,30 @@
       </aside>
     </div>
   </main>
+  {% endif %}
+  {% if state and (not report or is_current) and state.run_status in ['queued', 'running'] %}
+  <script id="review-progress"
+          data-status-url="{{ request.url_for('run_status', run_id=state.run_id) }}"
+          data-version="{{ state.report_version_id or '' }}">
+    const progress = document.getElementById("review-progress");
+    async function refreshReview() {
+      try {
+        const response = await fetch(progress.dataset.statusUrl, {cache: "no-store"});
+        if (response.ok) {
+          const state = await response.json();
+          if (!["queued", "running"].includes(state.run_status) ||
+              (state.report_version_id || "") !== progress.dataset.version) {
+            window.location.reload();
+            return;
+          }
+        }
+      } catch {
+        // The task remains in the local queue while the browser reconnects.
+      }
+      window.setTimeout(refreshReview, 1000);
+    }
+    window.setTimeout(refreshReview, 1000);
+  </script>
   {% endif %}
 </body>
 </html>

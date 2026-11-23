@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from abstract_review.models import ModelUnavailable, ResponsesModel, SmokeResult
+from abstract_review.models import ModelPaused, ModelUnavailable, ResponsesModel, SmokeResult
 from abstract_review.reporting import render_markdown
 from abstract_review.review import PdfReviewInput, ReviewService
 
@@ -83,3 +83,40 @@ def test_model_requests_use_fresh_context_and_reserve_budget():
     assert reserved == ["outcome_unknown", "outcome_unknown"]
     assert all(call["store"] is False and "previous_response_id" not in call for call in calls)
     assert all([item["role"] for item in call["input"]] == ["developer", "user"] for call in calls)
+
+
+def test_late_model_pause_resumes_without_repeating_completed_sentence_check(tmp_path, monkeypatch):
+    pdf = tmp_path / "sample.pdf"
+    runpy.run_path(str(SAMPLE))["make_paper"](pdf)
+    service = ReviewService(tmp_path / "state.db")
+    run = service.start(PdfReviewInput(pdf, pasted_abstract=WRONG, abstract_source="pasted", engine="offline"))
+    calls = []
+
+    class CheckingModel:
+        def __init__(self, *, pause):
+            self.pause = pause
+            self.events = []
+            self.elapsed_seconds = 0
+
+        def call(self, stage, material, schema):
+            calls.append(stage)
+            ids = [material["evidence"][0]["evidence_id"]]
+            if stage == "verify_sentence":
+                return schema(status="passed", reason="The sentence was checked.", evidence_ids=ids)
+            if self.pause:
+                raise ModelPaused("model budget exhausted")
+            return schema(status="passed", reason="The abstract was checked.", evidence_ids=ids, issues=[])
+
+    monkeypatch.setattr(service, "_responses", lambda *args, **kwargs: CheckingModel(pause=True))
+    selected = service.submit_selection(run["run_id"], run["report_version_id"], "edited",
+                                        edited_text=RIGHT + " The evaluation was fixed.")
+    assert selected["run_status"] == "paused"
+    assert "verify_sentence" in calls and calls[-1] == "verify_abstract"
+    calls.clear()
+
+    restarted = ReviewService(tmp_path / "state.db")
+    monkeypatch.setattr(restarted, "_responses", lambda *args, **kwargs: CheckingModel(pause=False))
+    result = restarted.resume(run["run_id"], "budget-extension", add_requests=3)
+    assert result["run_status"] == "report_ready"
+    assert result["report_version_id"] == selected["report_version_id"]
+    assert calls == ["verify_abstract"]
