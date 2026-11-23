@@ -826,15 +826,21 @@ class EvidenceIndex:
         results = {}
         for query in dict.fromkeys(query for query in queries if query.strip()):
             ranked = self._rank_context_windows(query, windows)
-            if ranked:
+            if not ranked:
+                continue
+            first = ranked[0]
+            if page_index is None and section is None:
+                # The primary lane already exposes summary matches. If two queries
+                # find the same source range, a different range can add context
+                # without narrowing the search to a guessed page.
+                ranked.sort(key=lambda eid: bool(_SUMMARY_SECTION.search(
+                    _section_key(_text_field(self._records[eid]["locator"], "section")),
+                )))
                 first = ranked[0]
-                if page_index is None and section is None:
-                    # The primary lane still exposes repeated claims in summary sections.
-                    first = next((eid for eid in ranked if not _SUMMARY_SECTION.search(
-                        _section_key(_text_field(self._records[eid]["locator"], "section")),
-                    )), first)
-                window = windows[first]
-                results.setdefault(window.expanded_ids, window)
+                if self._reranker is not None:
+                    first = next((eid for eid in ranked if windows[eid].expanded_ids not in results), first)
+            window = windows[first]
+            results.setdefault(window.expanded_ids, window)
         return list(results.values())
 
     def pack_body_context(self, windows: Iterable[_ContextWindow], primary_ids: Iterable[str]) -> list[dict]:

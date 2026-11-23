@@ -333,6 +333,122 @@ def test_partial_followup_keeps_initial_result_in_the_second_judge_packet():
     assert "result" in finding["sent_candidate_ids"] and len(finding["sent_candidate_ids"]) == 8
 
 
+@pytest.mark.parametrize("legacy_query", [True, False])
+def test_repeated_unscoped_followup_keeps_the_initial_primary_and_body_packet(legacy_query):
+    rows = []
+    for number in range(14):
+        text = "Biodiversity was measured in the main trial." if number == 0 else "The main trial used a fixed pulse."
+        row = _source(f"main-{number}", text, "Methods")
+        row["locator"]["bbox"] = [20, 50 + number * 12, 190, 60 + number * 12]
+        rows.append(row)
+    rows.extend(_source(f"near-match-{number}", "Biodiversity note.", "Discussion", 1) for number in range(12))
+    query = "  BIODIVERSITY  "
+    request = {"queries": [query]} if legacy_query else {"targets": [{"query": query, "doc_id": "paper"}]}
+    model = Model(_judgement(verdict="pending", **request))
+    reserved, saved = [], []
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, model, documents=[{"doc_id": "paper"}],
+                                  reserve_followup=lambda: reserved.append(True) or True, save_targets=saved.append)
+    packet, = model.calls
+    primary = [row["evidence_id"] for row in packet["evidence"]]
+    body = [line[0] for window in packet["body_context"] for line in window["lines"] if len(line) == 2]
+    assert "main-12" in body
+    assert finding["candidate_ids"] == primary
+    assert finding["sent_candidate_ids"] == [*primary, *body]
+    assert finding["stop_reason"] == "no_progress"
+    assert not finding["follow_up_performed"] and not reserved and not saved
+
+
+def test_duplicate_followup_queries_leave_room_for_a_same_query_named_proof():
+    rows = [_source("prior", "Biodiversity changed."), _source("proof", "The construction is stated here.", "Methods", 1)]
+    target = {"query": CLAIM["support_query"], "doc_id": "paper", "section": "Methods", "source_kind": "proof",
+              "requirement": "measurement definition"}
+    model = Model(_judgement(targets=[{"query": CLAIM["support_query"]},
+                                       {"query": CLAIM["counter_query"], "doc_id": "paper"}, target]),
+                  _judgement(verdict="pending"))
+    saved = []
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, model, documents=[{"doc_id": "paper"}], save_targets=saved.append)
+    assert len(model.calls) == 2 and saved == [[target]]
+    assert model.calls[1]["direct_inspections"][0]["section"] == "Methods"
+    assert "proof" in finding["sent_candidate_ids"]
+    assert finding["follow_up_performed"]
+
+
+@pytest.mark.parametrize("narrow_document", [True, False])
+def test_meaningful_document_narrowing_or_query_refinement_remains_actionable(narrow_document):
+    rows = [_source(f"p{number}", "Biodiversity changed as measured.") for number in range(10)]
+    if narrow_document:
+        rows.append({**_source("supplement", "Biodiversity changed as measured."), "doc_id": "appendix"})
+        target = {"query": CLAIM["support_query"], "doc_id": "appendix"}
+    else:
+        rows.append(_source("comparator", "The comparator used a calibrated pulse."))
+        target = {"query": f"{CLAIM['support_query']} comparator"}
+    model = Model(_judgement(targets=[target]), _judgement(verdict="pending"))
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, model, documents=[{"doc_id": "paper"}, {"doc_id": "appendix"}])
+    assert len(model.calls) == 2
+    assert ("supplement" if narrow_document else "comparator") in finding["sent_candidate_ids"]
+
+
+def test_printed_heading_hint_reaches_the_physical_page_when_the_parser_section_is_stale():
+    heading = "4.7 Biodiversity pulse comparator"
+    evidence_id = "actual-threshold"
+    evidence_page = 9
+    pages = [{"page_index": page, "status": "parsed", "source_headings": [f"Protocol note {page}"]}
+             for page in range(evidence_page)]
+    pages[1]["source_headings"] = "invalid legacy metadata"
+    pages.append({"page_index": evidence_page, "status": "parsed", "source_headings": [
+        " ", "x" * 101, None, "Overview", "  4.7  Biodiversity pulse comparator  ",
+        heading, "4.8 Prototype threshold", "Appendix note",
+    ]})
+    report = {
+        "claims": [CLAIM], "findings": [], "calculations": [], "reviewed_abstract": {"text": CLAIM["text"]},
+        "documents": [{"doc_id": "paper", "role": "main", "pages": pages}, {"doc_id": "legacy"}],
+        "evidence": [
+            _source("first-result", "Biodiversity changed.", "Results"),
+            _source("misleading-methods", "The simulation used an uncalibrated sensor.", "Methods", 2),
+            _source(evidence_id, "All field sites used a calibrated pulse threshold.", "Data processing", evidence_page),
+        ],
+    }
+
+    class Navigator:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, stage, material, schema):
+            assert stage == "judge"
+            self.calls.append(material)
+            if len(self.calls) == 1:
+                assert evidence_id not in {item["evidence_id"] for item in material["evidence"]}
+                hints = material["source_hints"]
+                assert len(hints) == 6 and all(len(item["headings"]) <= 2 for item in hints)
+                assert [item["page_index"] for item in hints] == sorted(item["page_index"] for item in hints)
+                assert all(len(text) <= 100 for item in hints for text in item["headings"])
+                hint, = [item for item in hints if heading in item["headings"]]
+                assert hint["headings"] == [heading, "4.8 Prototype threshold"]
+                target = {"query": "calibrated pulse threshold", "requirement": "measurement definition",
+                          "doc_id": hint["doc_id"], "page_index": hint["page_index"]}
+                return schema.model_validate(_judgement(verdict="pending", targets=[target]))
+
+            assert "source_hints" not in material
+            scope, = material["direct_inspections"]
+            assert scope["doc_id"] == "paper" and scope["page_index"] == evidence_page and scope["section"] is None
+            assert scope["complete"] and scope["examined_evidence_ids"] == [evidence_id]
+            assert any(item["evidence_id"] == evidence_id for item in material["evidence"])
+            return schema.model_validate(_judgement(
+                verdict="supported", missing=[], groups=[{"role": "support", "evidence_ids": [evidence_id]}],
+                observations=[{"requirement": "measurement definition", "status": "found", "evidence_ids": [evidence_id]}],
+            ))
+
+    model = Navigator()
+    audit_version(report, model, lambda: None)
+    assert len(model.calls) == 2
+    finding, = report["findings"]
+    assert finding["verdict"] == "supported" and finding["evidence_ids"] == [evidence_id]
+    assert evidence_id in finding["sent_candidate_ids"]
+
+
 def test_unqualified_page_scope_accounts_for_unreadable_attached_documents():
     docs = [
         {"doc_id": "paper", "pages": [{"page_index": 0, "status": "parsed"}]},
