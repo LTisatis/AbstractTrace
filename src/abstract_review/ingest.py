@@ -33,6 +33,7 @@ _TABLE_CONTINUED = re.compile(
 _FIGURE_CAPTION = re.compile(
     rf"^\s*(?:fig(?:ure)?\.?\s+|图\s*)(?P<label>{_OBJECT_LABEL}){_LABEL_END}", re.I,
 )
+_PANEL_MARKER = re.compile(r"[(（]\s*([a-z])\s*[)）]", re.I)
 _OBJECT_MENTION = re.compile(
     r"^\s*(?:(?:shows?|summari[sz]es?|illustrates?|presents?|reports?|lists?|gives?|contains?)\b|所示|显示|列出|给出)",
     re.I,
@@ -406,19 +407,79 @@ def _locate_table(entry: dict, label: _TableLabel) -> None:
         entry["caption_evidence_id"] = label.caption_id
 
 
-def _figures(doc_id: str, page: dict, images: list[BBox], captions: list[_Caption]) -> list[dict]:
-    figures = []
-    for number, caption in _caption_matches(captions, dict(enumerate(images)), 45).items():
+def _panel_near_corner(marker: BBox, image: BBox) -> bool:
+    x0, y0, x1, y1 = image
+    x, y = (marker[0] + marker[2]) / 2, (marker[1] + marker[3]) / 2
+    return x0 - 10 <= x <= x0 + min(28, (x1 - x0) / 3) and y0 - 16 <= y <= y0 + min(30, (y1 - y0) / 3)
+
+
+def _explicit_panels(caption: _Caption, images: list[BBox], lines: list[_Line]) -> dict[str, tuple[int, BBox]]:
+    labels = list(dict.fromkeys(_PANEL_MARKER.findall(caption.evidence["text"].casefold())))
+    if not 2 <= len(labels) <= 8:
+        return {}
+    panel_markers = defaultdict(list)
+    for line in lines:
+        if marker := _PANEL_MARKER.fullmatch(line.text):
+            panel_markers[marker[1].casefold()].append(line.bbox)
+    panels = {}
+    for label in labels:
+        matches = [(index, mark) for mark in panel_markers[label] for index, image in enumerate(images)
+                   if _panel_near_corner(mark, image)]
+        if len(matches) != 1:
+            return {}
+        panels[label] = matches[0]
+    if len({number for number, _ in panels.values()}) != len(panels):
+        return {}
+    boxes = [images[number] for number, _ in panels.values()]
+    union = (min(box[0] for box in boxes), min(box[1] for box in boxes),
+             max(box[2] for box in boxes), max(box[3] for box in boxes))
+    return panels if _near_caption(caption.bbox, union, 45) else {}
+
+
+def _figures(
+    doc_id: str, page: dict, images: list[BBox], captions: list[_Caption], lines: list[_Line],
+) -> list[dict]:
+    def figure(identity: str, caption: _Caption, box: BBox) -> dict:
         entry = _evidence(
-            doc_id, "figure", str(number), caption.evidence["text"], page, images[number],
+            doc_id, "figure", identity, caption.evidence["text"], page, box,
             caption.evidence["locator"]["section"],
         )
         entry.update(figure_label=caption.label, caption_evidence_id=caption.evidence["evidence_id"],
                      source_type="embedded_image")
-        entry["locator"].update(figure_index=number, figure_label=caption.label)
+        entry["locator"]["figure_label"] = caption.label
         if page["status"] == "ocr":
             entry["text_source"] = "ocr"
+        return entry
+
+    simple = _caption_matches(captions, dict(enumerate(images)), 45)
+    figures = []
+    for number, caption in simple.items():
+        entry = figure(str(number), caption, images[number])
+        entry["locator"]["figure_index"] = number
         figures.append(entry)
+    if page["status"] == "ocr":
+        return figures
+
+    simple_captions = {caption.evidence["evidence_id"] for caption in simple.values()}
+    possibilities = [
+        (caption, panels) for caption in captions if caption.evidence["evidence_id"] not in simple_captions
+        if (panels := _explicit_panels(caption, images, lines))
+    ]
+    uses = Counter(number for _, panels in possibilities for number, _ in panels.values())
+    for caption, panels in possibilities:
+        if any(number in simple or uses[number] != 1 for number, _ in panels.values()):
+            continue
+        boxes = [images[number] for number, _ in panels.values()]
+        union = (min(box[0] for box in boxes), min(box[1] for box in boxes),
+                 max(box[2] for box in boxes), max(box[3] for box in boxes))
+        parent = figure(f"panels-{caption.evidence['evidence_id']}", caption, union)
+        parent["source_type"] = "embedded_panels"
+        figures.append(parent)
+        for label, (number, mark) in panels.items():
+            panel = figure(f"panel-{number}-{label}", caption, images[number])
+            panel["parent_figure_evidence_id"] = parent["evidence_id"]
+            panel["locator"].update(figure_index=number, panel_label=label, panel_label_bbox=list(mark))
+            figures.append(panel)
     return figures
 
 
@@ -494,14 +555,14 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
             if cell.table_index in table_labels:
                 _locate_table(entry, table_labels[cell.table_index])
             evidence.append(entry)
-        evidence.extend(_figures(doc_id, page, images, figure_captions))
+        evidence.extend(_figures(doc_id, page, images, figure_captions, lines))
 
     return pages, " ".join(abstract_parts) or None, evidence
 
 
 def parse_pdf(path: Path, role: str = "main", *, ocr_language: str | None = None) -> ParsedPdf:
     """Parse local page text, supported figures and clearly marked bordered tables."""
-    if role not in {"main", "supplement"}:
+    if role not in {"main", "supplement", "external"}:
         raise ValueError(f"unknown PDF role {role!r}")
     with path.open("rb") as source:
         data = source.read(MAX_PDF_BYTES + 1)

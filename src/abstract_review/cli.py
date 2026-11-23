@@ -84,14 +84,12 @@ def doctor(args: argparse.Namespace) -> None:
         "data_dir": str(args.data_dir.resolve()),
     }
     if args.online:
-        from .models import ModelUnavailable, ResponsesModel, SmokeResult
+        from .models import ModelUnavailable, online_diagnostics
 
         try:
-            model = ResponsesModel(args.model, max_requests=2, max_seconds=50)
-            output = model.call("smoke", {"phrase": "AbstractTrace ready"}, SmokeResult)
+            result["online"] = online_diagnostics(args.model)
         except ModelUnavailable as exc:
             raise ValueError(str(exc)) from exc
-        result["online"] = {"model": model.model, "structured_output": output.phrase}
     emit(result)
 
 
@@ -174,17 +172,34 @@ def serve(args: argparse.Namespace) -> None:
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
+    import hashlib
+    import time
+
+    started = time.perf_counter()
+    results = []
     output_path = args.output_dir / "predictions.json"
-    if output_path.resolve() == args.input_manifest.resolve():
-        raise ValueError("predictions output must differ from the input manifest")
+    record_path = args.output_dir / "run.json"
+    checkpoints = args.output_dir / "sample-checkpoints.json"
+    files = {output_path.resolve(), record_path.resolve(), checkpoints.resolve(), args.input_manifest.resolve()}
+    if len(files) != 4:
+        raise ValueError("benchmark outputs and input manifest must use distinct files")
+    manifest_hash = hashlib.sha256(args.input_manifest.read_bytes()).hexdigest()
 
-    service = review_service(args.data_dir)
-    if args.engine:
-        from .benchmark import run_pdf_samples
+    if args.dataset == "scifact":
+        from .benchmark import benchmark_configuration
+        from .scifact import run_scifact
 
-        checkpoints = args.output_dir / "sample-checkpoints.json"
-        if checkpoints.resolve() == args.input_manifest.resolve():
-            raise ValueError("checkpoint output must differ from the input manifest")
+        if args.resume:
+            raise ValueError("--resume is available for local PDF benchmarks")
+        engine = args.engine or "offline"
+        configuration = benchmark_configuration(engine, args.model)
+        configuration["dataset"] = "scifact-cited-abstracts"
+        predictions = run_scifact(read_json(args.input_manifest), engine, args.model)
+    elif args.engine:
+        from .benchmark import benchmark_configuration, run_pdf_samples
+
+        service = review_service(args.data_dir)
+        configuration = benchmark_configuration(args.engine, args.model)
         recovered = read_json(checkpoints) if args.resume and checkpoints.is_file() else {}
         if not isinstance(recovered, dict):
             raise ValueError("invalid benchmark checkpoint file")
@@ -194,10 +209,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
             write_json(checkpoints, recovered)
 
         predictions = run_pdf_samples(service, args.input_manifest, args.engine, args.model,
-                                      recovered=recovered, on_sample=save_sample)
+                                      recovered=recovered, on_sample=save_sample, on_result=results.append,
+                                      configuration=configuration)
     else:
         if args.resume:
             raise ValueError("--resume requires a PDF benchmark engine")
+        service = review_service(args.data_dir)
+        configuration = {"engine": "fixture"}
         predictions = []
         for sample in load_samples(args.input_manifest).values():
             run = service.start(sample)
@@ -210,22 +228,67 @@ def run_benchmark(args: argparse.Namespace) -> None:
                     "verdict": finding["verdict"],
                     "evidence_ids": finding["evidence_ids"],
                 })
+    if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
+        raise ValueError("benchmark input manifest changed during review")
     write_json(output_path, {"schema_version": 1, "predictions": predictions})
+    write_json(record_path, {
+        "schema_version": 1, "input_manifest_sha256": manifest_hash, "configuration": configuration,
+        "wall_seconds": round(time.perf_counter() - started, 6), "prediction_count": len(predictions),
+        "samples": results,
+    })
     emit({"predictions_path": str(output_path), "prediction_count": len(predictions)})
 
 
 def score_benchmark(args: argparse.Namespace) -> None:
-    from .benchmark import summarize_classification
     from .scoring import score_predictions
 
     source_paths = {args.predictions.resolve(), args.gold_manifest.resolve()}
     if args.output.resolve() in source_paths:
         raise ValueError("score output must differ from both scoring input files")
     predictions, gold = read_json(args.predictions), read_json(args.gold_manifest)
-    result = score_predictions(predictions, gold)
-    result.update(summarize_classification(predictions, gold))
+    if args.dataset == "scifact":
+        from .scifact import score_scifact
+
+        result = score_scifact(predictions, gold)
+    elif args.dataset == "claimbench":
+        from .claimbench import score_claimbench
+
+        result = score_claimbench(predictions, gold)
+    else:
+        result = score_predictions(predictions, gold)
     write_json(args.output, result)
     emit(result)
+
+
+def prepare_scifact_benchmark(args: argparse.Namespace) -> None:
+    from .scifact import prepare_scifact
+
+    input_manifest = args.output_dir / "inputs.json"
+    gold_manifest = args.output_dir / "gold.json"
+    if len({path.resolve() for path in (input_manifest, gold_manifest, args.corpus, args.claims)}) != 4:
+        raise ValueError("SciFact source and output files must be distinct")
+    inputs, gold = prepare_scifact(args.corpus, args.claims, split=args.split, dataset_version=args.dataset_version)
+    write_json(input_manifest, inputs)
+    write_json(gold_manifest, gold)
+    emit({"input_manifest": str(input_manifest), "gold_manifest": str(gold_manifest),
+          "sample_count": len(inputs["samples"])})
+
+
+def prepare_claimbench_benchmark(args: argparse.Namespace) -> None:
+    from .claimbench import prepare_claimbench
+
+    input_manifest = args.output_dir / "inputs.json"
+    gold_manifest = args.output_dir / "gold.json"
+    if len({path.resolve() for path in (input_manifest, gold_manifest, args.pdf, args.annotations)}) != 4:
+        raise ValueError("CLAIM-BENCH source and output files must be distinct")
+    inputs, gold = prepare_claimbench(
+        args.pdf, args.annotations, output_dir=args.output_dir, paper_family_id=args.paper_family_id,
+        split=args.split, dataset_version=args.dataset_version,
+    )
+    write_json(input_manifest, inputs)
+    write_json(gold_manifest, gold)
+    emit({"input_manifest": str(input_manifest), "gold_manifest": str(gold_manifest),
+          "claim_count": len(gold["labels"])})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -295,7 +358,8 @@ def build_parser() -> argparse.ArgumentParser:
     run = bench_commands.add_parser("run", help="predict from an input-only manifest")
     run.add_argument("--input-manifest", type=Path, required=True)
     run.add_argument("--output-dir", type=Path, required=True)
-    run.add_argument("--engine", choices=("offline", "openai"), help="review a local PDF benchmark manifest")
+    run.add_argument("--engine", choices=("offline", "openai"), help="review a PDF or SciFact benchmark manifest")
+    run.add_argument("--dataset", choices=("scifact",), help="run the SciFact cited-abstract benchmark")
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     run.add_argument("--resume", action="store_true", help="reuse matching persisted PDF sample checkpoints")
     run.set_defaults(handler=run_benchmark)
@@ -304,7 +368,25 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--predictions", type=Path, required=True)
     score.add_argument("--gold-manifest", type=Path, required=True)
     score.add_argument("--output", type=Path, required=True)
+    score.add_argument("--dataset", choices=("scifact", "claimbench"), help="select dataset-specific metrics")
     score.set_defaults(handler=score_benchmark)
+
+    scifact = bench_commands.add_parser("prepare-scifact", help="adapt labeled SciFact release JSONL files")
+    scifact.add_argument("--corpus", type=Path, required=True)
+    scifact.add_argument("--claims", type=Path, required=True)
+    scifact.add_argument("--split", choices=("train", "dev"), required=True)
+    scifact.add_argument("--dataset-version", required=True)
+    scifact.add_argument("--output-dir", type=Path, required=True)
+    scifact.set_defaults(handler=prepare_scifact_benchmark)
+
+    claimbench = bench_commands.add_parser("prepare-claimbench", help="align local CLAIM-BENCH quotes to a PDF")
+    claimbench.add_argument("--pdf", type=Path, required=True)
+    claimbench.add_argument("--annotations", type=Path, required=True)
+    claimbench.add_argument("--paper-family-id", required=True)
+    claimbench.add_argument("--split", required=True)
+    claimbench.add_argument("--dataset-version", required=True)
+    claimbench.add_argument("--output-dir", type=Path, required=True)
+    claimbench.set_defaults(handler=prepare_claimbench_benchmark)
     return parser
 
 

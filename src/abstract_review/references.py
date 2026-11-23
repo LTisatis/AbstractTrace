@@ -24,7 +24,7 @@ import pymupdf
 from .audit import blind_evidence, sentences
 from .evidence import EvidenceIndex
 from .ingest import MAX_PDF_BYTES, MAX_PDF_PAGES, parse_pdf
-from .models import ModelUnavailable, Schema
+from .models import ModelPaused, ModelUnavailable, Schema
 
 
 _DOI = r"10\.\d{4,9}/[^\s<>\"'\[\]{}]+"
@@ -87,6 +87,7 @@ class _ExternalResult(Schema):
 class _Omission(Schema):
     reason: str
     evidence_ids: list[str]
+    anchor_sentence_id: str | None = None
 
 
 class _OmissionResult(Schema):
@@ -500,9 +501,9 @@ def _attributions(report: dict) -> list[tuple[dict, _Reference, list[str]]]:
     return attributions
 
 
-def _content_check(row: dict, path: Path, model) -> None:
+def _content_check(row: dict, path: Path, model, archive_pdf=None) -> None:
     try:
-        parsed = parse_pdf(path)
+        parsed = parse_pdf(path, role="external")
     except (OSError, ValueError) as exc:
         row.update(access_status="unavailable", reason=f"Could not read the open PDF: {exc}")
         return
@@ -514,11 +515,18 @@ def _content_check(row: dict, path: Path, model) -> None:
         row.update(access_status="unreadable", reason="The open PDF has no readable content evidence.")
         return
     query = _NUMBERED.sub(" ", _CITATION.sub(" ", row["attribution"]["text"]))
-    candidates = EvidenceIndex(available).search(query, limit=8)["evidence"]
+    index = EvidenceIndex(available)
+    try:
+        candidates = index.search(query, limit=8)["evidence"]
+    finally:
+        index.close()
     row["evidence"] = blind_evidence(candidates)
     if not candidates:
         row["reason"] = "The open PDF is readable, but no relevant passage was located."
         return
+    if archive_pdf is not None:
+        sha256 = parsed.document["sha256"]
+        row["document"] = {**parsed.document, "blob_path": archive_pdf(parsed.data, sha256)}
     if model is None:
         row["reason"] = "The open PDF is readable and candidate passages are available for review."
         return
@@ -528,6 +536,8 @@ def _content_check(row: dict, path: Path, model) -> None:
     }
     try:
         result = model.call("external", material, _ExternalResult)
+    except ModelPaused:
+        raise
     except ModelUnavailable:
         row["reason"] = "The external evidence classifier was unavailable."
         return
@@ -577,7 +587,7 @@ def _search_novelty(report: dict, transport: Transport, deadline: float) -> dict
 
 def check_external(
     report: dict, *, model=None, cache_dir: Path, transport: Transport | None = None,
-    contact_email: str | None = None,
+    contact_email: str | None = None, archive_pdf=None,
 ) -> list[dict]:
     """Check cited identifiers and optionally search for prior work on novelty claims."""
     request = transport or _request
@@ -596,7 +606,7 @@ def check_external(
         }
         if result.path is not None:
             row["pdf_file"] = result.path.name
-            _content_check(row, result.path, model)
+            _content_check(row, result.path, model, archive_pdf)
         checks.append(row)
     if novelty := _search_novelty(report, request, deadline):
         checks.append(novelty)
@@ -655,12 +665,17 @@ def check_omissions(report: dict, model=None) -> list[dict]:
     evidence = {item["evidence_id"]: item for items, _ in candidates for item in items}
     if not evidence:
         return []
+    parts = sentences(abstract)
+    sentence_ids = {part["sentence_id"] for part in parts}
     try:
-        result = model.call("omissions", {"abstract": abstract, "evidence": blind_evidence(list(evidence.values()))},
-                            _OmissionResult)
+        result = model.call("omissions", {"abstract": abstract, "abstract_sentences": parts,
+                                         "evidence": blind_evidence(list(evidence.values()))}, _OmissionResult)
+    except ModelPaused:
+        raise
     except ModelUnavailable:
         return []
     return [
-        {"status": "possible_omission", "evidence_ids": list(dict.fromkeys(item.evidence_ids)), "reason": item.reason}
+        {"status": "possible_omission", "evidence_ids": list(dict.fromkeys(item.evidence_ids)), "reason": item.reason,
+         "anchor_sentence_id": item.anchor_sentence_id if item.anchor_sentence_id in sentence_ids else None}
         for item in result.omissions if item.evidence_ids and evidence.keys() >= set(item.evidence_ids)
     ]

@@ -7,10 +7,13 @@ from decimal import Decimal
 from difflib import SequenceMatcher
 from typing import Literal
 
+from pydantic import Field
+
 from .audit import blind_evidence, sentences, validate_ids
 from .calculations import comparison_for_claim
 from .evidence import EvidenceIndex
-from .models import ModelUnavailable, Schema
+from .followups import FollowUps
+from .models import ROLE_PROMPTS, ModelPaused, ModelUnavailable, Schema, VerificationQuery
 
 
 class SemanticChange(Schema):
@@ -31,12 +34,14 @@ class SentenceCheck(Schema):
     status: Literal["passed", "returned", "manual_review"]
     reason: str
     evidence_ids: list[str]
+    follow_up_queries: list[VerificationQuery] = Field(default_factory=list)
 
 
 class AbstractIssue(Schema):
     sentence_ids: list[str]
     reason: str
     evidence_ids: list[str]
+    follow_up_queries: list[VerificationQuery] = Field(default_factory=list)
 
 
 class AbstractCheck(Schema):
@@ -54,7 +59,21 @@ _RELATIVE = re.compile(
 
 
 def _digest(payload: object) -> str:
-    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _call_step(model, stage: str, material: dict, schema, followups: FollowUps | None, target):
+    if followups is None:
+        return model.call(stage, material, schema)
+    steps = followups.report.setdefault("revision_model_steps", {})
+    key = _digest([stage, target, ROLE_PROMPTS[stage], schema.model_json_schema(), material])
+    if key not in steps:
+        result = model.call(stage, material, schema)
+        steps[key] = result.model_dump(mode="json")
+        followups.checkpoint()
+        return result
+    return schema.model_validate(steps[key])
 
 
 def new_version(text: str, kind: str, parent_version_id: str, revision_ids: list[str]) -> dict:
@@ -85,7 +104,15 @@ def _scope(report: dict, findings: list[dict], additional_ids=()) -> list[dict]:
     for item in findings:
         ids.update(item.get("candidate_ids", ()))
         ids.update(item.get("evidence_ids", ()))
-    return [item for item in report["evidence"] if item["evidence_id"] in ids]
+    scope = {item["evidence_id"]: item for item in report["evidence"] if item["evidence_id"] in ids}
+    for check in report.get("external_checks", ()):
+        if check.get("support_status") != "not_supported":
+            continue
+        reviewed = ids.intersection(check.get("evidence_ids", ()))
+        for item in check.get("evidence", ()):
+            if item["evidence_id"] in reviewed:
+                scope.setdefault(item["evidence_id"], item)
+    return list(scope.values())
 
 
 def _numeric_draft(source: str, evidence: list[dict]) -> RevisionDraft | None:
@@ -111,7 +138,13 @@ def _numeric_draft(source: str, evidence: list[dict]) -> RevisionDraft | None:
     ])
 
 
-def _verify_sentence(source: str, replacement: str, evidence: list[dict], model) -> SentenceCheck:
+def _followup_keys(original: dict, findings: list[dict], start: int, end: int, *, insertion: str = "") -> list[str]:
+    claim_ids = [row["claim_id"] for row in findings]
+    return claim_ids or [f"position:{original['version_id']}:{start}:{end}:{insertion}"]
+
+
+def _verify_sentence(source: str, replacement: str, evidence: list[dict], model, *,
+                     followups: FollowUps | None = None, keys: list[str] | None = None, target=None) -> SentenceCheck:
     if model is None:
         correction = _numeric_draft(source, evidence)
         revised = comparison_for_claim(replacement, evidence)
@@ -122,13 +155,28 @@ def _verify_sentence(source: str, replacement: str, evidence: list[dict], model)
                                      evidence_ids=calculation["evidence_ids"])
         return SentenceCheck(status="manual_review", reason="No offline check verified this replacement.", evidence_ids=[])
     try:
-        output = model.call("verify_sentence", {
-            "original_sentence": source, "revised_sentence": replacement, "evidence": blind_evidence(evidence),
-        }, SentenceCheck)
-        validate_ids(output.evidence_ids, evidence)
+        if followups is not None:
+            evidence = [*evidence, *followups.material(keys, evidence)]
+        material = {"original_sentence": source, "revised_sentence": replacement}
+
+        def check(rows: list[dict]) -> SentenceCheck:
+            output = _call_step(model, "verify_sentence", {**material, "evidence": blind_evidence(rows)}, SentenceCheck,
+                                followups, target)
+            validate_ids(output.evidence_ids, rows)
+            return output
+
+        output = check(evidence)
+        if output.follow_up_queries:
+            added = followups.collect(keys, output.follow_up_queries, evidence, "verify_sentence") if followups else []
+            if added:
+                output = check([*evidence, *added])
+            if output.follow_up_queries:
+                return output.model_copy(update={"status": "manual_review"})
         if output.status == "passed" and not output.evidence_ids:
             raise ModelUnavailable("sentence verification supplied no evidence")
         return output
+    except ModelPaused:
+        raise
     except ModelUnavailable as exc:
         return SentenceCheck(status="manual_review", reason=str(exc), evidence_ids=[])
 
@@ -143,29 +191,60 @@ def _validate_draft(draft: RevisionDraft, source: str, evidence: list[dict]) -> 
     validate_ids([eid for change in draft.semantic_diff for eid in change.evidence_ids], evidence)
 
 
-def _review_proposal(part: dict, findings: list[dict], evidence: list[dict], model) -> tuple[RevisionDraft | None, list[SentenceCheck]]:
+def _review_proposal(part: dict, findings: list[dict], evidence: list[dict], model, *,
+                     followups: FollowUps, keys: list[str], target: str) -> tuple[RevisionDraft | None, list[SentenceCheck]]:
     source = part["text"]
     attempts = []
     material = {"original_sentence": source, "evidence": blind_evidence(evidence), "findings": [
-        {key: row[key] for key in ("text", "proposition", "verdict", "reason", "evidence_ids") if key in row}
+        {key: row[key] for key in ("text", "proposition", "verdict", "reason", "evidence_ids", "extension") if key in row}
         for row in findings
     ]}
     draft = None
     for attempt in range(2 if model is not None else 1):
+        if attempt:
+            evidence = [*evidence, *followups.material(keys, evidence)]
+        material["evidence"] = blind_evidence(evidence)
         try:
-            draft = _numeric_draft(source, evidence) if model is None else model.call("revise", material, RevisionDraft)
+            draft = _numeric_draft(source, evidence) if model is None else _call_step(
+                model, "revise", material, RevisionDraft, followups, [target, attempt]
+            )
             if draft is None:
                 break
             _validate_draft(draft, source, evidence)
+        except ModelPaused:
+            raise
         except ModelUnavailable as exc:
             return None, [*attempts, SentenceCheck(status="manual_review", reason=str(exc), evidence_ids=[])]
-        check = _verify_sentence(source, draft.replacement, evidence, model)
+        check = _verify_sentence(source, draft.replacement, evidence, model, followups=followups, keys=keys,
+                                 target=[target, attempt])
         attempts.append(check)
         if check.status != "returned" or attempt:
             break
         material = {**material, "previous_replacement": draft.replacement,
                     "verification_feedback": check.model_dump()}
     return draft, attempts
+
+
+def _extensions(report: dict, original: dict) -> list[dict]:
+    parts = {part["sentence_id"]: part for part in sentences(original["text"])}
+    rows = []
+    for finding in report.get("omissions", ()):
+        anchor = parts.get(finding.get("anchor_sentence_id"))
+        ids = finding.get("evidence_ids", ())
+        if finding.get("status") == "possible_omission" and anchor and ids and len(_scope(report, [], ids)) == len(set(ids)):
+            rows.append((anchor, finding, ids, "omission"))
+    for finding in report.get("external_checks", ()):
+        anchor = finding.get("attribution", {})
+        ids = finding.get("evidence_ids", ())
+        if (finding.get("kind") == "explicit_citation" and finding.get("support_status") == "not_supported"
+                and parts.get(anchor.get("sentence_id")) == anchor and ids and len(_scope(report, [], ids)) == len(set(ids))):
+            rows.append((anchor, finding, ids, "external_citation"))
+    return [
+        {**part, "claim_id": f"{kind}:{_digest([original['version_id'], part['sentence_id'], ids])[:24]}",
+         "extension": kind, "verdict": "refuted" if kind == "external_citation" else None,
+         "reason": finding["reason"], "evidence_ids": list(ids)}
+        for part, finding, ids, kind in rows
+    ]
 
 
 def _sentence_findings(text: str, findings: list[dict]) -> list[tuple[dict, list[dict]]]:
@@ -176,32 +255,51 @@ def _sentence_findings(text: str, findings: list[dict]) -> list[tuple[dict, list
             and item.get("start", part["start"]) >= part["start"]
             and item.get("end", part["end"]) <= part["end"]
         )]
-        if any(item.get("review_status") == "completed" and item.get("verdict") in {"refuted", "insufficient"}
-               and item.get("evidence_ids") for item in rows):
+        if any(_has_revision_reason(item) and item.get("evidence_ids") for item in rows):
             grouped.append((part, rows))
     return grouped
 
 
-def build_candidate(report: dict, model=None) -> dict | None:
+def _has_revision_reason(finding: dict) -> bool:
+    return bool(finding.get("extension")) or (
+        finding.get("review_status") == "completed" and finding.get("verdict") in {"refuted", "insufficient"}
+    )
+
+
+def build_candidate(report: dict, model=None, *, followups: FollowUps | None = None) -> dict | None:
     """Record proposed replacements, then merge only independently checked sentences."""
     original = report["original_abstract"]
     revisions = report.setdefault("revisions", [])
     verifications = report.setdefault("verifications", [])
     unresolved = report.setdefault("unresolved_items", [])
+    followups = followups or FollowUps(report)
     passed = []
-    for part, rows in _sentence_findings(original["text"], report["findings"]):
+    extensions = _extensions(report, original) if model is not None else []
+    steps = report.setdefault("revision_steps", {})
+    for part, rows in _sentence_findings(original["text"], [*report["findings"], *extensions]):
         evidence = _scope(report, rows)
-        scoped = [row for row in rows if row.get("verdict") in {"refuted", "insufficient"}]
+        step = _digest([original["version_id"], part, rows, [row["evidence_id"] for row in evidence]])
+        if step in steps:
+            prior = next((row for row in revisions if row["revision_id"] == steps[step]), None)
+            if prior is not None and prior["status"] == "passed":
+                passed.append(prior)
+            continue
+        scoped = [row for row in rows if _has_revision_reason(row)]
         if model is None and len(scoped) != 1:
             draft, attempts = None, []
         else:
-            draft, attempts = _review_proposal(part, rows, evidence, model)
+            keys = _followup_keys(original, [row for row in rows if not row.get("extension")], part["start"], part["end"])
+            draft, attempts = _review_proposal(part, rows, evidence, model, followups=followups, keys=keys, target=step)
         if draft is None:
             reason = attempts[-1].reason if attempts else "A draft could not be grounded in local evidence."
             unresolved.append({"code": "revision_manual_review", "sentence_id": part["sentence_id"], "reason": reason})
+            steps[step] = None
+            followups.checkpoint()
             continue
         check = attempts[-1]
         revision_id = _digest([original["version_id"], part["start"], part["end"], draft.replacement])[:24]
+        if any(row["revision_id"] == revision_id for row in revisions):
+            revision_id = _digest([revision_id, step])[:24]
         patch = {"revision_id": revision_id, "sentence_id": part["sentence_id"],
                  "start": part["start"], "end": part["end"], "original_text": part["text"],
                  "replacement": draft.replacement, "evidence_ids": draft.evidence_ids,
@@ -212,10 +310,12 @@ def build_candidate(report: dict, model=None) -> dict | None:
                         "revised_sentence": draft.replacement, "repair_count": len(attempts) - 1, **check.model_dump()}
         revisions.append(patch)
         verifications.append(verification)
+        steps[step] = revision_id
         if check.status == "passed":
             passed.append(patch)
         else:
             unresolved.append({"code": "revision_manual_review", "revision_id": revision_id, "reason": check.reason})
+        followups.checkpoint()
     if not passed:
         return None
     return new_version(apply_revisions(original["text"], passed), "candidate", original["version_id"],
@@ -246,7 +346,8 @@ def _whole_targets(candidate_text: str, patches: list[dict], issues: list[dict])
     return targets
 
 
-def repair_candidate(report: dict, candidate: dict, whole_review: dict, model) -> dict | None:
+def repair_candidate(report: dict, candidate: dict, whole_review: dict, model, *,
+                     followups: FollowUps | None = None) -> dict | None:
     """Try one repair per unambiguous position, sharing the sentence repair limit."""
     original = report["original_abstract"]
     if (model is None or whole_review.get("status") != "returned"
@@ -264,6 +365,7 @@ def repair_candidate(report: dict, candidate: dict, whole_review: dict, model) -
         return None
 
     targets = _whole_targets(candidate["text"], patches, whole_review.get("issues", []))
+    followups = followups or FollowUps(report)
     history = report["verifications"]
     replacements = {}
     for patch in patches:
@@ -272,37 +374,55 @@ def repair_candidate(report: dict, candidate: dict, whole_review: dict, model) -
             continue
         checks = [record for record in history if record.get("original_version_id") == original["version_id"]
                   and (record.get("start"), record.get("end")) == (patch["start"], patch["end"])]
-        if (any(record.get("repair_count", 0) >= 1 for record in checks)
-                or not any(record.get("revision_id") == patch_id and record.get("status") == "passed" for record in checks)):
+        attempt = next((record for record in checks if record.get("scope") == "whole_repair"
+                        and record.get("candidate_version_id") == candidate["version_id"]
+                        and record.get("revision_id") == patch_id), None)
+        if attempt is not None and attempt["status"] != "attempted":
+            if "patch" in attempt:
+                replacements[patch_id] = (attempt["patch"], attempt["verification"])
+            continue
+        if (any(record is not attempt and record.get("repair_count", 0) >= 1 for record in checks)
+                or not any(record.get("revision_id") == patch_id and record.get("status") == "passed"
+                           and record.get("scope") == "sentence" for record in checks)):
             continue
 
         issues = targets[patch_id]
         feedback_ids = [eid for issue in issues for eid in issue.get("evidence_ids", [])]
         finding_rows = [row for row in report["findings"] if row.get("sentence_id") == patch["sentence_id"]]
+        keys = _followup_keys(original, finding_rows, patch["start"], patch["end"])
         evidence = _scope(report, finding_rows, [*patch["evidence_ids"], *feedback_ids])
+        evidence = [*evidence, *followups.material(keys, evidence)]
         try:
             validate_ids([*patch["evidence_ids"], *feedback_ids], evidence)
         except ModelUnavailable:
             continue
 
         anchor = {"original_version_id": original["version_id"], "start": patch["start"], "end": patch["end"], "repair_count": 1}
-        attempt = {**anchor, "scope": "whole_repair", "revision_id": patch_id,
-                   "candidate_version_id": candidate["version_id"], "status": "attempted"}
-        history.append(attempt)
+        if attempt is None:
+            attempt = {**anchor, "scope": "whole_repair", "revision_id": patch_id,
+                       "candidate_version_id": candidate["version_id"], "status": "attempted"}
+            history.append(attempt)
+            followups.checkpoint()
+        target = [candidate["version_id"], patch_id]
         try:
-            draft = model.call("revise", {"original_sentence": patch["original_text"],
+            draft = _call_step(model, "revise", {"original_sentence": patch["original_text"],
                 "previous_replacement": patch["replacement"], "verification_feedback": issues,
-                "evidence": blind_evidence(evidence)}, RevisionDraft)
+                "evidence": blind_evidence(evidence)}, RevisionDraft, followups, target)
             _validate_draft(draft, patch["original_text"], evidence)
             if draft.replacement.strip() == patch["replacement"].strip():
                 raise ModelUnavailable("whole-abstract repair did not change the replacement")
+        except ModelPaused:
+            raise
         except ModelUnavailable as exc:
             attempt.update(status="manual_review", reason=str(exc))
+            followups.checkpoint()
             continue
 
-        check = _verify_sentence(patch["original_text"], draft.replacement, evidence, model)
+        check = _verify_sentence(patch["original_text"], draft.replacement, evidence, model,
+                                 followups=followups, keys=keys, target=target)
         attempt.update(status=check.status, reason=check.reason)
         if check.status != "passed":
+            followups.checkpoint()
             continue
         revision_id = _digest([original["version_id"], patch["start"], patch["end"], draft.replacement])[:24]
         revised_patch = {**patch, "revision_id": revision_id, "replacement": draft.replacement,
@@ -311,6 +431,8 @@ def repair_candidate(report: dict, candidate: dict, whole_review: dict, model) -
         verification = {**anchor, "scope": "sentence", "revision_id": revision_id,
                         "original_sentence": patch["original_text"], "revised_sentence": draft.replacement,
                         **check.model_dump()}
+        attempt.update(patch=revised_patch, verification=verification)
+        followups.checkpoint()
         replacements[patch_id] = (revised_patch, verification)
 
     if not replacements:
@@ -336,23 +458,33 @@ def _location(parts: list[dict], start: int, end: int, text: str) -> dict:
             "end": end_offset, "text": text[start_offset:end_offset]}
 
 
-def _check_changes(report: dict, original: dict, revised: dict, model) -> list[dict]:
+def _aligned_spans(original: dict, revised: dict, *, include_equal: bool = False):
     left, right = sentences(original["text"]), sentences(revised["text"])
     matching = SequenceMatcher(a=[part["text"] for part in left], b=[part["text"] for part in right], autojunk=False)
-    known = {row["revision_id"]: row for row in report.get("verifications", []) if row.get("scope") == "sentence"
-             and row.get("original_version_id") == original["version_id"] and row["status"] == "passed"}
-    reusable = [known[rid] for rid in revised["revision_ids"] if rid in known]
-    index = None
-    checks = []
     for tag, i, j, k, m in matching.get_opcodes():
-        if tag == "equal":
+        if tag == "equal" and not include_equal:
             continue
         spans = [(i, j, k, m)]
         if j - i == m - k:
             spans = [(a, a + 1, b, b + 1) for a, b in zip(range(i, j), range(k, m))]
         for a, b, c, d in spans:
-            source = _location(left, a, b, original["text"])
-            target = _location(right, c, d, revised["text"])
+            yield _location(left, a, b, original["text"]), _location(right, c, d, revised["text"])
+
+
+def _location_keys(report: dict, original: dict, revised: dict, source: dict, target: dict) -> list[str]:
+    findings = [row for row in report["findings"] if row.get("sentence_id") in source["sentence_ids"]]
+    insertion = f"{revised['version_id']}:{target['start']}" if source["start"] == source["end"] else ""
+    return _followup_keys(original, findings, source["start"], source["end"], insertion=insertion)
+
+
+def _check_changes(report: dict, original: dict, revised: dict, model, followups: FollowUps) -> list[dict]:
+    known = {row["revision_id"]: row for row in report.get("verifications", []) if row.get("scope") == "sentence"
+             and row.get("original_version_id") == original["version_id"] and row["status"] == "passed"}
+    reusable = [known[rid] for rid in revised["revision_ids"] if rid in known]
+    index = None
+    checks = []
+    try:
+        for source, target in _aligned_spans(original, revised):
             reviewed = next((row for row in reusable if row["start"] == source["start"]
                              and row["end"] == source["end"] and row["revised_sentence"] == target["text"]), None)
             if reviewed is not None and revised["kind"] == "candidate":
@@ -363,36 +495,66 @@ def _check_changes(report: dict, original: dict, revised: dict, model) -> list[d
                 findings = [row for row in report["findings"] if row.get("sentence_id") in source["sentence_ids"]]
                 related = index.search(source["text"] + " " + target["text"], limit=8)["evidence"]
                 evidence = _scope(report, findings, (item["evidence_id"] for item in related))
-                result = _verify_sentence(source["text"], target["text"], evidence, model).model_dump()
+                keys = _location_keys(report, original, revised, source, target)
+                finding_revision = len(report.get("finding_history", []))
+                result = _verify_sentence(source["text"], target["text"], evidence, model,
+                                          followups=followups, keys=keys,
+                                          target=[revised["version_id"], source, target, finding_revision]).model_dump()
             checks.append({"version_id": revised["version_id"], "original": source, "revised": target, **result})
+    finally:
+        if index is not None:
+            index.close()
     return checks
 
 
-def verify_version(report: dict, original: dict, revised: dict, model=None) -> dict:
+def verify_version(report: dict, original: dict, revised: dict, model=None, *,
+                   followups: FollowUps | None = None) -> dict:
     """Check this exact version, including cross-sentence constraints and all changed text."""
-    checks = _check_changes(report, original, revised, model)
+    followups = followups or FollowUps(report)
+    checks = _check_changes(report, original, revised, model, followups)
     summary = {"version_id": revised["version_id"], "sentence_checks": checks, "evidence_ids": [], "issues": []}
     if model is None:
         return {**summary, "status": "manual_review", "reason": "Offline checks do not establish whole-abstract consistency."}
     by_sentence = {part["sentence_id"]: part for part in sentences(revised["text"])}
+    keys_by_sentence = {
+        sid: _location_keys(report, original, revised, source, target)
+        for source, target in _aligned_spans(original, revised, include_equal=True) for sid in target["sentence_ids"]
+    }
     ids = [eid for item in checks for eid in item["evidence_ids"]]
     evidence = _scope(report, report["findings"], ids)
-    try:
-        result = model.call("verify_abstract", {
+    all_keys = list(dict.fromkeys(key for keys in keys_by_sentence.values() for key in keys))
+    evidence.extend(followups.material(all_keys, evidence))
+
+    def check(rows: list[dict]) -> AbstractCheck:
+        result = _call_step(model, "verify_abstract", {
             "version_id": revised["version_id"], "original_abstract": original["text"],
             "revised_abstract": revised["text"], "revised_sentences": list(by_sentence.values()),
-            "evidence": blind_evidence(evidence), "unresolved_items": report.get("unresolved_items", []),
-        }, AbstractCheck)
-        validate_ids(result.evidence_ids, evidence)
-        issues = []
+            "evidence": blind_evidence(rows), "unresolved_items": report.get("unresolved_items", []),
+        }, AbstractCheck, followups, [revised["version_id"], len(report.get("finding_history", []))])
+        validate_ids(result.evidence_ids, rows)
         for item in result.issues:
-            validate_ids(item.evidence_ids, evidence)
+            validate_ids(item.evidence_ids, rows)
             if not item.sentence_ids or not by_sentence.keys() >= set(item.sentence_ids):
                 raise ModelUnavailable("whole-abstract verification did not supply valid sentence locations")
-            issues.append({**item.model_dump(), "locations": [by_sentence[sid] for sid in item.sentence_ids]})
+        return result
+
+    try:
+        result = check(evidence)
+        added = []
+        for item in result.issues:
+            keys = list(dict.fromkeys(key for sid in item.sentence_ids for key in keys_by_sentence.get(sid, ())))
+            added.extend(followups.collect(keys, item.follow_up_queries, [*evidence, *added], "verify_abstract"))
+        if added:
+            result = check([*evidence, *added])
+        issues = [{**item.model_dump(), "locations": [by_sentence[sid] for sid in item.sentence_ids]}
+                  for item in result.issues]
+    except ModelPaused:
+        raise
     except ModelUnavailable as exc:
         return {**summary, "status": "manual_review", "reason": str(exc)}
     status = result.status
+    if any(item.follow_up_queries for item in result.issues):
+        status = "manual_review"
     if issues and status == "passed":
         status = "returned"
     if status == "passed" and any(check["status"] != "passed" for check in checks):

@@ -2,6 +2,7 @@
 
 import math
 import re
+import sqlite3
 import unicodedata
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -17,6 +18,9 @@ _TABLE_NUMBER = r"(?:[a-z]+\d+|\d+(?:[.-]\d+)*[a-z]?)(?![a-z0-9])"
 _TABLE_MENTION = rf"(?:(?<![a-z0-9])(?:table|tab\.)\s+|表\s*)({_TABLE_NUMBER})"
 _TABLE_REFERENCE = re.compile(_TABLE_MENTION)
 _TABLE_CAPTION = re.compile(rf"^\s*{_TABLE_MENTION}\s*(?:[:.—-]|$)")
+_FIGURE_MENTION = rf"(?:(?<![a-z0-9])(?:figure|fig\.)\s+|图\s*)({_TABLE_NUMBER})"
+_FIGURE_REFERENCE = re.compile(_FIGURE_MENTION)
+_FIGURE_PANEL = re.compile(rf"{_FIGURE_MENTION}\s*\(([a-z])\)")
 _EXPERIMENT = re.compile(
     r"(?:(?<![a-z0-9])(?:experiment\s+|exp\.\s*)|实验(?:编号|号)?\s*)"
     r"[:#]?\s*([a-z]*\d+(?:[-.]\d+)*[a-z]?)(?![a-z0-9])"
@@ -24,10 +28,16 @@ _EXPERIMENT = re.compile(
 _UNIT = r"%|百分点|percentage\s+points?|p\.?p\.?\b"
 _NUMBER = re.compile(rf"(?<![a-z0-9_.])([+-]?(?:\d+(?:\.\d+)?|\.\d+))(?:\s*({_UNIT}))?")
 _MAX_CANDIDATES = 24
+_SECTION_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*|[ivx]+)[.)]?\s+")
 _LINK_PRIORITY = {
     "same_experiment": 0,
     "table_reference": 1,
+    "figure_reference": 1,
     "table_caption": 2,
+    "table_continuation": 2,
+    "table_note": 2,
+    "figure_caption": 2,
+    "figure_panel": 2,
     "row_header": 3,
     "column_header": 4,
     "same_table": 5,
@@ -77,7 +87,8 @@ def _terms(text: str, *, index: bool = False) -> set[str]:
 def _exact_terms(text: str, *, header: str = "") -> tuple[set[str], str]:
     normalized = _normalize(text)
     tokens = {f"table:{label}" for label in _TABLE_REFERENCE.findall(normalized)}
-    without_tables = _TABLE_REFERENCE.sub(" ", normalized)
+    tokens.update(f"figure-panel:{figure}:{panel}" for figure, panel in _FIGURE_PANEL.findall(normalized))
+    without_tables = _TABLE_REFERENCE.sub(" ", _FIGURE_PANEL.sub(" ", normalized))
     header_unit = re.search(_UNIT, _normalize(header))
     for number, unit in _NUMBER.findall(without_tables):
         tokens.add(f"number:{number}:{'pp' if unit and unit != '%' else unit}")
@@ -94,6 +105,10 @@ def _text_field(record: dict, key: str) -> str:
 def _document_key(record: dict) -> tuple[str, str]:
     version = _text_field(record, "doc_version_id") or _text_field(record, "document_version_id")
     return record["doc_id"], version
+
+
+def _section_key(section: str) -> str:
+    return _SECTION_NUMBER.sub("", _normalize(section).strip()).rstrip(":：")
 
 
 def _table_key(record: dict) -> tuple[tuple[str, str], int, int] | None:
@@ -114,6 +129,10 @@ def _cell_position(record: dict) -> tuple[int, int] | None:
 
 def _table_label(record: dict) -> str | None:
     value = _text_field(record, "table_label") or _text_field(record["locator"], "table_label")
+    return _printed_table_label(value)
+
+
+def _printed_table_label(value: str) -> str | None:
     label = _normalize(value).strip()
     match = _TABLE_REFERENCE.fullmatch(label)
     if match:
@@ -169,21 +188,24 @@ class EvidenceIndex:
 
     def __init__(self, evidence: Iterable[dict], *, embedder: Embedder | None = None) -> None:
         self._records: dict[str, dict] = {}
-        self._lexical: dict[str, set[str]] = defaultdict(set)
         self._exact: dict[str, set[str]] = defaultdict(set)
         self._graph: dict[str, set[_Edge]] = defaultdict(set)
         self._table_indexes: dict[tuple, list[str]] = defaultdict(list)
+        self._named_tables: dict[str, set[str]] = defaultdict(set)
         self._embedder = embedder
         texts = []
+        lexical_rows = []
         for raw in evidence:
             record = deepcopy(raw)
             eid = self._register(record)
             text_parts = [record["text"], _text_field(record, "row_header"), _text_field(record, "column_header")]
             text = " ".join(part for part in text_parts if part)
             texts.append(text)
-            for token in _terms(text, index=True):
-                self._lexical[token].add(eid)
+            lexical_rows.append((eid, " ".join(sorted(_terms(text, index=True)))))
             exact, _ = _exact_terms(record["text"], header=text_parts[-1])
+            panel = _text_field(record["locator"], "panel_label")
+            if panel and (figure := _text_field(record, "figure_label")):
+                exact.add(f"figure-panel:{_normalize(figure)}:{_normalize(panel)}")
             for token in exact:
                 self._exact[token].add(eid)
             table = _table_key(record)
@@ -194,6 +216,17 @@ class EvidenceIndex:
         self._vectors = dict(zip(self._records, vectors))
         self._build_tables()
         self._build_experiments()
+        self._build_ingest_links()
+        self._fts = sqlite3.connect(":memory:")
+        try:
+            self._fts.execute("CREATE VIRTUAL TABLE lexical USING fts5(evidence_id UNINDEXED, text, tokenize='unicode61')")
+            self._fts.executemany("INSERT INTO lexical(evidence_id, text) VALUES (?, ?)", lexical_rows)
+        except sqlite3.Error:
+            self._fts.close()
+            raise
+
+    def close(self) -> None:
+        self._fts.close()
 
     def _register(self, record: dict) -> str:
         if not isinstance(record, dict):
@@ -269,6 +302,7 @@ class EvidenceIndex:
             if len(possible_tables) == 1:
                 table = possible_tables[0]
                 table_labels[table].add(label)
+                self._named_tables[label].add(eid)
                 for cell_id in self._table_indexes[table]:
                     self._connect(eid, cell_id, "table_caption", eid)
 
@@ -278,6 +312,7 @@ class EvidenceIndex:
                 label = next(iter(labels))
                 for eid in self._table_indexes[table]:
                     self._exact[f"table:{label}"].add(eid)
+                    self._named_tables[label].add(eid)
                 labeled_tables[(table[0], label)].append(table)
 
         for eid, record in self._records.items():
@@ -320,6 +355,53 @@ class EvidenceIndex:
             for eid in ids:
                 self._connect(center, eid, "same_experiment", center, eid)
 
+    def _build_ingest_links(self) -> None:
+        figures: dict[tuple, list[str]] = defaultdict(list)
+        for eid, record in self._records.items():
+            locator = record["locator"]
+            kind = record.get("kind")
+            caption_id = record.get("caption_evidence_id")
+            caption = self._records.get(caption_id) if isinstance(caption_id, str) else None
+            if caption is not None and (_document_key(record) != _document_key(caption)
+                                        or caption["locator"]["page_index"] != locator["page_index"]):
+                caption = None
+            if caption is not None:
+                relation = {"figure": "figure_caption", "table_cell": "table_caption",
+                            "table_note": "table_note"}.get(kind)
+                if relation:
+                    self._connect(eid, caption_id, relation, caption_id)
+            if kind == "figure" and (label := _text_field(record, "figure_label")):
+                if not locator.get("panel_label"):
+                    figures[(_document_key(record), _normalize(label))].append(eid)
+                elif isinstance(parent_id := record.get("parent_figure_evidence_id"), str) and parent_id in self._records:
+                    parent = self._records[parent_id]
+                    if parent.get("kind") == "figure" and parent.get("figure_label") == label and caption is not None:
+                        self._connect(eid, parent_id, "figure_panel", caption_id, eid)
+            if kind == "table_note" and (label := _table_label(record)):
+                self._named_tables[label].add(eid)
+            previous = locator.get("continued_from")
+            if not isinstance(previous, dict) or caption is None:
+                continue
+            previous_id = previous.get("caption_evidence_id")
+            previous_caption = self._records.get(previous_id) if isinstance(previous_id, str) else None
+            if previous_caption is None:
+                continue
+            previous_loc = previous_caption["locator"]
+            group = locator.get("table_group_id")
+            if (group and group == previous_loc.get("table_group_id")
+                    and group == caption["locator"].get("table_group_id")
+                    and previous_loc["page_index"] == previous.get("page_index")
+                    and previous_loc.get("table_index") == previous.get("table_index")
+                    and previous_loc["page_index"] < locator["page_index"]):
+                self._connect(caption_id, previous_id, "table_continuation", caption_id, previous_id)
+        for eid, record in self._records.items():
+            if record.get("kind") == "figure":
+                continue
+            for label in set(_FIGURE_REFERENCE.findall(_normalize(record["text"]))):
+                targets = figures.get((_document_key(record), label), [])
+                if len(targets) == 1 and eid != self._records[targets[0]].get("caption_evidence_id"):
+                    self._connect(eid, targets[0], "figure_reference", eid)
+
     def get(self, ids: Iterable[str]) -> list[dict]:
         """Return only records owned by this index, in the requested order."""
         if isinstance(ids, str):
@@ -354,6 +436,16 @@ class EvidenceIndex:
             if score > 0:
                 scores[eid] = score
         return sorted(scores, key=lambda eid: (-scores[eid], eid))
+
+    def _lexical_rank(self, tokens: set[str], active: set[str]) -> list[str]:
+        if not tokens or not active:
+            return []
+        # Quote the generated tokens so words such as OR are searched literally.
+        query = " OR ".join(f'"{token}"' for token in sorted(tokens)[:96])
+        rows = self._fts.execute(
+            "SELECT evidence_id FROM lexical WHERE lexical MATCH ? ORDER BY bm25(lexical), evidence_id", (query,),
+        )
+        return [eid for (eid,) in rows if eid in active]
 
     def _walk(self, seed: str, active: set[str]) -> Iterable[tuple[tuple[str, ...], tuple[_Edge, ...]]]:
         queue = deque([((seed,), ())])
@@ -415,7 +507,8 @@ class EvidenceIndex:
         return result
 
     def search(
-        self, query: str, *, limit: int = 8, section: str | None = None, expand: bool = True
+        self, query: str, *, limit: int = 8, section: str | None = None, expand: bool = True,
+        doc_id: str | None = None,
     ) -> dict:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("evidence query must be nonempty text")
@@ -427,12 +520,13 @@ class EvidenceIndex:
         section_key = _normalize(section).strip() if section else None
         active = {
             eid for eid, record in self._records.items()
-            if section_key is None or section_key in _normalize(_text_field(record["locator"], "section"))
+            if (doc_id is None or record["doc_id"] == doc_id)
+            and (section_key is None or section_key in _normalize(_text_field(record["locator"], "section")))
         }
         exact, query_without_exact = _exact_terms(query)
         lexical = _terms(query_without_exact if exact else query)
         ranks = {
-            "lexical": self._rank(self._lexical, lexical, active),
+            "lexical": self._lexical_rank(lexical, active),
             "exact": self._rank(self._exact, exact, active),
         }
         if self._embedder is not None:
@@ -454,6 +548,7 @@ class EvidenceIndex:
             "scope": {
                 "query": query,
                 "section": section,
+                "doc_id": doc_id,
                 "document_ids": sorted({doc_id for doc_id, _, _ in locations}),
                 "locations": [
                     {"doc_id": doc_id, "page_index": page, "section": section_name}
@@ -461,6 +556,50 @@ class EvidenceIndex:
                 ],
                 "examined_evidence_ids": sorted(active),
                 "channels": list(ranks),
+                "lexical_engine": "sqlite_fts5_unicode61",
                 "candidate_limit": limit,
             },
         }
+
+    def inspect(
+        self, *, section: str | None = None, table_label: str | None = None,
+        page_index: int | None = None, doc_id: str | None = None, limit: int = 8,
+    ) -> dict:
+        """Read a named local source directly, independent of relevance ranking."""
+        if section is None and table_label is None and page_index is None:
+            raise ValueError("direct inspection needs a section, table label or page")
+        if not 0 <= limit <= _MAX_CANDIDATES:
+            raise ValueError("invalid direct inspection limit")
+        label = _printed_table_label(table_label) if table_label else None
+        table_ids = self._named_tables.get(label, set())
+        section_key = _section_key(section) if section is not None else None
+        ids = []
+        for eid, record in self._records.items():
+            locator = record["locator"]
+            if doc_id is not None and record["doc_id"] != doc_id:
+                continue
+            if page_index is not None and locator["page_index"] != page_index:
+                continue
+            if section_key is not None and _section_key(_text_field(locator, "section")) != section_key:
+                continue
+            if table_label is not None and eid not in table_ids:
+                continue
+            ids.append(eid)
+        ids.sort(key=lambda eid: (
+            self._records[eid]["doc_id"], self._records[eid]["locator"]["page_index"], eid,
+        ))
+        chosen = self.get(ids[:limit])
+        locators = {
+            (record["doc_id"], record["locator"]["page_index"], _text_field(record["locator"], "section"))
+            for record in chosen
+        }
+        return {"evidence": chosen, "scope": {
+            "mode": "direct", "section": section, "table_label": table_label,
+            "page_index": page_index, "doc_id": doc_id, "matching_count": len(ids),
+            "complete": bool(ids) and len(ids) <= limit,
+            "examined_evidence_ids": [item["evidence_id"] for item in chosen],
+            "document_ids": sorted({doc for doc, _, _ in locators}),
+            "locations": [
+                {"doc_id": doc, "page_index": page, "section": name} for doc, page, name in sorted(locators)
+            ],
+        }}

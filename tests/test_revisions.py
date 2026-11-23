@@ -3,7 +3,10 @@ from copy import deepcopy
 import pytest
 
 from abstract_review.audit import sentences
+from abstract_review.followups import FollowUps
+from abstract_review.models import VerificationQuery
 from abstract_review.revisions import apply_revisions, build_candidate, new_version, repair_candidate, verify_version
+from abstract_review.workflow import _refresh_findings
 
 
 SOURCE = "Accuracy increased by 12 percentage points on Dataset A."
@@ -210,3 +213,101 @@ def test_whole_check_cannot_pass_with_a_failed_manual_edit():
     assert checked["status"] == "manual_review"
     assert checked["version_id"] == manual["version_id"]
     assert checked["sentence_checks"][0]["status"] == "returned"
+
+
+def test_sentence_supplement_is_shared_with_whole_review_and_restart():
+    report = report_for()
+    report["evidence"].append({"evidence_id": "limitation", "doc_id": "paper", "kind": "body_text",
+                               "text": "Dataset A used a fixed validation split.",
+                               "locator": {"page_index": 2, "section": "Limitations"}})
+    query = {"query": "fixed validation split", "requirement": "scope", "section": "Limitations"}
+    model = ScriptedModel([
+        ("revise", draft(CORRECTION, "8")),
+        ("verify_sentence", {"status": "returned", "reason": "Check the split.",
+                             "evidence_ids": ["result"], "follow_up_queries": [query]}),
+        ("verify_sentence", {"status": "passed", "reason": "Split checked.",
+                             "evidence_ids": ["result", "limitation"]}),
+    ])
+    candidate = build_candidate(report, model)
+    assert candidate["text"] == CORRECTION
+    assert "limitation" not in {item["evidence_id"] for item in model.calls[1][1]["evidence"]}
+    assert "limitation" in {item["evidence_id"] for item in model.calls[2][1]["evidence"]}
+    assert report["follow_up_rounds"]["claim-a"]["evidence_ids"] == ["limitation"]
+
+    restored = deepcopy(report)
+    whole = ScriptedModel([("verify_abstract", {
+        "status": "returned", "reason": "Check another result.", "evidence_ids": ["limitation"],
+        "issues": [{"reason": "Need another source.", "sentence_ids": ["s1"], "evidence_ids": [],
+                    "follow_up_queries": [{**query, "section": "Results"}]}],
+    })])
+    assert verify_version(restored, restored["original_abstract"], candidate, whole)["status"] == "manual_review"
+    assert len(whole.calls) == 1
+    assert restored["follow_up_rounds"] == report["follow_up_rounds"]
+
+
+def test_grounded_omission_uses_same_independent_revision_path():
+    report = report_for()
+    report["findings"] = []
+    report["evidence"].append({"evidence_id": "limit", "doc_id": "paper", "kind": "body_text",
+                               "text": "The primary endpoint used a fixed split.",
+                               "locator": {"page_index": 2, "section": "Methods"}})
+    report["omissions"] = [{"status": "possible_omission", "anchor_sentence_id": "s1",
+                            "reason": "The split should be stated.", "evidence_ids": ["limit"]}]
+    replacement = SOURCE.removesuffix(".") + " using a fixed validation split."
+    model = ScriptedModel([
+        ("revise", {"replacement": replacement, "evidence_ids": ["limit"], "semantic_diff": [{
+            "kind": "added", "field": "scope", "before": None, "after": "fixed split", "evidence_ids": ["limit"],
+        }]}),
+        ("verify_sentence", {"status": "passed", "reason": "Scope confirmed.", "evidence_ids": ["limit"]}),
+    ])
+    candidate = build_candidate(report, model)
+    assert build_candidate(report, ScriptedModel([])) == candidate
+    assert len(report["revisions"]) == 1
+    assert model.calls[0][1]["findings"][0]["extension"] == "omission"
+    assert candidate["text"] == replacement
+
+
+def test_reserved_supplement_is_replayed_when_interrupted_before_lookup():
+    report = report_for()
+    report["evidence"].append({"evidence_id": "new", "doc_id": "paper", "kind": "body_text",
+                               "text": "Dataset A used a fixed validation split.",
+                               "locator": {"page_index": 2, "section": "Limitations"}})
+    snapshots = []
+
+    def interrupt():
+        snapshots.append(deepcopy(report))
+        raise KeyboardInterrupt()
+
+    query = VerificationQuery(query="fixed split", requirement="scope", section="Limitations")
+    with pytest.raises(KeyboardInterrupt):
+        FollowUps(report, interrupt).collect(["claim-a"], [query], [], "verify_sentence")
+    restored = FollowUps(snapshots[0])
+    assert restored.rounds["claim-a"]["queries"][0]["section"] == "Limitations"
+    assert [item["evidence_id"] for item in restored.material(["claim-a"], [])] == ["new"]
+    assert restored.rounds["claim-a"]["evidence_ids"] == ["new"]
+
+
+def test_changed_original_judgement_invalidates_only_affected_drafts(monkeypatch, tmp_path):
+    report = report_for()
+    report["evidence"].append({"evidence_id": "corrected-result", "doc_id": "paper", "kind": "body_text",
+                               "text": "A corrected result supersedes the earlier table.", "locator": {"page_index": 3}})
+    report["claims"] = [deepcopy(report["findings"][0])]
+    report["documents"] = []
+    report["calculations"] = []
+    candidate = build_candidate(report)
+    report["candidate_proposal"] = candidate
+    report["revisions"].append({**report["revisions"][0], "sentence_id": "s2", "revision_id": "unrelated"})
+    followups = FollowUps(report)
+    followups.rounds["claim-a"] = {"stage": "verify_sentence", "evidence_ids": ["corrected-result"]}
+
+    def recheck(claim, index, model, **kwargs):
+        assert [row["evidence_id"] for row in kwargs["additional_evidence"]] == ["corrected-result"]
+        return {**claim, "verdict": "supported", "evidence_ids": ["corrected-result"]}, None
+
+    monkeypatch.setattr("abstract_review.workflow.review_claim", recheck)
+    assert _refresh_findings(report, object(), followups, None, tmp_path)
+    assert report["findings"][0]["verdict"] == "supported"
+    assert report["finding_history"][0]["verdict"] == "refuted"
+    assert "candidate_proposal" not in report
+    assert [row["status"] for row in report["revisions"]] == ["superseded", "passed"]
+    assert not _refresh_findings(report, object(), followups, None, tmp_path)

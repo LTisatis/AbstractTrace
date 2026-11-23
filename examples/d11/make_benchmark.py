@@ -101,7 +101,7 @@ def make_benchmark(output_dir: Path) -> None:
         evidence_by_source = source_ids(path, paper)
         samples.append({"sample_id": sample_id, "paper_family_id": family_id, "split": paper.split,
                         "pdf": path.name, "claims": [{"claim_id": claim.claim_id, "text": claim.text} for claim in paper.claims]})
-        labels.extend({"sample_id": sample_id, "claim_id": claim.claim_id, "verdict": claim.verdict,
+        labels.extend({"sample_id": sample_id, "claim_id": claim.claim_id, "verdict": claim.verdict, "split": paper.split,
                        "accepted_evidence_groups": [evidence_by_source[claim.source]] if claim.source else []}
                       for claim in paper.claims)
     write_json(output_dir / "inputs.json", {"schema_version": 1, "samples": samples})

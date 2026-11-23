@@ -169,4 +169,33 @@ def test_pdf_benchmark_replays_against_independently_supplied_claims(tmp_path):
     assert [row["claim_id"] for row in rows] == ["stated", "unestablished"]
     assert rows[0]["review_status"] == "completed" and rows[0]["verdict"] == "supported"
     assert rows[0]["evidence_ids"]
+    assert rows[0]["candidate_ids"]
     assert rows[1]["review_status"] == "pending" and rows[1]["verdict"] is None
+
+
+def test_predictions_use_sent_order_and_keep_measurement_metadata_on_sidecar(tmp_path):
+    pdf = tmp_path / "source.pdf"
+    pdf.touch()
+    source = manifest(tmp_path / "inputs.json", [{"sample_id": "sample", "pdf": pdf.name}])
+    anchor = {"sentence_id": "s1", "start": 0, "end": 4, "proposition": "Test"}
+    service = ServiceStub({
+        "claims": [{"claim_id": "c1", **anchor}],
+        "findings": [
+            dict(finding("c1", evidence=["cited"]), candidate_ids=["b", "a", "cited"],
+                 sent_candidate_ids=["a", "b", "cited"], stop_reason="verdict"),
+        ],
+        "usage": {"external_requests": 2, "model_events": [{"total_tokens": 9}, {"total_tokens": 12}]},
+    })
+    results, recovered = [], {}
+
+    def save(sample_id, digest, predictions):
+        recovered[sample_id] = {"input_digest": digest, "predictions": predictions}
+
+    rows = run_pdf_samples(service, source, "offline", "model", on_sample=save, on_result=results.append)
+    replay = run_pdf_samples(service, source, "offline", "model", recovered=recovered, on_result=results.append)
+    assert rows == replay
+    assert rows[0]["candidate_ids"] == ["a", "b", "cited"]
+    assert rows[0]["claim_anchor"] == anchor
+    assert results[0]["model_requests"] == 2 and results[0]["tokens"]["total_tokens"] == 21
+    assert results[0]["run_id"] == "test-run"
+    assert results[1]["cache_hit"] is True and "model_requests" not in results[1]

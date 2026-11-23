@@ -2,10 +2,12 @@
 
 import json
 import re
+import shutil
 import sqlite3
+from contextlib import asynccontextmanager
 from math import isfinite
 from pathlib import Path, PureWindowsPath
-from tempfile import TemporaryDirectory
+from threading import Event
 from typing import Annotated
 from uuid import uuid4
 
@@ -15,7 +17,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from jinja2 import Environment, PackageLoader, select_autoescape
 
 from .ingest import MAX_PDF_BYTES
-from .review import PdfReviewInput, ReviewService
+from .reporting import display_documents, display_evidence, render_markdown
+from .review import ReviewService
+from .run_store import RunBusy
+from .worker import LocalWorker
 
 
 _TEMPLATES = Environment(loader=PackageLoader("abstract_review"), autoescape=select_autoescape())
@@ -24,7 +29,7 @@ _STATUS_TEXT = {
     "completed": "已裁决", "pending": "待核验", "supported": "支持", "refuted": "反驳",
     "insufficient": "证据不足", "manual_conflict": "证据冲突", "manual_review": "需人工复核",
     "passed": "已通过", "returned": "已退回", "report_ready": "报告已就绪",
-    "paused": "已暂停", "failed": "未完成", "running": "正在处理",
+    "queued": "排队中", "paused": "已暂停", "failed": "未完成", "running": "正在处理",
     "not_checked": "未核查", "not_supported": "未获支持", "unclear": "尚无定论",
     "unverified": "未核实", "unavailable": "不可访问", "unreadable": "无法提取",
 }
@@ -38,13 +43,15 @@ def _html(request: Request, *, status_code: int = 200, **context) -> HTMLRespons
 
 def _status(service: ReviewService, run_id: str) -> dict:
     try:
-        return service.status(run_id)
+        return service.store.status(run_id)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 
 
 def _snapshot(service: ReviewService, run_id: str, version_id: str | None) -> tuple[dict, dict]:
     state = _status(service, run_id)
+    if state["report_version_id"] is None:
+        raise HTTPException(409, "当前任务还没有可查看的报告版本。")
     try:
         return state, service.export(run_id, version_id or state["report_version_id"])
     except ValueError as exc:
@@ -143,14 +150,14 @@ def _render_page(archive: Path, index: int, marks: list[tuple[pymupdf.Rect, bool
 def _selected_evidence(report: dict, evidence_id: str | None) -> dict | None:
     if evidence_id is None:
         return None
-    for evidence in report.get("evidence", []):
+    for evidence in display_evidence(report):
         if evidence["evidence_id"] == evidence_id:
             return evidence
     raise HTTPException(404, "Evidence not found in this report version")
 
 
 def _viewer(report: dict, selected: dict | None) -> tuple[dict, int, str | None] | None:
-    for document in report.get("documents", []):
+    for document in display_documents(report):
         if selected is not None:
             if document["doc_id"] == selected.get("doc_id") and _box(selected["locator"]):
                 return document, selected["locator"]["page_index"], selected["evidence_id"]
@@ -163,12 +170,26 @@ def create_app(data_dir: Path) -> FastAPI:
     """Expose the PDF review workflow on the local web server."""
     data_dir = Path(data_dir).resolve()
     service = ReviewService(data_dir / "state.sqlite3")
-    app = FastAPI(title="AbstractTrace")
+    wake = Event()
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        worker = LocalWorker(service, data_dir, wake)
+        worker.start()
+        try:
+            yield
+        finally:
+            worker.stop()
+
+    app = FastAPI(title="AbstractTrace", lifespan=lifespan)
 
     def report_page(
         request: Request, run_id: str, version_id: str | None = None,
         evidence_id: str | None = None, *, error: str | None = None, status_code: int = 200,
     ) -> HTMLResponse:
+        intake = _status(service, run_id)
+        if intake["report_version_id"] is None and version_id is None and evidence_id is None:
+            return _html(request, state=intake, error=error, status_code=status_code)
         state, report = _snapshot(service, run_id, version_id)
         selected = _selected_evidence(report, evidence_id)
         version = report["report_version_id"]
@@ -186,7 +207,7 @@ def create_app(data_dir: Path) -> FastAPI:
         return _html(
             request, status_code=status_code, error=error, report=report, state=state,
             is_current=version == state["report_version_id"], selected=selected,
-            evidence_by_id={item["evidence_id"]: item for item in report.get("evidence", [])},
+            evidence_by_id={item["evidence_id"]: item for item in display_evidence(report)},
             preview_url=preview_url, preview_document=preview_document, preview_page=preview_page,
         )
 
@@ -207,31 +228,38 @@ def create_app(data_dir: Path) -> FastAPI:
     ) -> Response:
         _block_foreign_origin(request)
         is_html = request.url.path == "/runs"
+        run_id = uuid4().hex
+        root = data_dir / "intake" / run_id
         try:
             if abstract_source not in {"pdf", "pasted"}:
                 raise ValueError("请选择有效的待审摘要来源。")
             if engine not in {"offline", "openai"}:
                 raise ValueError("请选择可用的审阅方式。")
-            data_dir.mkdir(parents=True, exist_ok=True)
-            with TemporaryDirectory(dir=data_dir) as temporary:
-                root = Path(temporary)
-                paper = _upload_pdf(pdf, root / "main")
-                attachments = tuple(
-                    _upload_pdf(upload, root / f"supplement-{i}")
-                    for i, upload in enumerate(supplements or []) if upload.filename
-                )
-                state = service.start(PdfReviewInput(
-                    paper, supplements=attachments, pasted_abstract=pasted_abstract or None,
-                    abstract_source=abstract_source, engine=engine,
-                    check_omissions=check_omissions, check_external=check_external,
-                ))
+            if abstract_source == "pasted" and not (pasted_abstract or "").strip():
+                raise ValueError("请填写待审摘要。")
+            root.mkdir(parents=True)
+            paper = _upload_pdf(pdf, root / "main")
+            attachments = [
+                _upload_pdf(upload, root / f"supplement-{i}")
+                for i, upload in enumerate(supplements or []) if upload.filename
+            ]
+            state = service.store.queue_start(run_id, {
+                "pdf": paper.relative_to(root).as_posix(),
+                "supplements": [attachment.relative_to(root).as_posix() for attachment in attachments],
+                "pasted_abstract": pasted_abstract or None, "abstract_source": abstract_source,
+                "engine": engine, "check_omissions": check_omissions, "check_external": check_external,
+            })
         except (ValueError, OSError, sqlite3.Error) as exc:
+            shutil.rmtree(root, ignore_errors=True)
             if is_html:
                 return _html(request, error=str(exc), status_code=400)
             raise HTTPException(400, str(exc)) from exc
+        wake.set()
         if is_html:
             return RedirectResponse(request.url_for("view_run", run_id=state["run_id"]), status_code=303)
-        return JSONResponse(state, status_code=202)
+        return JSONResponse(state, status_code=202, headers={
+            "Location": str(request.url_for("run_status", run_id=run_id)),
+        })
 
     @app.get("/api/v1/reviews/{run_id}")
     def run_status(run_id: str) -> dict:
@@ -252,8 +280,6 @@ def create_app(data_dir: Path) -> FastAPI:
             raise HTTPException(400, "Export format must be json or md")
         _, report = _snapshot(service, run_id, version_id)
         if format == "md":
-            from .reporting import render_markdown
-
             text, media_type = render_markdown(report), "text/markdown"
         else:
             text, media_type = json.dumps(report, ensure_ascii=False, indent=2), "application/json"
@@ -267,7 +293,7 @@ def create_app(data_dir: Path) -> FastAPI:
         run_id: str, doc_id: str, page_index: int, version_id: str | None = None, evidence_id: str | None = None,
     ) -> Response:
         _, report = _snapshot(service, run_id, version_id)
-        document = next((doc for doc in report.get("documents", []) if doc["doc_id"] == doc_id), None)
+        document = next((doc for doc in display_documents(report) if doc["doc_id"] == doc_id), None)
         if document is None or not any(p["page_index"] == page_index for p in document.get("pages", [])):
             raise HTTPException(404, "PDF page not found in this report version")
         archive = _blob_file(data_dir, document)
@@ -277,7 +303,7 @@ def create_app(data_dir: Path) -> FastAPI:
             if selected.get("doc_id") != doc_id or selected["locator"]["page_index"] != page_index:
                 raise HTTPException(404, "Evidence anchor does not belong to this page")
             page_evidence = [
-                e for e in report.get("evidence", [])
+                e for e in display_evidence(report)
                 if e.get("doc_id") == doc_id and e["locator"]["page_index"] == page_index
             ]
             marks = _marks(selected, page_evidence)
@@ -286,7 +312,7 @@ def create_app(data_dir: Path) -> FastAPI:
         })
 
     @app.post("/runs/{run_id}/selection", name="select_revision")
-    @app.post("/api/v1/reviews/{run_id}/selection", name="api_select_revision")
+    @app.post("/api/v1/reviews/{run_id}/selection", name="api_select_revision", status_code=202)
     def select_revision(
         request: Request, run_id: str, base_version_id: Annotated[str, Form()],
         submission_id: Annotated[str, Form()], revision_ids: Annotated[list[str] | None, Form()] = None,
@@ -294,24 +320,32 @@ def create_app(data_dir: Path) -> FastAPI:
     ) -> Response:
         _block_foreign_origin(request)
         is_html = request.url.path.startswith("/runs/")
-        _status(service, run_id)
+        current = _status(service, run_id)
         try:
+            if current["report_version_id"] is None:
+                raise RunBusy("请等待解析出首份报告后再提交修订。")
             state = service.submit_selection(
                 run_id, base_version_id, submission_id, revision_ids=tuple(revision_ids or ()),
-                edited_text=edited_text,
+                edited_text=edited_text, enqueue=True,
             )
         except ValueError as exc:
             stale = _status(service, run_id)["report_version_id"] != base_version_id
-            code = 409 if stale else 400
+            code = 409 if stale or isinstance(exc, RunBusy) else 400
             if is_html:
                 return report_page(request, run_id, error=str(exc), status_code=code)
             raise HTTPException(code, str(exc)) from exc
+        wake.set()
         if is_html:
-            return RedirectResponse(request.url_for("view_run", run_id=run_id), status_code=303)
-        return JSONResponse(state)
+            redirect = request.url_for("view_run", run_id=run_id).include_query_params(
+                version_id=state["report_version_id"],
+            )
+            return RedirectResponse(redirect, status_code=303)
+        return JSONResponse(state, status_code=202, headers={
+            "Location": str(request.url_for("run_status", run_id=run_id)),
+        })
 
     @app.post("/runs/{run_id}/resume", name="resume_review")
-    @app.post("/api/v1/reviews/{run_id}/resume", name="api_resume_review")
+    @app.post("/api/v1/reviews/{run_id}/resume", name="api_resume_review", status_code=202)
     def resume_review(
         request: Request, run_id: str, request_id: Annotated[str | None, Form()] = None,
         add_requests: Annotated[int, Form(ge=0)] = 0, add_seconds: Annotated[int, Form(ge=0)] = 0,
@@ -319,13 +353,17 @@ def create_app(data_dir: Path) -> FastAPI:
         _block_foreign_origin(request)
         _status(service, run_id)
         try:
-            state = service.resume(run_id, request_id=request_id, add_requests=add_requests, add_seconds=add_seconds)
+            state = service.store.queue_resume(run_id, request_id, add_requests, add_seconds)
         except ValueError as exc:
+            code = 409 if isinstance(exc, RunBusy) else 400
             if request.url.path.startswith("/runs/"):
-                return report_page(request, run_id, error=str(exc), status_code=400)
-            raise HTTPException(400, str(exc)) from exc
+                return report_page(request, run_id, error=str(exc), status_code=code)
+            raise HTTPException(code, str(exc)) from exc
+        wake.set()
         if request.url.path.startswith("/runs/"):
             return RedirectResponse(request.url_for("view_run", run_id=run_id), status_code=303)
-        return JSONResponse(state)
+        return JSONResponse(state, status_code=202, headers={
+            "Location": str(request.url_for("run_status", run_id=run_id)),
+        })
 
     return app

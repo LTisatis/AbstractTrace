@@ -3,6 +3,7 @@ from pathlib import Path
 import pymupdf
 import pytest
 
+from abstract_review.evidence import EvidenceIndex
 from abstract_review.ingest import parse_pdf
 
 
@@ -91,6 +92,47 @@ def test_figure_requires_a_unique_visible_image_and_caption(tmp_path):
     assert caption["text"] == figure["text"] == "Fig. 1. A visible sample."
     with pymupdf.open(path) as original:
         assert figure["locator"]["bbox"] == pytest.approx(original[0].get_image_info()[0]["bbox"], abs=0.01)
+
+
+def test_embedded_subfigures_need_both_caption_and_unambiguous_panel_labels(tmp_path):
+    pixels = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 20, 20), False)
+    pixels.clear_with(140)
+    left = pymupdf.Rect(40, 75, 170, 180)
+    right = pymupdf.Rect(200, 75, 330, 180)
+    with pymupdf.open() as paper:
+        page = paper.new_page()
+        for box, label in ((left, "a"), (right, "b")):
+            page.insert_image(box, pixmap=pixels, keep_proportion=False)
+            page.insert_text((box.x0 + 5, box.y0 + 13), f"({label})")
+        page.insert_text((43, 202), "Figure 8. (a) First approximation and (b) the final response.")
+
+        page = paper.new_page()
+        combined = pymupdf.Rect(40, 75, 330, 180)
+        page.insert_image(combined, pixmap=pixels, keep_proportion=False)
+        page.insert_text((45, 89), "(a)")
+        page.insert_text((204, 89), "(b)")
+        page.insert_text((43, 202), "Figure 9. (a) and (b) in one embedded bitmap.")
+        path = save(paper, tmp_path / "panels.pdf")
+
+    records = parse_pdf(path).evidence
+    figures = [item for item in records if item["kind"] == "figure"]
+    parent = next(item for item in figures if item["source_type"] == "embedded_panels")
+    panels = {item["locator"]["panel_label"]: item for item in figures if item["locator"].get("panel_label")}
+    assert set(panels) == {"a", "b"}
+    for label, box in (("a", left), ("b", right)):
+        panel = panels[label]
+        assert panel["parent_figure_evidence_id"] == parent["evidence_id"]
+        assert panel["locator"]["bbox"] == pytest.approx(tuple(box), abs=0.01)
+        assert panel["caption_evidence_id"] == parent["caption_evidence_id"]
+    assert [item["source_type"] for item in figures if item["figure_label"] == "9"] == ["embedded_image"]
+
+    index = EvidenceIndex(records)
+    try:
+        result = index.search("Figure 8(b)", limit=1)
+        assert result["evidence"] == [panels["b"]]
+        assert index.search("Figure 9(b)", limit=1)["evidence"] == []
+    finally:
+        index.close()
 
 
 def test_detects_left_column_before_right_column_and_keeps_their_coordinates(tmp_path):

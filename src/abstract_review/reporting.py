@@ -7,6 +7,23 @@ def _plain(value: object) -> str:
     return escape(str(value), quote=False).replace("[", "\\[").replace("]", "\\]")
 
 
+def display_documents(report: dict) -> list[dict]:
+    docs = {doc["doc_id"]: doc for doc in report.get("documents", ())}
+    for check in report.get("external_checks", ()):
+        if doc := check.get("document"):
+            docs.setdefault(doc["doc_id"], doc)
+    return list(docs.values())
+
+
+def display_evidence(report: dict) -> list[dict]:
+    evidence = {item["evidence_id"]: item for item in report.get("evidence", ())}
+    for check in report.get("external_checks", ()):
+        if check.get("document"):
+            for item in check.get("evidence", ()):
+                evidence.setdefault(item["evidence_id"], item)
+    return list(evidence.values())
+
+
 def render_markdown(report: dict) -> str:
     original = report["original_abstract"]
     actual = report["reviewed_abstract"]
@@ -22,8 +39,8 @@ def render_markdown(report: dict) -> str:
         lines.extend([f"- **{label}** · {_plain(item['text'])}",
                       f"  {_plain(item['reason'])}", f"  {ids}" if ids else ""])
     lines.extend(["", "## Evidence locations", ""])
-    docs = {doc["doc_id"]: doc for doc in report.get("documents", [])}
-    for item in report["evidence"]:
+    docs = {doc["doc_id"]: doc for doc in display_documents(report)}
+    for item in display_evidence(report):
         anchor = item["locator"]
         source = docs.get(item.get("doc_id"), {}).get("name", "Synthetic fixture")
         page = anchor.get("page_number", anchor["page_index"] + 1)

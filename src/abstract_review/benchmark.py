@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +12,11 @@ from .scoring import score_predictions
 
 
 _LABELS = ("supported", "refuted", "insufficient")
-_SAMPLE_FIELDS = {"sample_id", "pdf", "claims", "abstract_file", "paper_family_id", "split"}
+_SAMPLE_FIELDS = {"sample_id", "pdf", "pdf_sha256", "claims", "abstract_file", "paper_family_id", "split"}
+_ANCHOR_FIELDS = ("sentence_id", "start", "end", "proposition")
+_BENCHMARK_PIPELINE_FILES = ("audit.py", "benchmark.py", "calculations.py", "evidence.py", "followups.py",
+                             "ingest.py", "models.py", "review.py", "revisions.py", "run_store.py",
+                             "scifact.py", "workflow.py")
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +26,9 @@ class _Sample:
     pasted_abstract: str | None
     abstract_digest: str | None
     claims: tuple[tuple[str, str], ...]
+    paper_family_id: str | None
+    split: str | None
+    pdf_sha256: str | None
 
 
 def _identifier(value: object, location: str) -> str:
@@ -81,7 +89,13 @@ def _load_samples(path: Path) -> list[_Sample]:
             raise ValueError(f"{location} repeats sample_id {sample_id!r}")
         seen.add(sample_id)
         pdf = _source_path(row["pdf"], base, f"{location}.pdf")
+        pdf_sha256 = None
+        if "pdf_sha256" in row:
+            pdf_sha256 = _identifier(row["pdf_sha256"], f"{location}.pdf_sha256")
+            if len(pdf_sha256) != 64 or any(character not in "0123456789abcdef" for character in pdf_sha256):
+                raise ValueError(f"{location}.pdf_sha256 must be a lowercase SHA-256 digest")
         family = _identifier(row["paper_family_id"], f"{location}.paper_family_id") if "paper_family_id" in row else None
+        split = None
         if "split" in row:
             split = _identifier(row["split"], f"{location}.split")
             if family is None:
@@ -103,7 +117,7 @@ def _load_samples(path: Path) -> list[_Sample]:
                 raise ValueError(f"{location}.abstract_file is empty")
             abstract_digest = hashlib.sha256(raw_abstract).hexdigest()
         claims = _claims(row["claims"], f"{location}.claims") if "claims" in row else ()
-        samples.append(_Sample(sample_id, pdf, abstract, abstract_digest, claims))
+        samples.append(_Sample(sample_id, pdf, abstract, abstract_digest, claims, family, split, pdf_sha256))
     return samples
 
 
@@ -113,7 +127,7 @@ def _claim_ids(sample: _Sample, report: dict, findings: Iterable[dict]) -> list[
     return list(dict.fromkeys(row["claim_id"] for row in [*report.get("claims", []), *findings]))
 
 
-def _prediction(sample_id: str, claim_id: str, finding: dict) -> dict:
+def _prediction(sample_id: str, claim_id: str, finding: dict, claim: dict | None = None) -> dict:
     status, verdict = finding.get("review_status"), finding.get("verdict")
     if status == "completed" and verdict in _LABELS:
         evidence = finding.get("evidence_ids", [])
@@ -122,19 +136,46 @@ def _prediction(sample_id: str, claim_id: str, finding: dict) -> dict:
         evidence = finding.get("evidence_ids", [])
     else:
         status, verdict, evidence = "pending", None, []
-    return {"sample_id": sample_id, "claim_id": claim_id, "review_status": status,
-            "verdict": verdict, "evidence_ids": list(dict.fromkeys(evidence))}
+    row = {"sample_id": sample_id, "claim_id": claim_id, "review_status": status,
+           "verdict": verdict, "evidence_ids": list(dict.fromkeys(evidence))}
+    candidates = finding.get("sent_candidate_ids", finding.get("candidate_ids"))
+    if candidates is not None:
+        row["candidate_ids"] = list(dict.fromkeys(candidates))
+    if claim is not None and all(field in claim for field in _ANCHOR_FIELDS):
+        row["claim_anchor"] = {key: claim[key] for key in _ANCHOR_FIELDS}
+    if finding.get("stop_reason"):
+        row["stop_reason"] = finding["stop_reason"]
+    return row
 
 
-def _input_digest(sample: _Sample, engine: str, model: str) -> tuple[str, str]:
+def benchmark_configuration(engine: str, model: str) -> dict:
     from .ingest import PARSER_VERSION
     from .models import ROLE_PROMPTS
 
+    source_dir = Path(__file__).parent
+    pipeline = hashlib.sha256()
+    for name in _BENCHMARK_PIPELINE_FILES:
+        source = source_dir / name
+        if not source.is_file():
+            continue
+        pipeline.update(name.encode("ascii"))
+        pipeline.update(hashlib.sha256(source.read_bytes()).digest())
+    prompts = json.dumps(ROLE_PROMPTS, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return {
+        "engine": engine, "model": model, "parser_version": PARSER_VERSION,
+        "prompts_sha256": hashlib.sha256(prompts).hexdigest(), "pipeline_sha256": pipeline.hexdigest(),
+    }
+
+
+def _input_digest(sample: _Sample, configuration: dict) -> tuple[str, str]:
     with sample.pdf.open("rb") as source:
         pdf_hash = hashlib.file_digest(source, "sha256").hexdigest()
-    material = [1, PARSER_VERSION, ROLE_PROMPTS, sample.sample_id, pdf_hash, sample.abstract_digest,
-                sample.claims, engine, model]
-    digest = hashlib.sha256(json.dumps(material, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    if sample.pdf_sha256 is not None and pdf_hash != sample.pdf_sha256:
+        raise ValueError(f"benchmark sample {sample.sample_id!r}: PDF does not match the manifest SHA-256")
+    material = [1, configuration, sample.sample_id, pdf_hash, sample.abstract_digest,
+                sample.claims, sample.paper_family_id, sample.split]
+    encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
     return digest, pdf_hash
 
 
@@ -154,7 +195,21 @@ def _checkpoint_rows(sample: _Sample, input_digest: str, entry: object) -> list[
             return None
         if not all(isinstance(item, str) and item.strip() for item in evidence):
             return None
-        if _prediction(sample.sample_id, claim_id, row) != row:
+        candidates = row.get("candidate_ids", [])
+        if not isinstance(candidates, list) or not all(isinstance(item, str) and item.strip() for item in candidates):
+            return None
+        anchor = row.get("claim_anchor")
+        if anchor is not None and (
+            not isinstance(anchor, dict) or anchor.keys() != set(_ANCHOR_FIELDS)
+            or not isinstance(anchor["sentence_id"], str) or not anchor["sentence_id"].strip()
+            or not isinstance(anchor["proposition"], str) or not anchor["proposition"].strip()
+            or type(anchor["start"]) is not int or type(anchor["end"]) is not int
+            or not 0 <= anchor["start"] < anchor["end"]
+        ):
+            return None
+        if "stop_reason" in row and (not isinstance(row["stop_reason"], str) or not row["stop_reason"].strip()):
+            return None
+        if _prediction(sample.sample_id, claim_id, row, anchor) != row:
             return None
         claim_ids.append(claim_id)
     if len(set(claim_ids)) != len(claim_ids):
@@ -167,21 +222,28 @@ def _checkpoint_rows(sample: _Sample, input_digest: str, entry: object) -> list[
 def run_pdf_samples(
     service, manifest_path: Path, engine: str, model: str, *,
     recovered: dict | None = None, on_sample: Callable[[str, str, list[dict]], None] | None = None,
+    on_result: Callable[[dict], None] | None = None, configuration: dict | None = None,
 ) -> list[dict]:
     """Run input rows through the normal review service without reading gold."""
     if engine not in {"offline", "openai"}:
         raise ValueError("PDF benchmark engine must be offline or openai")
     samples = _load_samples(manifest_path)
+    configuration = configuration or benchmark_configuration(engine, model)
     checkpoints = recovered or {}
     predictions = []
     for sample in samples:
+        started = time.perf_counter()
         try:
-            digest, pdf_hash = _input_digest(sample, engine, model)
+            digest, pdf_hash = _input_digest(sample, configuration)
         except OSError as exc:
             raise ValueError(f"benchmark sample {sample.sample_id!r}: {exc}") from exc
+        result = {"sample_id": sample.sample_id, "paper_family_id": sample.paper_family_id,
+                  "split": sample.split, "pdf_sha256": pdf_hash, "input_sha256": digest}
         cached = _checkpoint_rows(sample, digest, checkpoints.get(sample.sample_id))
         if cached is not None:
             predictions.extend(cached)
+            if on_result is not None:
+                on_result({**result, "cache_hit": True, "prediction_count": len(cached)})
             continue
         request = PdfReviewInput(
             pdf=sample.pdf, pasted_abstract=sample.pasted_abstract,
@@ -198,38 +260,36 @@ def run_pdf_samples(
         if documents and documents[0]["sha256"] != pdf_hash:
             raise ValueError(f"benchmark sample {sample.sample_id!r}: PDF changed during review")
         findings = {item["claim_id"]: item for item in report.get("findings", [])}
-        rows = [_prediction(sample.sample_id, claim_id, findings.get(claim_id, {}))
+        extracted = {item["claim_id"]: item for item in report.get("claims", [])} if not sample.claims else {}
+        rows = [_prediction(sample.sample_id, claim_id, findings.get(claim_id, {}), extracted.get(claim_id))
                 for claim_id in _claim_ids(sample, report, findings.values())]
         predictions.extend(rows)
         if on_sample is not None and run.get("run_status") == "report_ready":
             on_sample(sample.sample_id, digest, rows)
+        if on_result is not None:
+            on_result(_sample_result(result, run, report, rows, time.perf_counter() - started))
     return predictions
 
 
-def _ratio(numerator: int, denominator: int) -> dict:
-    return {"numerator": numerator, "denominator": denominator,
-            "value": numerator / denominator if denominator else None}
+def _sample_result(result: dict, run: dict, report: dict, rows: list[dict], elapsed: float) -> dict:
+    usage = report.get("usage", {})
+    tokens = {}
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        values = [entry[key] for entry in usage.get("model_events", []) if type(entry.get(key)) is int]
+        tokens[key] = sum(values) if values else None
+    return {
+        **result, "cache_hit": False, "run_id": run["run_id"], "run_status": run.get("run_status"),
+        "prediction_count": len(rows), "wall_seconds": round(elapsed, 6),
+        "model_requests": usage.get("external_requests"), "tokens": tokens,
+        "follow_up_count": sum(bool(row.get("follow_up_performed")) for row in report.get("findings", [])),
+        "unreadable_pages": sum(page.get("status") == "unreadable" for document in report.get("documents", [])
+                                for page in document.get("pages", [])),
+        "revision_count": len(report.get("revisions", [])),
+        "abstract_verification_status": report.get("abstract_review", {}).get("status"),
+    }
 
 
 def summarize_classification(predictions: object, gold: object) -> dict:
     """Add completed-only scores and count false support against all unsupported gold."""
     scored = score_predictions(predictions, gold)
-    confusion = {actual: {predicted: 0 for predicted in _LABELS} for actual in _LABELS}
-    correct = completed = unsupported = false_support = 0
-    for case in scored["cases"]:
-        actual, predicted = case["gold_verdict"], case["predicted_verdict"]
-        if actual != "supported":
-            unsupported += 1
-            false_support += int(predicted == "supported" and case["review_status"] == "completed")
-        if case["review_status"] == "completed":
-            confusion[actual][predicted] += 1
-            correct += int(actual == predicted)
-            completed += 1
-
-    class_f1 = []
-    for label in _LABELS:
-        denominator = sum(confusion[label].values()) + sum(confusion[row][label] for row in _LABELS)
-        class_f1.append(2 * confusion[label][label] / denominator if denominator else 0.0)
-    return {"completed_accuracy": _ratio(correct, completed), "confusion_matrix": confusion,
-            "macro_f1": sum(class_f1) / len(_LABELS) if completed else None,
-            "unsupported_as_support": _ratio(false_support, unsupported)}
+    return {key: scored[key] for key in ("completed_accuracy", "confusion_matrix", "macro_f1", "unsupported_as_support")}
