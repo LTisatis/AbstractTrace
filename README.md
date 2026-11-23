@@ -58,7 +58,7 @@ uv run abstract-review serve
 
 原页没有可读文本时，可用 `--ocr-language eng` 启用本机 Tesseract。需要语言数据时，按安装方式配置 `TESSDATA_PREFIX`。检索默认使用 SQLite FTS5、精确词元和图扩展。`uv sync --locked --extra embeddings` 后，`--embed-model PATH` 读取本地模型目录。跨页关联仅用于有明确续表标记且表头对齐的表格。
 
-外部网络入口使用 `review start --source DOI_OR_ARXIV`。DOI 开放全文查询使用 `UNPAYWALL_EMAIL`。运行审稿引擎时，用 `--check-external` 启用内容核查。含首创性措辞时查询少量书目候选，OpenAlex 支持通过 `OPENALEX_API_KEY` 配置。用 `--check-omissions` 查找有正文依据的潜在遗漏。默认审稿只读取指定材料。
+外部网络入口使用 `review start --source DOI_OR_ARXIV`。DOI 开放全文查询使用 `UNPAYWALL_EMAIL`。arXiv 官方域名可通过 `HTTPS_PROXY` 中的免认证 HTTP 代理访问，并遵循 `NO_PROXY`。运行审稿引擎时，用 `--check-external` 启用内容核查。含首创性措辞时查询少量书目候选，OpenAlex 支持通过 `OPENALEX_API_KEY` 配置。用 `--check-omissions` 查找有正文依据的潜在遗漏。默认审稿只读取指定材料。
 
 ## 独立评分
 
@@ -106,4 +106,4 @@ uv run abstract-review bench score-reviews --run-record out/run.json --gold-mani
 - `abstract_checks` 使用布尔值 `has_conflict` 记录该版本是否存在整篇冲突。
 - `table_checks` 使用 `claim_id`、`operation` 定位复算，并记录有序的 `operand_ids`、`header_ids`、`note_ids`、十进制字符串 `result` 和 `unit`。
 
-如需估算成本，可加 `--pricing prices.json`。价格文件包含 `schema_version: 1`、`pricing_id` 和按实际返回模型名索引的 `models`。每个模型用十进制字符串填写每百万词元的美元费率 `input_per_million`、`cached_input_per_million` 和 `output_per_million`。费用结果单列缺少用量或费率的请求。
+如需估算成本，可加 `--pricing prices.json`。价格文件包含 `schema_version: 1`、`pricing_id` 和按实际返回模型名索引的 `models`。每个模型用十进制字符串填写每百万词元的美元费率 `input_per_million`、`cached_input_per_million` 和 `output_per_million`。模型有缓存写入计费时，可填写 `cache_write_30m_per_million` 和 `cache_write_12h_per_million`。费用结果单列缺少用量或费率的请求。

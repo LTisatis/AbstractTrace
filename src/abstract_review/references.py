@@ -17,6 +17,7 @@ from tempfile import NamedTemporaryFile
 from threading import Lock
 from typing import Literal
 from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import getproxies_environment, proxy_bypass_environment
 from xml.etree import ElementTree
 
 import pymupdf
@@ -173,20 +174,43 @@ class _PinnedConnection(http.client.HTTPSConnection):
             raise
 
 
+def _arxiv_proxy(host: str) -> tuple[str, int] | None:
+    # A user-configured tunnel is only used for the fixed arXiv hosts. Other
+    # publishers must still be reached through a connection pinned to a public IP.
+    if host not in _ARXIV_HOSTS:
+        return None
+    proxies = getproxies_environment()
+    if "https" not in proxies or proxy_bypass_environment(host, proxies):
+        return None
+    try:
+        proxy = urlsplit(proxies["https"])
+        if (proxy.scheme == "http" and proxy.hostname and proxy.username is None
+                and proxy.path in {"", "/"} and not proxy.query and not proxy.fragment):
+            return proxy.hostname, proxy.port or 80
+    except ValueError:
+        pass
+    return None
+
+
 def _request_once(url: str, limit: int, timeout: float) -> HttpResponse:
     deadline = time.monotonic() + timeout
     parts = urlsplit(url)
     host = parts.hostname.encode("idna").decode("ascii")
     addresses = _public_addresses(host)
+    proxy = _arxiv_proxy(host)
     path = urlunsplit((
         "", "", quote(parts.path or "/", safe="/%:;@()!$&'*,+~=-_."),
         quote(parts.query, safe="=&?/:;+,%@$()!*'~.-_"), "",
     ))
-    for address in addresses[:3]:
+    for address in addresses[:1 if proxy else 3]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        connection = _PinnedConnection(host, address, remaining)
+        if proxy:
+            connection = http.client.HTTPSConnection(*proxy, timeout=remaining)
+            connection.set_tunnel(host, port=443)
+        else:
+            connection = _PinnedConnection(host, address, remaining)
         try:
             connection.request("GET", path, headers={"User-Agent": "AbstractTrace/0.1", "Accept-Encoding": "identity"})
             with connection.getresponse() as response:

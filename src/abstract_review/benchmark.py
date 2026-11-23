@@ -286,8 +286,14 @@ def _sample_result(result: dict, run: dict, report: dict, rows: list[dict], elap
     request_usage = []
     for event in events:
         input_details = event.get("input_tokens_details") or {}
+        write_details = input_details.get("cache_write_tokens_details") or {}
         request_usage.append({key: event.get(key) for key in ("stage", "model", "status", "input_tokens", "output_tokens")}
-                             | {"cached_input_tokens": input_details.get("cached_tokens")})
+                             | {
+                                 "cached_input_tokens": input_details.get("cached_tokens"),
+                                 "cache_write_input_tokens": input_details.get("cache_write_tokens"),
+                                 "cache_write_30m_input_tokens": write_details.get("ttl_30m_tokens"),
+                                 "cache_write_12h_input_tokens": write_details.get("ttl_12h_tokens"),
+                             })
     summary = {
         **result, "cache_hit": False, "run_id": run["run_id"], "run_status": run.get("run_status"),
         "prediction_count": len(rows), "wall_seconds": round(elapsed, 6),

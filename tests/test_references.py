@@ -9,6 +9,7 @@ import pytest
 from abstract_review.references import (
     HttpResponse,
     ReferenceResolutionError,
+    _arxiv_proxy,
     _public_addresses,
     check_external,
     check_omissions,
@@ -154,6 +155,18 @@ def test_dns_answers_must_all_be_public(monkeypatch):
         _public_addresses("public.example.org")
     answers.pop()
     assert _public_addresses("public.example.org") == ["93.184.215.14"]
+
+
+def test_proxy_is_restricted_to_arxiv_and_respects_no_proxy(monkeypatch):
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    assert _arxiv_proxy("export.arxiv.org") == ("127.0.0.1", 7897)
+    assert _arxiv_proxy("arxiv.org") == ("127.0.0.1", 7897)
+    assert _arxiv_proxy("redirected.example.org") is None
+    monkeypatch.setenv("NO_PROXY", ".arxiv.org")
+    assert _arxiv_proxy("export.arxiv.org") is None
 
 
 def make_report(abstract, *evidence):

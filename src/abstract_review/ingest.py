@@ -16,13 +16,18 @@ pymupdf.no_recommend_layout()
 
 MAX_PDF_BYTES = 64 * 1024 * 1024
 MAX_PDF_PAGES = 200
-PARSER_VERSION = f"pymupdf-{pymupdf.__version__}-v2"
+_PARSER_FAMILY = f"pymupdf-{pymupdf.__version__}"
+PARSER_VERSION = f"{_PARSER_FAMILY}-v3"
+# Abstract cleanup does not change the physical locator of an existing source.
+_ANCHOR_VERSION = f"{_PARSER_FAMILY}-v2"
 
 _PDF_ERRORS = (pymupdf.mupdf.FzErrorBase, RuntimeError, ValueError)
 _ABSTRACT_HEADING = re.compile(
     r"^(?:abstract|摘\s*要)(?:\s*[:：.—–-]\s*(?P<text>.*))?$", re.IGNORECASE
 )
 _KEYWORDS_HEADING = re.compile(r"^(?:keywords?\b|index terms\b|关键词)", re.IGNORECASE)
+_ABSTRACT_WORD = re.compile(r"[^\W\d_]+")
+_WRAP_SUFFIX = re.compile(r"([^\W\d_]+)([-\u00ad])$")
 _OBJECT_LABEL = r"[A-Z]?\d+(?:[.-]\d+)*[A-Z]?"
 _LABEL_END = r"(?=$|\s|[:：.。—–(（])"
 _TABLE_CAPTION = re.compile(rf"^\s*(?P<prefix>table\s+|续表\s*|表\s*)(?P<label>{_OBJECT_LABEL}){_LABEL_END}", re.I)
@@ -367,7 +372,7 @@ def _read_page(
 
 
 def _evidence(doc_id: str, kind: str, identity: str, text: str, page: dict, bbox: BBox, section: str | None) -> dict:
-    key = f"{PARSER_VERSION}/{doc_id}/{kind}/{page['page_index']}/{identity}"
+    key = f"{_ANCHOR_VERSION}/{doc_id}/{kind}/{page['page_index']}/{identity}"
     if page["status"] == "ocr":
         key = f"{key}/ocr/{page['ocr_language']}"
     return {
@@ -653,12 +658,49 @@ def _figures(
     return figures
 
 
+def _abstract_column(heading: _Line, lines: list[_Line], width: float) -> tuple[float, float] | None:
+    """Recognize a broad text column aligned with the abstract heading."""
+    heading_left, _, heading_right, heading_bottom = heading.bbox
+    blocks = defaultdict(list)
+    for line in lines:
+        if line.bbox[1] >= heading_bottom - 1:
+            blocks[line.block_index].append(line)
+    margin = 5.0
+    for block in sorted(blocks.values(), key=lambda items: min(item.bbox[1] for item in items)):
+        first_y = min(item.bbox[1] for item in block)
+        if first_y > heading_bottom + 72:
+            break
+        left, right = min(item.bbox[0] for item in block), max(item.bbox[2] for item in block)
+        # A narrow abstract column may continue in the next column. Filter only
+        # when the text establishes a broad, heading-aligned main column.
+        if right - left >= width / 2 and left <= heading_right + margin and right >= heading_left - margin:
+            return left - margin, right + margin
+    return None
+
+
+def _abstract_text(parts: list[tuple[str, bool]]) -> str | None:
+    words = {word.casefold() for text, _ in parts for word in _ABSTRACT_WORD.findall(text)}
+    joined: list[str] = []
+    for text, same_paragraph in parts:
+        suffix = _WRAP_SUFFIX.search(joined[-1]) if same_paragraph and joined else None
+        continuation = _ABSTRACT_WORD.match(text)
+        if suffix and continuation and text[0].islower():
+            word = (suffix[1] + continuation[0]).casefold()
+            if suffix[2] == "\u00ad" or word in words:
+                joined[-1] = joined[-1][:-1]
+            joined[-1] += text
+        else:
+            joined.append(text)
+    return " ".join(joined) or None
+
+
 def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tuple[list[dict], str | None, list[dict]]:
     pages = []
-    abstract_parts: list[str] = []
+    abstract_parts: list[tuple[str, bool]] = []
     evidence = []
     section = None
     collecting_abstract = False
+    previous_abstract_line = None
     previous_tables: dict[str, _TableLabel] = {}
 
     for page_index in range(pdf.page_count):
@@ -669,14 +711,21 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
         table_captions = []
         figure_captions = []
         table_notes = []
+        abstract_column = None
         for line in lines:
             text = line.text
             if page_index < 2 and section is None and not collecting_abstract and not abstract_parts:
                 match = _ABSTRACT_HEADING.fullmatch(text)
                 if match:
                     collecting_abstract = True
+                    abstract_column = _abstract_column(line, lines, page["width"])
                     if inline_text := match.group("text"):
-                        abstract_parts.append(inline_text)
+                        abstract_parts.append((inline_text, False))
+                        previous_abstract_line = (page_index, line.block_index, line.line_index)
+                    continue
+            if collecting_abstract and abstract_column is not None:
+                left, right = abstract_column
+                if line.bbox[2] <= left or line.bbox[0] >= right:
                     continue
             if _KEYWORDS_HEADING.match(text):
                 collecting_abstract = False
@@ -687,7 +736,9 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
                 headings.append((line.bbox[1], section))
                 continue
             if collecting_abstract:
-                abstract_parts.append(text)
+                same_paragraph = previous_abstract_line == (page_index, line.block_index, line.line_index - 1)
+                abstract_parts.append((text, same_paragraph))
+                previous_abstract_line = (page_index, line.block_index, line.line_index)
                 continue
             entry = _evidence(
                 doc_id, "body_text", f"{line.block_index}/{line.line_index}", text, page, line.bbox, section,
@@ -745,7 +796,7 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
         _attach_notes(table_notes, cells, cell_entries, table_labels)
         evidence.extend(_figures(doc_id, page, images, figure_captions, lines))
 
-    return pages, " ".join(abstract_parts) or None, evidence
+    return pages, _abstract_text(abstract_parts), evidence
 
 
 def parse_pdf(path: Path, role: str = "main", *, ocr_language: str | None = None) -> ParsedPdf:
