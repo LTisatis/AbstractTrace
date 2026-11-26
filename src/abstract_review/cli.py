@@ -169,7 +169,22 @@ def serve(args: argparse.Namespace) -> None:
 
     from .web import create_app
 
-    uvicorn.run(create_app(args.data_dir.resolve()), host="127.0.0.1", port=args.port)
+    app = create_app(args.data_dir.resolve())
+    host = "127.0.0.1"
+    if not args.open_browser:
+        uvicorn.run(app, host=host, port=args.port)
+        return
+
+    from threading import Thread
+    from webbrowser import open as open_url
+
+    class BrowserServer(uvicorn.Server):
+        async def startup(self, sockets=None) -> None:
+            await super().startup(sockets)
+            port = self.servers[0].sockets[0].getsockname()[1]
+            Thread(target=open_url, args=(f"http://{host}:{port}/",), daemon=True).start()
+
+    BrowserServer(uvicorn.Config(app, host=host, port=args.port)).run()
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
@@ -379,7 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostic.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     diagnostic.set_defaults(handler=doctor)
     server = commands.add_parser("serve", help="launch the local report interface on loopback")
-    server.add_argument("--port", type=int, default=8000)
+    server.add_argument("--port", type=int, default=8000, help="local port (0 chooses an available port)")
+    server.add_argument("--open", dest="open_browser", action="store_true", help="open the browser when the server is ready")
     server.set_defaults(handler=serve)
 
     review = commands.add_parser("review", help="review local PDFs or synthetic fixtures")
