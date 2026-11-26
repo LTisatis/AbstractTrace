@@ -1,0 +1,18 @@
+{% macro evidence_href(id) -%}
+  {{ request.url_for('view_run', run_id=run_id).include_query_params(version_id=version_id, evidence_id=id) }}#pdf-preview
+{%- endmacro %}
+{% macro evidence_link(id) -%}
+  {% set record = evidence_by_id.get(id) %}
+  {% if record %}
+    {% set loc = record.locator %}
+    {% if record.doc_id and loc.bbox %}
+    <a class="anchor" data-evidence-id="{{ id }}"{% if selected and selected.evidence_id == id %} aria-current="true"{% endif %}
+       href="{{ evidence_href(id) }}" title="{{ record.text|truncate(200) }}">
+      第 {{ loc.page_label or loc.page_number or (loc.page_index + 1) }} 页{% if record.kind == 'table_note' %} · 表注{% elif record.kind == 'table_cell' %} · {{ '表头' if record.cell_role in ['column_header', 'row_header'] else '表格' }}{% elif record.kind == 'figure_caption' %} · 图注{% elif loc.section %} · {{ loc.section }}{% endif %}
+    </a>
+    {% else %}<span class="meta">{{ loc.section }} · 第 {{ loc.page_label or loc.page_number or (loc.page_index + 1) }} 页</span>{% endif %}
+  {% endif %}
+{%- endmacro %}
+{% macro evidence_links(ids) -%}
+  {% if ids %}<div class="anchors">{% for id in ids %}{{ evidence_link(id) }}{% endfor %}</div>{% endif %}
+{%- endmacro %}

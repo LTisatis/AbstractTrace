@@ -1,0 +1,44 @@
+{% from 'review_evidence.html' import evidence_link, evidence_links with context %}
+<div class="preview-content" data-preview-content{% if selected %} data-selected-evidence="{{ selected.evidence_id }}"{% endif %}>
+  <div class="pdf-heading">
+    <div>
+      <h2>PDF 原页</h2>
+      {% if preview_document %}
+        <p class="meta">{{ preview_document.name }} · 第 {{ selected.locator.page_label or selected.locator.page_number or (preview_page + 1) if selected else (preview_page + 1) }} 页</p>
+      {% endif %}
+    </div>
+    {% if preview_url %}
+      <div class="toolbar pdf-tools">
+        <a class="button button-small mobile-back" href="#findings">返回断言</a>
+        <button type="button" class="button button-small" data-zoom aria-pressed="false" hidden>放大</button>
+        <a class="button button-small" href="{{ preview_url }}" target="_blank" rel="noopener">打开页图 <span aria-hidden="true">↗</span></a>
+      </div>
+    {% endif %}
+  </div>
+  {% if preview_url %}
+    {% if selected %}
+      <div class="source-quote">
+        <div class="source-label">所选证据{% if selected.locator.section %}<span>{{ selected.locator.section }}</span>{% endif %}</div>
+        {% if selected.text %}<blockquote class="excerpt">{{ selected.text }}</blockquote>{% endif %}
+      </div>
+    {% else %}
+      <p class="source-hint">选择证据后，这里会定位并高亮对应原文。</p>
+    {% endif %}
+    <div class="pdf" tabindex="0" role="region" aria-label="PDF 页图"
+         {% if preview_focus %}data-focus-x="{{ preview_focus[0] }}" data-focus-y="{{ preview_focus[1] }}"{% endif %}>
+      <img src="{{ preview_url }}" alt="第 {{ preview_page + 1 }} 页原文{% if selected %}，已高亮所选证据{% endif %}">
+    </div>
+    {% if selected and (selected.row_header_evidence_id or selected.column_header_evidence_ids or selected.note_evidence_ids) %}
+      <div class="source-links">
+        {% if selected.row_header_evidence_id or selected.column_header_evidence_ids %}
+          <p class="meta">相关表头</p>
+          <div class="anchors">
+            {% if selected.row_header_evidence_id %}{{ evidence_link(selected.row_header_evidence_id) }}{% endif %}
+            {% for id in selected.column_header_evidence_ids|default([]) %}{{ evidence_link(id) }}{% endfor %}
+          </div>
+        {% endif %}
+        {% if selected.note_evidence_ids %}<p class="meta">表注</p>{{ evidence_links(selected.note_evidence_ids) }}{% endif %}
+      </div>
+    {% endif %}
+  {% else %}<p class="source-hint">当前报告没有可打开的 PDF 页。</p>{% endif %}
+</div>

@@ -24,6 +24,24 @@ def display_evidence(report: dict) -> list[dict]:
     return list(evidence.values())
 
 
+def evidence_path_tree(paths: list[dict], evidence_by_id: dict[str, dict]) -> dict:
+    """Merge shared prefixes of recorded paths for display."""
+    roots, evidence_ids = {}, set()
+    for path in paths:
+        ids, edges = path["evidence_ids"], path["edges"]
+        if not edges or len(ids) != len(edges) + 1 or any(eid not in evidence_by_id for eid in ids):
+            continue
+        if any((edge.get("from_id", source), edge.get("to_id", target)) != (source, target)
+               for source, target, edge in zip(ids[:-1], ids[1:], edges, strict=True)):
+            continue
+        evidence_ids.update(ids)
+        children = roots
+        for eid, relation in zip(ids, [None, *(edge["relation"] for edge in edges)], strict=True):
+            node = children.setdefault((eid, relation), {"id": eid, "relation": relation, "children": {}})
+            children = node["children"]
+    return {"roots": list(roots.values()), "evidence_ids": evidence_ids}
+
+
 def render_markdown(report: dict) -> str:
     original = report["original_abstract"]
     actual = report["reviewed_abstract"]

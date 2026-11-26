@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from jinja2 import Environment, PackageLoader, select_autoescape
 
 from .ingest import MAX_PDF_BYTES
-from .reporting import display_documents, display_evidence, render_markdown
+from .reporting import display_documents, display_evidence, evidence_path_tree, render_markdown
 from .review import ReviewService
 from .run_store import RunBusy
 from .worker import LocalWorker
@@ -35,8 +35,8 @@ _STATUS_TEXT = {
 }
 
 
-def _html(request: Request, *, status_code: int = 200, **context) -> HTMLResponse:
-    template = _TEMPLATES.get_template("review.html")
+def _html(request: Request, *, status_code: int = 200, template_name: str = "review.html", **context) -> HTMLResponse:
+    template = _TEMPLATES.get_template(template_name)
     html = template.render(request=request, statuses=_STATUS_TEXT, token=uuid4().hex, **context)
     return HTMLResponse(html, status_code=status_code, headers={"Cache-Control": "no-store"})
 
@@ -170,6 +170,18 @@ def _viewer(report: dict, selected: dict | None) -> tuple[dict, int, str | None]
     return None
 
 
+def _preview_focus(document: dict, index: int, selected: dict) -> tuple[float, float] | None:
+    page = next((item for item in document.get("pages", ()) if item["page_index"] == index), None)
+    if page is None or not page.get("width") or not page.get("height"):
+        return None
+    box = _box(selected["locator"])
+    if box is None:
+        return None
+    x = min(1.0, max(0.0, (box.x0 + box.x1) / (2 * page["width"])))
+    y = min(1.0, max(0.0, (box.y0 + box.y1) / (2 * page["height"])))
+    return {90: (1 - y, x), 180: (1 - x, 1 - y), 270: (y, 1 - x)}.get(page.get("rotation"), (x, y))
+
+
 def create_app(data_dir: Path) -> FastAPI:
     """Expose the PDF review workflow on the local web server."""
     data_dir = Path(data_dir).resolve()
@@ -190,9 +202,10 @@ def create_app(data_dir: Path) -> FastAPI:
     def report_page(
         request: Request, run_id: str, version_id: str | None = None,
         evidence_id: str | None = None, *, error: str | None = None, status_code: int = 200,
+        preview_only: bool = False,
     ) -> HTMLResponse:
         intake = _status(service, run_id)
-        if intake["report_version_id"] is None and version_id is None and evidence_id is None:
+        if not preview_only and intake["report_version_id"] is None and version_id is None and evidence_id is None:
             return _html(request, state=intake, error=error, status_code=status_code)
         state, report = _snapshot(service, run_id, version_id)
         selected = _selected_evidence(report, evidence_id)
@@ -200,19 +213,33 @@ def create_app(data_dir: Path) -> FastAPI:
         preview_url = None
         preview_document = None
         preview_page = None
+        preview_focus = None
         if preview := _viewer(report, selected):
             preview_document, preview_page, preview_evidence = preview
             page_args = {"version_id": version}
             if preview_evidence is not None:
                 page_args["evidence_id"] = preview_evidence
+                preview_focus = _preview_focus(preview_document, preview_page, selected)
             preview_url = request.url_for(
                 "review_page_image", run_id=run_id, doc_id=preview_document["doc_id"], page_index=preview_page,
             ).include_query_params(**page_args)
+        evidence_by_id = {item["evidence_id"]: item for item in display_evidence(report)}
+        preview_context = dict(
+            run_id=run_id, version_id=version, selected=selected,
+            evidence_by_id=evidence_by_id, preview_url=preview_url, preview_document=preview_document,
+            preview_page=preview_page, preview_focus=preview_focus,
+        )
+        if preview_only:
+            return _html(request, template_name="review_preview.html", **preview_context)
+        evidence_graphs = {
+            finding["claim_id"]: evidence_path_tree(paths, evidence_by_id)
+            for finding in report.get("findings", ()) if (paths := finding.get("retrieval_paths"))
+        }
         return _html(
             request, status_code=status_code, error=error, report=report, state=state,
-            is_current=version == state["report_version_id"], selected=selected,
-            evidence_by_id={item["evidence_id"]: item for item in display_evidence(report)},
-            preview_url=preview_url, preview_document=preview_document, preview_page=preview_page,
+            is_current=version == state["report_version_id"], evidence_graphs=evidence_graphs,
+            preview_endpoint=request.url_for("evidence_preview", run_id=run_id),
+            **preview_context,
         )
 
     @app.get("/", response_class=HTMLResponse)
@@ -272,6 +299,10 @@ def create_app(data_dir: Path) -> FastAPI:
     @app.get("/runs/{run_id}", response_class=HTMLResponse, name="view_run")
     def view_run(request: Request, run_id: str, version_id: str | None = None, evidence_id: str | None = None):
         return report_page(request, run_id, version_id, evidence_id)
+
+    @app.get("/runs/{run_id}/preview", response_class=HTMLResponse, name="evidence_preview")
+    def evidence_preview(request: Request, run_id: str, version_id: str | None = None, evidence_id: str | None = None):
+        return report_page(request, run_id, version_id, evidence_id, preview_only=True)
 
     @app.get("/api/v1/reviews/{run_id}/evidence/{evidence_id}")
     def review_evidence(run_id: str, evidence_id: str, version_id: str | None = None) -> dict:

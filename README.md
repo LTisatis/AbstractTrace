@@ -1,6 +1,25 @@
 # AbstractTrace
 （东南大学大模型智能体与具身智能课程期末作业）A multi-agent system that checks abstract claims against the full paper, suggests evidence-backed revisions, and independently verifies the revised abstract.
 
+## 快速开始
+
+```sh
+git clone https://github.com/LTisatis/AbstractTrace.git
+cd AbstractTrace
+```
+
+**Windows 64 位**。双击仓库里的 [start-web.cmd](start-web.cmd)。电脑上没有 `uv` 时，脚本会下载校验过的 [Astral uv 发行包](https://github.com/astral-sh/uv/releases/tag/0.9.18)。首次启动请联网，启动器会按需获取 Python 3.12 并安装 `uv.lock` 锁定的依赖。服务就绪后，脚本会用默认浏览器打开首页。
+
+**macOS 或 Linux**。先按 [uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装 `uv`，再用下面的命令启动网页。
+
+```sh
+uv run --locked --no-dev python -m abstract_review serve --open --port 0
+```
+
+服务只监听本机的 `127.0.0.1`，自动分配一个可用端口。终端会显示访问地址，也可以用 `--port 8000` 指定端口。使用时保留终端窗口，按 `Ctrl+C` 退出。论文和审稿记录默认保存在仓库的 `.review-data/`。
+
+首次体验可以上传一篇有可选中文本的 PDF，选择「本地规则」。本地规则无需 API 密钥。要使用「OpenAI 模型」审阅，先在启动服务的终端设置 `OPENAI_API_KEY`。
+
 ## D01 离线演示
 
 D01 使用合成证据和确定性的假模型。CLI 把审稿结果写入本地 SQLite，可在另一进程读取运行状态并导出 UTF-8 JSON。示例中的三个断言分别得到支持、反驳和证据不足。这个切片用于验证工程链路，PDF 解析和真实模型接入在后续任务中实现。
@@ -35,7 +54,7 @@ uv run abstract-review review export $run.run_id --version-id $run.report_versio
 
 `documents` 记录原文件名、SHA-256 和相对于数据目录的 `blob_path`。`evidence[].doc_id` 对应这份归档 PDF。用 `locator.page_index` 打开零基物理页，按 `locator.bbox` 在未旋转的裁剪页上定位文字区域。边框表格还提供表、行、列索引。`--supplement` 可重复使用，指定本人已确认归属的 PDF 附件。默认选 PDF 内摘要，有另贴摘要时可用 `--abstract-file PATH --abstract-source pasted` 切换。
 
-能从原页确认关系时，数据单元格会保留行表头、多层列表头和脚注的证据 ID。报告中的取证路径显示结果表如何连接到同一实验的方法段。Web 报告可以逐个打开这些原页锚点。
+能从原页确认关系时，数据单元格会保留行表头、多层列表头和脚注的证据 ID。Web 报告的「证据关系图」按断言显示实际走过的路径。节点可打开并高亮同一报告版本的 PDF 原页。「取证路径」可逐步查看每条连线的原文依据。
 
 不指定 `--engine` 时，PDF 入口只解析原始文档和锚点。PDF 解析依赖 PyMuPDF，分发时请参阅其许可说明。 [PyMuPDF 许可](https://pymupdf.readthedocs.io/en/latest/about.html#license-and-copyright)
 

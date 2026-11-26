@@ -80,6 +80,11 @@ def test_pdf_upload_report_export_and_version_bound_image(tmp_path, client):
     browser = client.get(browser_url, params={"evidence_id": evidence_id, "version_id": version_id})
     assert browser.status_code == 200, browser.text
     assert "下载 Markdown" in browser.text and "已高亮所选证据" in browser.text
+    fragment = client.get(f"{browser_url}/preview", params={"evidence_id": evidence_id, "version_id": version_id})
+    assert fragment.status_code == 200
+    assert f'data-selected-evidence="{evidence_id}"' in fragment.text
+    assert "data-focus-y=" in fragment.text and "已高亮所选证据" in fragment.text
+    assert "<main" not in fragment.text
     markdown = client.get(f"{api}/export", params={"version_id": version_id, "format": "md"})
     assert markdown.status_code == 200
     assert markdown.headers["content-type"].startswith("text/markdown")
@@ -309,4 +314,5 @@ def test_external_evidence_preview_is_limited_to_its_report_version(tmp_path, cl
     assert browser.status_code == 200
     assert "The publication measured samples." in browser.text
     assert "已高亮所选证据" in browser.text
+    assert client.get(f"/runs/{run_id}/preview", params={"version_id": older, "evidence_id": evidence_id}).status_code == 404
     assert evidence_id not in {item["evidence_id"] for item in service.export(run_id, latest)["evidence"]}
