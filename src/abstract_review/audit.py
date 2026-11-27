@@ -1628,12 +1628,15 @@ def review_claim(
         follow_up_requested = bool(output.follow_up_queries or output.follow_up_targets)
         decisive_fields_checked = checked <= {"found"} and not follow_up_requested
         invalid_contradiction = verdict == "refuted" and not direct_proof
+        required = {_field_key(field) for field in requirements}
+        insufficiency_checks = {field["status"] for field in coverage
+                                 if not cited_abstract or _field_key(field["requirement"]) in required}
+        # In a bounded abstract, explanations in missing_fields do not add new requirements.
         can_call_insufficient = (
-            "searched_missing" in checked and checked <= {"found", "searched_missing"}
+            "searched_missing" in insufficiency_checks and insufficiency_checks <= {"found", "searched_missing"}
             and not follow_up_requested and not conflicting & {"support", "refute"}
         )
         if cited_abstract:
-            required = {_field_key(field) for field in requirements}
             marked_missing = any(check.status == "searched_missing" and _field_key(check.requirement) in required
                                  and set(sent_candidate_ids).issuperset(check.evidence_ids) for check in output.coverage)
             can_call_insufficient = can_call_insufficient and full_abstract and marked_missing
@@ -1685,6 +1688,9 @@ def review_claim(
             reason = f"Required sources have not been fully checked. Proposed assessment: {output.reason}"
         else:
             reason = output.reason
+        if cited_abstract and verdict == "refuted" and direct_proof:
+            proof = output.direct_contradiction
+            ids = list(dict.fromkeys([*proof.evidence_ids, *proof.scope_evidence_ids, *ids]))
         finding = {**claim, "review_status": status, "verdict": verdict if status == "completed" else None,
                    "reason": reason, "evidence_ids": ids,
                    "evidence_groups": [group.model_dump() for group in output.evidence_groups],

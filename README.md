@@ -137,9 +137,15 @@ PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `pd
 
 SciFact 适配器读取作者发布的 JSONL，将每条断言与它的给定引用摘要配对，并保留原始文档和句子 ID。这组指标的适用范围是给定引用摘要。 [SciFact 数据和评估协议](https://github.com/allenai/scifact#dataset)
 
+判定证据不足时，系统要求完整摘要和对原要求的显式检查。模型可另外解释缺少哪个结果或条件，这些说明保留在报告里。
+
+反证通过范围和引文校验后，JSON 的 `evidence_ids` 先列直接反驳断言的结果句，再列用来确认范围的句子，其余引文放在后面。
+
 在线裁决逐条引用摘要中的句子，系统校验编号后恢复为原始证据 ID。支持和反驳仍需满足证据与研究范围校验。摘要只送审了一部分时，未找到证据的断言保留为待查。
 
 SciFact 在线批跑默认最多预留 8 次请求和 180 秒，可用 `--max-requests` 与 `--max-seconds` 调整。预算内的预测逐样本保存到输出目录。使用相同输入、模型和输出目录并加上 `--resume` 可以续跑，两项限额均按累计用量计算。`run.json` 记录暂停原因和样本用量，`batch.last_paused_sample` 保留最近一次已捕获暂停的详细诊断。
+
+可用 `--scifact-recheck-model gpt-6.2-astra` 为完整摘要启用一次额外复核。首轮输出证据不足或待核验时才发起复核，两次判定共用原批次的请求和时间额度。只有复核给出有原句引文且通过现有校验的支持或反驳，才替换首轮结果。
 
 ```powershell
 uv run abstract-review bench prepare-scifact --corpus data/corpus.jsonl --claims data/claims_dev.jsonl --split dev --dataset-version author-release-2020 --output-dir .review-data/scifact
@@ -161,7 +167,7 @@ uv run abstract-review bench run --engine offline --input-manifest .review-data/
 uv run abstract-review bench score --dataset claimbench --predictions .review-data/claimbench/out/predictions.json --gold-manifest .review-data/claimbench/gold.json --output .review-data/claimbench/out/scores.json
 ```
 
-SciTabAlign 适配器读取作者发布的表格和单元格标注。离线默认排列最多 8 格。启用 `--engine openai` 后，系统根据断言匹配的行列及比较范围选择 8 格或 16 格的上限。模型读取完整表格和表题，返回经过坐标校验的原始单元格。可用 `--table-cell-limit 8` 或 `--table-cell-limit 16` 复跑固定上限，`run.json` 记录所用策略。两种模式报告前 1、3、5、8、16 格的选证指标和完整组命中，并单列空标注和越界金标。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
+SciTabAlign 适配器读取作者发布的表格和单元格标注。离线默认排列最多 8 格。启用 `--engine openai` 后，表格总共不超过 8 格时，上限为 8 格，其余表格上限为 24 格。模型读取完整表格和表题，选出相关数值及解释这些数值所需的行名、表头和对照单元格。所有坐标都会与原表核对。如果模型选了超过 8 格，系统会结合断言、行名和表头重排这些坐标，让关键数值及其上下文靠前。用 `--table-cell-limit 48` 可以为跨多行、多指标的断言留出更多证据位置，也可固定为 8、16 或 24 格。每条断言使用一次模型调用，`run.json` 记录所用上限。两种模式报告前 1、3、5、8、16、24、48 格的选证指标和完整组命中，并单列空标注和越界金标。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
 
 ```powershell
 uv run abstract-review bench prepare-scitabalign --annotations data/data.json --dataset-version author-release --output-dir .review-data/scitabalign

@@ -217,6 +217,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
         raise ValueError("benchmark-wide limits are available for online SciFact and SciTabAlign")
     if args.table_cell_limit is not None and args.dataset != "scitabalign":
         raise ValueError("--table-cell-limit requires --dataset scitabalign")
+    if args.scifact_recheck_model and (args.dataset != "scifact" or args.engine != "openai"):
+        raise ValueError("--scifact-recheck-model requires online SciFact")
 
     def finish(predictions: list[dict], configuration: dict, batch: dict | None = None) -> None:
         if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
@@ -242,8 +244,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scifact-cited-abstracts"
         if online_dataset:
+            configuration["cited_abstract_coverage_revision"] = 2
+            configuration["cited_abstract_citation_order"] = "decisive_result_first"
+            if args.scifact_recheck_model:
+                configuration["cited_abstract_recheck_model"] = args.scifact_recheck_model
             with scifact_checkpoint(checkpoints, manifest_hash, configuration, resume=args.resume, **batch_limits) as batch:
-                predictions = run_scifact(manifest, engine, args.model, batch=batch)
+                predictions = run_scifact(manifest, engine, args.model, batch=batch, recheck_model=args.scifact_recheck_model)
                 results.extend(batch.results)
                 finish(predictions, configuration, batch.summary(len(manifest["samples"])))
             return
@@ -258,9 +264,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scitabalign-cells"
         configuration["table_cell_limit"] = (
-            args.table_cell_limit if args.table_cell_limit is not None else ("adaptive" if online_dataset else 8)
+            args.table_cell_limit if args.table_cell_limit is not None
+            else ("8_for_small_tables_else_24" if online_dataset else 8)
         )
         if online_dataset:
+            configuration["table_selector_revision"] = 3
             from .models import ModelUnavailable, ResponsesModel
             from .scifact import benchmark_checkpoint
 
@@ -517,8 +525,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-dir", type=Path, required=True)
     run.add_argument("--engine", choices=("offline", "openai"), help="benchmark engine for PDF, SciFact or SciTabAlign")
     run.add_argument("--dataset", choices=("scifact", "scitabalign"), help="select a public benchmark adapter")
-    run.add_argument("--table-cell-limit", type=int, choices=(8, 16),
-                     help="override SciTabAlign selection size (online default: adaptive; offline default: 8)")
+    run.add_argument("--table-cell-limit", type=int, choices=(8, 16, 24, 48),
+                     help="override SciTabAlign selection size (online default: 8 for small tables, else 24; offline default: 8)")
+    run.add_argument("--scifact-recheck-model", help="optionally recheck one undecided complete SciFact abstract")
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     run.add_argument("--embed-model", type=Path, help="path to an installed local Sentence Transformers model")
     run.add_argument("--rerank-model", type=Path, help="path to an installed local CrossEncoder")

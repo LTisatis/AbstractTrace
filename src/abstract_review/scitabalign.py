@@ -20,23 +20,16 @@ from pydantic import StrictInt
 from .evidence import EvidenceIndex, _MAX_CANDIDATES
 from .models import ModelPaused, ModelUnavailable, Schema
 from .scoring import _DEFAULT_RANK_CUTOFFS, _identifier, _parse_predictions, _ratio, _rows, semantic_manifest_sha256
-from .table_ranking import _label_terms, rank_table_cells
+from .table_ranking import rank_table_cells
 
 
 _DATASET = "scitabalign-cells"
 _STATUSES = ("aligned", "empty_explanation", "invalid_coordinates")
 _COORDINATE = re.compile(r"(0|[1-9][0-9]*):(0|[1-9][0-9]*)")
 _SELECTION_LIMIT = max(_DEFAULT_RANK_CUTOFFS)
-_WIDE_SELECTION_LIMIT = 16
-_TABLE_CUTOFFS = (*_DEFAULT_RANK_CUTOFFS, _WIDE_SELECTION_LIMIT)
-_BROAD_SCOPE = re.compile(
-    r"\b(?:all|each|every|across|throughout|highest|lowest|best|worst|in general)\b", re.IGNORECASE,
-)
-_COMPARISON = re.compile(
-    r"\b(?:than|compared?|comparable|baselines?|outperform\w*|dominat\w*|improv\w*|gap|"
-    r"difference|margin|differ\w*|increas\w*|decreas\w*|greater|lower|higher|no effect|negligible)\b",
-    re.IGNORECASE,
-)
+_ONLINE_SELECTION_LIMIT = 24
+_TABLE_CELL_LIMITS = (_SELECTION_LIMIT, 16, _ONLINE_SELECTION_LIMIT, 48)
+_TABLE_CUTOFFS = (*_DEFAULT_RANK_CUTOFFS, *_TABLE_CELL_LIMITS[1:])
 
 
 class _CellCoordinate(Schema):
@@ -181,33 +174,9 @@ def _load_inputs(manifest: object) -> list[dict]:
 
 
 def _selection_limit(sample: dict) -> int:
-    """Expand the budget when named rows and columns imply a larger evidence group."""
+    """Give larger tables room for the full rationale, including headers and comparisons."""
     grid = sample["grid"]
-    claim = sample["claim"]
-    if len(grid) * len(grid[0]) <= _SELECTION_LIMIT:
-        return _SELECTION_LIMIT
-    query = _label_terms(claim)
-
-    def matched(labels):
-        terms = [_label_terms(label) for label in labels]
-        frequency = Counter(term for label in terms for term in label)
-        return sum(any(frequency[term] == 1 for term in label & query) for label in terms)
-
-    rows = matched([row[0] for row in grid[1:]])
-    columns = matched(grid[0][1:])
-    if _BROAD_SCOPE.search(claim):
-        if columns and rows < 2:
-            rows = len(grid) - 1
-        elif rows and not columns:
-            columns = len(grid[0]) - 1
-        elif not rows and not columns:
-            rows = len(grid) - 1
-    elif _COMPARISON.search(claim) and rows < 2 and columns < 2:
-        # An unnamed comparator can refer to several eligible rows or columns.
-        return _WIDE_SELECTION_LIMIT
-    rows, columns = max(1, rows), max(1, columns)
-    needed = rows * columns + rows + columns  # values, row labels, and column headers
-    return _WIDE_SELECTION_LIMIT if needed > _SELECTION_LIMIT else _SELECTION_LIMIT
+    return _SELECTION_LIMIT if len(grid) * len(grid[0]) <= _SELECTION_LIMIT else _ONLINE_SELECTION_LIMIT
 
 
 def _offline_selection(sample: dict, limit: int) -> tuple[list[str], str]:
@@ -215,6 +184,16 @@ def _offline_selection(sample: dict, limit: int) -> tuple[list[str], str]:
     with closing(EvidenceIndex(cells)) as index:
         seeds = [item["evidence_id"] for item in index.search(sample["claim"], limit=_MAX_CANDIDATES)["evidence"]]
     return rank_table_cells(sample["claim"], cells, seeds, limit=limit), "ranking_only"
+
+
+def _rerank_selected_cells(sample: dict, selected: list[str]) -> list[str]:
+    if len(selected) <= _SELECTION_LIMIT:
+        return selected
+    cells = _table_cells(sample, sample["grid"])
+    ranked = rank_table_cells(sample["claim"], cells, selected, limit=len(cells))
+    chosen = set(selected)
+    # Use the table context to rank the model's evidence without adding or dropping a coordinate.
+    return list(dict.fromkeys([*(eid for eid in ranked if eid in chosen), *selected]))
 
 
 def _model_selection(sample: dict, model, limit: int) -> tuple[list[str], str]:
@@ -228,15 +207,16 @@ def _model_selection(sample: dict, model, limit: int) -> tuple[list[str], str]:
             or len(set(map(tuple, coordinates))) != len(coordinates)):
         return [], "invalid_model_cell_selection"
     reason = "model_cell_selection" if coordinates else "model_cell_selection_empty"
-    return [_cell_id(sample["sample_id"], row, column) for row, column in coordinates], reason
+    selected = [_cell_id(sample["sample_id"], row, column) for row, column in coordinates]
+    return _rerank_selected_cells(sample, selected), reason
 
 
 def run_scitabalign(manifest: object, *, model=None, batch=None, cell_limit: int | None = None) -> list[dict]:
     """Select ranked evidence from the given table under a fixed or adaptive budget."""
     if batch is not None and model is None:
         raise ValueError("SciTabAlign batch checkpoints are for model selection")
-    if cell_limit is not None and (type(cell_limit) is not int or cell_limit not in (_SELECTION_LIMIT, _WIDE_SELECTION_LIMIT)):
-        raise ValueError("SciTabAlign cell limit must be 8 or 16")
+    if cell_limit is not None and (type(cell_limit) is not int or cell_limit not in _TABLE_CELL_LIMITS):
+        raise ValueError("SciTabAlign cell limit must be 8, 16, 24, or 48")
     samples = _load_inputs(manifest)
     predictions = []
     for sample in samples:

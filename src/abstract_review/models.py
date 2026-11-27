@@ -128,10 +128,27 @@ class _JudgeWire:
 
 
 ROLE_PROMPTS = {
-    "select_table_cells": "Select table cells that are necessary to decide the supplied claim. Use only the given table and caption. Return cell coordinates in priority order, with the most decisive cells first and no duplicates. Both indices are zero-based, and row zero is the table header. Include values, comparison operands, and headers or labels when they are needed to interpret the values. Respect the supplied selection limit. Return an empty list when no cell helps decide the claim.",
+    "select_table_cells": (
+        "Select the smallest set of table cells that lets a reader verify the claim from the table and caption. "
+        "Identify the tested rows and metric columns. For comparisons, include the focal value and the relevant "
+        "comparator values. For a claim about all conditions or the best or worst result, check each applicable "
+        "condition on the relevant axes. Include the row labels and column headers that identify selected operands, "
+        "especially when there are several methods or datasets. Keep unrelated rows and metrics out. Return unique "
+        "coordinates in priority order, keeping evidence for each comparison together, within the selection limit. "
+        "Both indices are zero-based and row zero is the header. Return an empty list if no cell helps decide the claim."
+    ),
     "extract": "Extract atomic verifiable claims from numbered abstract sentences. Quote exact substrings, preserve qualifications and quantifiers, and provide concise support and counter-evidence queries. Omit no verifiable material claim. Set empirical_result to true for measured experimental outcomes, comparisons, or observed failures, false for pure methods or definitions, and null when unclear. Use requirements for the facts and conditions needed to decide the claim as worded. Leave optional reporting details out of requirements. For a compound assertion, emit its independently verifiable operands with distinct, non-overlapping exact quotes and self-contained propositions preserving shared conditions. In compounds, give the source sentence ID, operator and/or, and zero-based indexes into claims. Use or only for an actual disjunction in the author's statement, not a list within one subject, contrast, alias, conditional, or a comparison with two operands. Do not flatten mixed or ambiguous logical structure. Each compound must cover the full asserted relationship in its sentence.",
     "judge": "Judge the claim against the supplied original paper evidence. Compare study conditions and units. Cite only supplied IDs. Distinguish refutation, evidence insufficiency after checks, and pending when potentially decisive evidence is not checked. Treat visually estimated or OCR-uncertain values as approximate. Identify conflicting evidence and bounded follow-up queries. Any calculation supplied is authoritative for the specified operands only.",
-    "judge_cited_abstract": "Verify the exact claim using only the supplied abstract sentences. Compare their meaning, polarity, and study scope. Follow the decision rules and cite only the supplied sentence IDs.",
+    "judge_cited_abstract": (
+        "Verify the claim using only the supplied abstract sentences. Read the relevant findings and conclusion "
+        "together. An explicit finding reported from earlier work can be evidence for the relationship it states. "
+        "Resolve terms in context and accept a faithful paraphrase when it preserves the population, intervention, "
+        "comparator, endpoint, direction, and strength. A broader name can refer to the same studied entity if "
+        "the text licenses that reading. Keep limitations to a subtype, subgroup, or condition when they change "
+        "the meaning. Keep association separate from causation and a reported lack of association separate from "
+        "proof that an effect is impossible. Before deciding evidence is insufficient, identify the specific fact "
+        "or scope that remains unestablished. Follow the decision rules and cite only the supplied sentence IDs."
+    ),
     "revise": "Propose a minimal revision of the supplied sentence based on cited paper evidence. Preserve supported facts and conditions, identify substantiated semantic changes, and leave unsupported changes unresolved.",
     "provisional_revision": "The target claim is still pending, and these evidence excerpts may be incomplete. Propose one cautious standalone rewrite in the original claim's language, limited to statements directly supported by the supplied evidence. Omit unresolved comparisons, generalizations, causal claims or values from the rewrite and list what would need checking to restore them. Preserve the original study scope and report uncertainty accurately. Do not infer that an unchecked claim is false. If there is no useful narrower statement grounded in the excerpts, return a null replacement. When inline_context is supplied, also offer inline_replacement only if the same qualified meaning can replace the exact excerpt in its sentence grammatically without changing other claims or their scope. Otherwise return null for inline_replacement. Cite only supplied evidence IDs and include at least one for any replacement. Explain the changes in concise Chinese, with specific remaining checks.",
     "verify_sentence": "Independently verify the exact revised sentence against the paper evidence, including counterevidence and limitations. Check for lost constraints and new factual claims. Cite only supplied IDs. If a missing fact would change the result, request at most two targeted checks of named sources and identify the missing requirement.",

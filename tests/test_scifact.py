@@ -7,7 +7,7 @@ import pytest
 from abstract_review.audit import review_claim, supplied_claims
 from abstract_review.evidence import EvidenceIndex
 from abstract_review.models import ResponsesModel
-from abstract_review.scifact import prepare_scifact, run_scifact, score_scifact
+from abstract_review.scifact import prepare_scifact, run_scifact, scifact_checkpoint, score_scifact
 
 
 def write_jsonl(path, rows):
@@ -85,7 +85,10 @@ def test_scifact_wire_uses_only_original_sentence_ids_and_disallows_ranges(tmp_p
     def parse(**request):
         schema = request["text_format"]
         assert schema.model_json_schema()["properties"]["evidence_ranges"]["type"] == "null"
-        assert "only the supplied abstract sentences" in request["input"][0]["content"]
+        prompt = request["input"][0]["content"]
+        assert "only the supplied abstract sentences" in prompt
+        assert "accept a faithful paraphrase" in prompt
+        assert "Keep limitations to a subtype, subgroup, or condition" in prompt
         material = json.loads(request["input"][1]["content"])
         assert "list each ID explicitly" in material["coverage_instructions"]
         assert "direct_inspections" not in material and "follow_up_already_performed" not in material
@@ -112,6 +115,25 @@ def test_scifact_does_not_complete_insufficient_with_unresolved_or_conflicting_o
 
     assert prediction["review_status"] == "pending" and prediction["verdict"] is None
     assert len(model.requests) == 1
+
+
+@pytest.mark.parametrize(("checked", "expected"), [("searched_missing", "insufficient"), ("unchecked", None)])
+def test_scifact_missing_detail_does_not_replace_explicit_coverage_of_the_supplied_requirement(
+    tmp_path, checked, expected,
+):
+    judge = AbstractJudge("insufficient", status=checked)
+
+    def call(stage, material, schema):
+        return judge.call(stage, material, schema).model_copy(
+            update={"missing_fields": ["the reported observation rate in the intervention group"]}
+        )
+
+    inputs = _one_scifact_abstract(tmp_path, ["Treatment was randomized.", " ", "The records tracked enrollment only."])
+    prediction, = run_scifact(inputs, "openai", "unused", make_model=lambda *_a, **_kw: SimpleNamespace(call=call))
+
+    assert len(judge.requests) == 1
+    assert prediction["verdict"] == expected
+    assert prediction["review_status"] == ("completed" if expected else "pending")
 
 
 @pytest.mark.parametrize(("sentence_count", "repeat"), [(17, 1), (3, 40)])
@@ -143,6 +165,55 @@ def test_scifact_empty_abstract_is_not_a_completed_insufficient_verdict(tmp_path
     assert model.requests == []
 
 
+@pytest.mark.parametrize(("scope", "expected"), [("same", "refuted"), ("different", "insufficient")])
+def test_scifact_optional_model_recovers_only_a_validated_verdict_from_the_same_abstract(tmp_path, scope, expected):
+    inputs = _one_scifact_abstract(tmp_path, [
+        "Treatment was randomized.", " ", "Treatment increased the target observation rate.",
+    ])
+    initial = AbstractJudge("insufficient")
+    second = AbstractJudge("refuted", proof_scope=scope)
+    attempts = []
+
+    def make_model(name, **options):
+        attempts.append((name, options["max_requests"]))
+        return initial if name == "first" else second
+
+    prediction, = run_scifact(inputs, "openai", "first", make_model=make_model, recheck_model="verifier")
+
+    assert attempts == [("first", 4), ("verifier", 1)]
+    assert initial.requests == second.requests
+    assert prediction["verdict"] == expected
+    assert prediction["evidence_ids"] == (["scifact:11:2"] if expected == "refuted" else [])
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_scifact_optional_model_uses_the_batch_request_budget(tmp_path, limit):
+    inputs = _one_scifact_abstract(tmp_path, ["The groups were randomized.", "", "Treatment increased the rate."])
+    called = []
+
+    def make_model(name, *, before_call, **options):
+        judge = AbstractJudge("insufficient" if name == "first" else "refuted")
+        events = []
+
+        def call(*args):
+            before_call()
+            called.append(name)
+            events.append({"input_tokens": 12, "output_tokens": 8, "total_tokens": 20})
+            return judge.call(*args)
+
+        return SimpleNamespace(call=call, events=events)
+
+    with scifact_checkpoint(tmp_path / "batch.sqlite3", "a" * 64, {"model": "first", "recheck": "second"},
+                            resume=False, max_requests=limit) as batch:
+        prediction, = run_scifact(inputs, "openai", "first", batch=batch, make_model=make_model,
+                                  recheck_model="second")
+        assert batch.requests_used == batch.results[0]["model_requests"] == limit
+        assert batch.results[0]["tokens"]["total_tokens"] == 20 * limit
+
+    assert called == ["first", "second"][:limit]
+    assert prediction["verdict"] == ("refuted" if limit == 2 else "insufficient")
+
+
 @pytest.mark.parametrize(("verdict", "proof_scope", "expected"), [
     ("supported", None, "supported"),
     ("refuted", "same", "refuted"),
@@ -166,6 +237,29 @@ def test_scifact_preserves_grounded_citations_and_rejects_scope_mismatched_refut
         assert prediction["review_status"] == "completed" and prediction["evidence_ids"] == ["scifact:11:2"]
     else:
         assert prediction["review_status"] == "pending"
+
+
+def test_scifact_lists_the_validated_opposite_result_before_scope_and_context(tmp_path):
+    inputs = _one_scifact_abstract(tmp_path, [
+        "Treatment and control groups were randomized.", "Follow-up was complete.",
+        "The collected outcome was the target observation rate.", "Treatment increased the target observation rate.",
+    ])
+    scope, context, outcome, result = [f"scifact:11:{n}" for n in range(4)]
+
+    def call(stage, material, schema):
+        return schema(verdict="refuted", reason="Treatment increased the same rate.", missing_fields=[],
+                      evidence_groups=[{"role": "refute", "evidence_ids": [scope, context, outcome, result]}],
+                      follow_up_queries=[],
+                      coverage=[{"requirement": material["requirements"][0], "status": "found",
+                                 "evidence_ids": [scope, outcome, result]}],
+                      direct_contradiction={"evidence_ids": [result], "scope_evidence_ids": [scope, outcome],
+                                            "subject_and_conditions": "same", "relation": "opposite_result",
+                                            "scope_reason": "The outcome and study arms match.", "supplementary_fields": []})
+
+    prediction, = run_scifact(inputs, "openai", "unused", make_model=lambda *_a, **_kw: SimpleNamespace(call=call))
+
+    assert prediction["verdict"] == "refuted"
+    assert prediction["evidence_ids"] == [result, scope, outcome, context]
 
 
 def test_ordinary_pdf_review_does_not_infer_insufficiency_from_ranked_abstract_hits():
