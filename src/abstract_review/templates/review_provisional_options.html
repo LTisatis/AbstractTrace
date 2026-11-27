@@ -1,0 +1,18 @@
+<div class="provisional-editor" data-provisional-options{% if not provisional_options %} hidden{% endif %}>
+  {% if provisional_options %}
+  <p class="field-caption">应用暂定修订</p>
+  <p class="meta">将选中的改句填入编辑框。检查后点「保存并复核」。</p>
+  {% for option in provisional_options %}
+  <div class="provisional-option">
+    <p class="excerpt">{{ option.preview }}</p>
+    {% if option.replacement and option.source %}
+    <button class="button button-small" type="button" data-provisional-apply
+            data-source="{{ option.source }}" data-replacement="{{ option.replacement }}">一键应用</button>
+    {% else %}
+    <p class="meta">这条改句需要结合前后文手动填写。</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+  <p class="provisional-apply-status meta" role="status" hidden></p>
+  {% endif %}
+</div>

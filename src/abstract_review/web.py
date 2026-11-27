@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import sqlite3
+from collections import Counter
 from contextlib import asynccontextmanager
 from math import isfinite
 from pathlib import Path, PureWindowsPath
@@ -160,14 +161,27 @@ def _selected_evidence(report: dict, evidence_id: str | None) -> dict | None:
     raise HTTPException(404, "Evidence not found in this report version")
 
 
-def _viewer(report: dict, selected: dict | None) -> tuple[dict, int, str | None] | None:
-    for document in display_documents(report):
-        if selected is not None:
-            if document["doc_id"] == selected.get("doc_id") and _box(selected["locator"]):
-                return document, selected["locator"]["page_index"], selected["evidence_id"]
-        elif document.get("pages"):
-            return document, document["pages"][0]["page_index"], None
-    return None
+def _viewer(
+    report: dict, selected: dict | None, doc_id: str | None, page: int | None,
+) -> tuple[dict, int, str | None] | None:
+    target_doc = doc_id
+    if target_doc is None and selected:
+        target_doc = selected.get("doc_id")
+    document = next((item for item in display_documents(report) if item.get("pages")
+                     and (target_doc is None or item["doc_id"] == target_doc)), None)
+    locator = selected["locator"] if selected and selected.get("doc_id") == target_doc else None
+    anchor = locator["page_index"] if locator and _box(locator) else None
+    if document is None or (selected is not None and anchor is None and doc_id is None and page is None):
+        if page is not None or doc_id is not None:
+            raise HTTPException(404, "PDF document not found in this report version")
+        return None
+    indices = {row["page_index"] for row in document["pages"]}
+    index = anchor if anchor is not None else min(indices)
+    if page is not None:
+        index = page - 1
+    if index not in indices:
+        raise HTTPException(404, "PDF page not found in this report version")
+    return document, index, selected["evidence_id"] if selected and anchor == index else None
 
 
 def _preview_focus(document: dict, index: int, selected: dict) -> tuple[float, float] | None:
@@ -201,8 +215,8 @@ def create_app(data_dir: Path) -> FastAPI:
 
     def report_page(
         request: Request, run_id: str, version_id: str | None = None,
-        evidence_id: str | None = None, *, error: str | None = None, status_code: int = 200,
-        preview_only: bool = False,
+        evidence_id: str | None = None, *, doc_id: str | None = None, page: int | None = None,
+        error: str | None = None, status_code: int = 200, preview_only: bool = False,
     ) -> HTMLResponse:
         intake = _status(service, run_id)
         if not preview_only and intake["report_version_id"] is None and version_id is None and evidence_id is None:
@@ -214,8 +228,13 @@ def create_app(data_dir: Path) -> FastAPI:
         preview_document = None
         preview_page = None
         preview_focus = None
-        if preview := _viewer(report, selected):
+        preview_evidence = None
+        page_numbers = []
+        page_position = 0
+        if preview := _viewer(report, selected, doc_id, page):
             preview_document, preview_page, preview_evidence = preview
+            page_numbers = sorted({item["page_index"] + 1 for item in preview_document["pages"]})
+            page_position = page_numbers.index(preview_page + 1)
             page_args = {"version_id": version}
             if preview_evidence is not None:
                 page_args["evidence_id"] = preview_evidence
@@ -227,17 +246,26 @@ def create_app(data_dir: Path) -> FastAPI:
         preview_context = dict(
             run_id=run_id, version_id=version, selected=selected,
             evidence_by_id=evidence_by_id, preview_url=preview_url, preview_document=preview_document,
-            preview_page=preview_page, preview_focus=preview_focus,
+            preview_page=preview_page, preview_focus=preview_focus, preview_evidence=preview_evidence,
+            page_numbers=page_numbers, page_position=page_position, requested_doc=doc_id, requested_page=page,
         )
         if preview_only:
             return _html(request, template_name="review_preview.html", **preview_context)
+        from .revisions import provisional_editor_options
+
         evidence_graphs = {
             finding["claim_id"]: evidence_path_tree(paths, evidence_by_id)
             for finding in report.get("findings", ()) if (paths := finding.get("retrieval_paths"))
         }
+        finding_counts = Counter(
+            row.get("verdict") or row.get("review_status")
+            for kind in ("compound_findings", "findings") for row in report.get(kind, ())
+        )
         return _html(
             request, status_code=status_code, error=error, report=report, state=state,
             is_current=version == state["report_version_id"], evidence_graphs=evidence_graphs,
+            finding_counts=finding_counts,
+            provisional_options=provisional_editor_options(report),
             preview_endpoint=request.url_for("evidence_preview", run_id=run_id),
             **preview_context,
         )
@@ -297,12 +325,14 @@ def create_app(data_dir: Path) -> FastAPI:
         return _status(service, run_id)
 
     @app.get("/runs/{run_id}", response_class=HTMLResponse, name="view_run")
-    def view_run(request: Request, run_id: str, version_id: str | None = None, evidence_id: str | None = None):
-        return report_page(request, run_id, version_id, evidence_id)
+    def view_run(request: Request, run_id: str, version_id: str | None = None, evidence_id: str | None = None,
+                 doc_id: str | None = None, page: int | None = None):
+        return report_page(request, run_id, version_id, evidence_id, doc_id=doc_id, page=page)
 
     @app.get("/runs/{run_id}/preview", response_class=HTMLResponse, name="evidence_preview")
-    def evidence_preview(request: Request, run_id: str, version_id: str | None = None, evidence_id: str | None = None):
-        return report_page(request, run_id, version_id, evidence_id, preview_only=True)
+    def evidence_preview(request: Request, run_id: str, version_id: str | None = None, evidence_id: str | None = None,
+                         doc_id: str | None = None, page: int | None = None):
+        return report_page(request, run_id, version_id, evidence_id, doc_id=doc_id, page=page, preview_only=True)
 
     @app.get("/api/v1/reviews/{run_id}/evidence/{evidence_id}")
     def review_evidence(run_id: str, evidence_id: str, version_id: str | None = None) -> dict:
@@ -378,6 +408,40 @@ def create_app(data_dir: Path) -> FastAPI:
         return JSONResponse(state, status_code=202, headers={
             "Location": str(request.url_for("run_status", run_id=run_id)),
         })
+
+    @app.post("/runs/{run_id}/provisional-revision", name="provisional_revision")
+    def provisional_revision(
+        request: Request, run_id: str, version_id: Annotated[str, Form()], claim_id: Annotated[str, Form()],
+    ) -> Response:
+        from .models import ModelUnavailable
+        from .revisions import generate_provisional, provisional_editor_options
+
+        _block_foreign_origin(request)
+        _status(service, run_id)
+        fragment = request.headers.get("x-abstracttrace-fragment") == "provisional"
+        try:
+            proposal = generate_provisional(service, run_id, version_id, claim_id)
+        except (ValueError, ModelUnavailable) as exc:
+            if isinstance(exc, ModelUnavailable):
+                message, code = "暂定修订未能生成。请检查模型连接和用量，或稍后重试。", 502
+            elif isinstance(exc, RunBusy):
+                message, code = "报告正在处理或已更新。请打开最新报告后重试。", 409
+            else:
+                message, code = str(exc), 400
+            if fragment:
+                raise HTTPException(code, message) from exc
+            return report_page(request, run_id, error=message, status_code=code)
+
+        if fragment:
+            report = service.export(run_id, version_id)
+            return _html(
+                request, template_name="review_provisional.html", run_id=run_id, version_id=version_id,
+                finding_id=claim_id, proposal=proposal,
+                refresh_provisional_options=True, provisional_options=provisional_editor_options(report),
+                evidence_by_id={item["evidence_id"]: item for item in display_evidence(report)},
+            )
+        url = request.url_for("view_run", run_id=run_id).include_query_params(version_id=version_id, finding=claim_id)
+        return RedirectResponse(url.replace(fragment=f"finding-{claim_id}"), status_code=303)
 
     @app.post("/runs/{run_id}/resume", name="resume_review")
     @app.post("/api/v1/reviews/{run_id}/resume", name="api_resume_review", status_code=202)

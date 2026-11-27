@@ -32,6 +32,14 @@ class RevisionDraft(Schema):
     semantic_diff: list[SemanticChange]
 
 
+class ProvisionalRevision(Schema):
+    replacement: str | None
+    inline_replacement: str | None = None
+    reason: str
+    evidence_ids: list[str]
+    remaining_checks: list[str]
+
+
 class SentenceCheck(Schema):
     status: Literal["passed", "returned", "manual_review"]
     reason: str
@@ -124,6 +132,84 @@ def _scope(report: dict, findings: list[dict], additional_ids=(), *, additional_
             if item["evidence_id"] in reviewed:
                 scope.setdefault(item["evidence_id"], item)
     return with_method_scope(scope.values(), paths)
+
+
+def generate_provisional(service, run_id: str, version_id: str, claim_id: str) -> dict:
+    """Add advisory wording to the current report without creating an abstract version."""
+    from .run_store import RunBusy
+
+    with service.store.acquire(run_id) as token:
+        report = service.store.read(run_id)
+        if report["report_version_id"] != version_id or report["run_status"] != "report_ready":
+            raise RunBusy("请打开最新且已就绪的报告，再生成暂定修订。")
+        findings = [*report.get("findings", ()), *report.get("compound_findings", ())]
+        finding = next((item for item in findings if claim_id in (item.get("claim_id"), item.get("compound_id"))), None)
+        if finding is None or (finding.get("verdict") or finding.get("review_status")) != "pending":
+            raise ValueError("请选择一条待核验的断言。")
+        if (report.get("configuration") or {}).get("engine") != "openai":
+            raise ValueError("暂定修订需要使用 OpenAI 模型审阅。")
+
+        proposals = report.setdefault("provisional_revisions", {}).setdefault(version_id, {})
+        if claim_id in proposals:
+            return proposals[claim_id]
+        ids = dict.fromkeys([*finding.get("evidence_ids", ()), *finding.get("follow_up_evidence_ids", ())])
+        records = {row["evidence_id"]: row for row in report["evidence"]}
+        evidence = [records[eid] for eid in ids if eid in records and records[eid].get("text", "").strip()][:24]
+        if not evidence:
+            raise ValueError("这条断言尚无可引用的原文。找到原文证据后再生成暂定修订。")
+        aliases = {f"E{i}": row["evidence_id"] for i, row in enumerate(evidence, 1)}
+        masked_evidence = {row["evidence_id"]: row for row in blind_evidence(evidence)}
+        source = [dict(masked_evidence[eid], evidence_id=alias) for alias, eid in aliases.items()]
+        material = {"claim": finding.get("proposition") or finding["text"], "pending_reason": finding.get("reason", ""),
+                    "missing_fields": finding.get("missing_fields", ()), "evidence": source}
+        part = next((part for part in sentences(report["original_abstract"]["text"])
+                     if part["sentence_id"] == finding.get("sentence_id")), None)
+        if part and finding["text"] != part["text"]:
+            material["inline_context"] = {"excerpt": finding["text"], "sentence": part["text"]}
+        usage = report["usage"]
+        previous_events = list(usage.get("model_events", ()))
+        previous_count = usage["external_requests"]
+        model = service._responses(report, time_limit=65)
+        try:
+            draft = model.call("provisional_revision", material, ProvisionalRevision)
+            validate_ids(draft.evidence_ids, source)
+            replacement = (draft.replacement or "").strip() or None
+            reason = draft.reason.strip()
+            remaining = [item.strip() for item in draft.remaining_checks if item.strip()]
+            if not reason or not remaining or (replacement and not draft.evidence_ids):
+                raise ModelUnavailable("provisional revision did not include evidence and remaining checks")
+            proposals[claim_id] = {"replacement": replacement, "reason": reason, "remaining_checks": remaining,
+                                   "inline_replacement": (draft.inline_replacement or "").strip() or None,
+                                   "evidence_ids": list(dict.fromkeys(aliases[eid] for eid in draft.evidence_ids))}
+        finally:
+            usage["external_requests"] = previous_count + len(model.events)
+            usage["model_events"] = previous_events + model.events
+            usage["elapsed_seconds"] = round(model.elapsed_seconds, 3)
+            service.store.save(report, token)
+        return proposals[claim_id]
+
+
+def provisional_editor_options(report: dict) -> list[dict]:
+    proposals = report.get("provisional_revisions", {}).get(report["report_version_id"], {})
+    if not proposals:
+        return []
+    parts = {part["sentence_id"]: part for part in sentences(report["original_abstract"]["text"])}
+    options = []
+    for finding in [*report.get("findings", ()), *report.get("compound_findings", ())]:
+        proposal = proposals.get(finding.get("claim_id") or finding.get("compound_id"))
+        if not proposal or not proposal.get("replacement") or (finding.get("verdict") or finding.get("review_status")) != "pending":
+            continue
+        part = parts.get(finding.get("sentence_id"))
+        source = part["text"] if part else ""
+        replacement = proposal["replacement"] if source == finding["text"] else None
+        if source and replacement is None and (inline := proposal.get("inline_replacement")):
+            start, end = finding.get("start"), finding.get("end")
+            if isinstance(start, int) and isinstance(end, int) and part["start"] <= start < end <= part["end"]:
+                first, last = start - part["start"], end - part["start"]
+                if source[first:last] == finding["text"]:
+                    replacement = source[:first] + inline + source[last:]
+        options.append({"source": source, "replacement": replacement, "preview": proposal["replacement"]})
+    return options
 
 
 def _figure_documents(report: dict) -> tuple[dict, ...]:
