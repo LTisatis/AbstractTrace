@@ -1,5 +1,8 @@
 # AbstractTrace
-（东南大学大模型智能体与具身智能课程期末作业）A multi-agent system that checks abstract claims against the full paper, suggests evidence-backed revisions, and independently verifies the revised abstract.
+
+AbstractTrace 是一个论文摘要证据审阅 Agent。导入论文 PDF 后，它会逐条核对摘要里的断言，把判定链接到正文、图或表格单元格。系统可以提出带证据的改句，并复核用户保存后的摘要版本。
+
+东南大学「大模型智能体与具身智能」课程期末项目。
 
 ## 快速开始
 
@@ -8,7 +11,7 @@ git clone https://github.com/LTisatis/AbstractTrace.git
 cd AbstractTrace
 ```
 
-**Windows 64 位**。双击仓库里的 [start-web.cmd](start-web.cmd)。电脑上没有 `uv` 时，脚本会下载校验过的 [Astral uv 发行包](https://github.com/astral-sh/uv/releases/tag/0.9.18)。首次启动请联网，启动器会按需获取 Python 3.12 并安装 `uv.lock` 锁定的依赖。服务就绪后，脚本会用默认浏览器打开首页。
+**Windows（x64 或 ARM64）**。双击仓库里的 [start-web.cmd](start-web.cmd)。首次启动请联网。启动器会按需安装校验过的 `uv`、Python 3.12 和锁定的项目依赖，并用默认浏览器打开首页。[uv 发行包](https://github.com/astral-sh/uv/releases/tag/0.9.18)
 
 **macOS 或 Linux**。先按 [uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装 `uv`，再用下面的命令启动网页。
 
@@ -16,9 +19,42 @@ cd AbstractTrace
 uv run --locked --no-dev python -m abstract_review serve --open --port 0
 ```
 
-服务只监听本机的 `127.0.0.1`，自动分配一个可用端口。终端会显示访问地址，也可以用 `--port 8000` 指定端口。使用时保留终端窗口，按 `Ctrl+C` 退出。论文和审稿记录默认保存在仓库的 `.review-data/`。
+服务在本机 `127.0.0.1` 自动选择一个可用端口。如果浏览器没有自动打开，访问终端里显示的地址。使用期间保留终端窗口，按 `Ctrl+C` 停止服务。论文和报告默认保存在仓库的 `.review-data/`。
 
-首次体验可以上传一篇有可选中文本的 PDF，选择「本地规则」。本地规则无需 API 密钥。要使用「OpenAI 模型」审阅，先在启动服务的终端设置 `OPENAI_API_KEY`。
+### 选择审阅方式
+
+- **本地规则**适合先体验 PDF 导入、证据定位和数值复算，无需密钥。
+- **OpenAI 模型**用于模型判定、定向补查和暂定修订。启动服务前，在同一个终端设置 `OPENAI_API_KEY`。选用此方式时，审阅所需的摘要和证据会发送给模型 API。
+
+在 Windows PowerShell 中，可用以下命令输入密钥并启动服务。
+
+```powershell
+$key = Read-Host 'OpenAI API key' -AsSecureString
+$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', $key).Password
+.\start-web.cmd
+```
+
+### 在网页上完成一次审阅
+
+1. **导入论文。** 选择有可选中文本的 PDF。选「从 PDF 提取」审阅论文原摘要，或选「使用粘贴内容」审阅自己的版本。选择审阅方式后，点「开始审阅」。
+2. **先看概览。** 报告就绪后，点「反驳」或「待确认」的数量查看相关断言。「待确认」汇总待核验、证据不足和证据冲突。
+3. **回查原文。** 在「断言与证据」展开一条断言，点击「判定引用」下方的页码链接，右侧会打开并高亮 PDF 原页。用「上一页」「下一页」或输入页码浏览全文。点「返回证据页」恢复引用位置和高亮。
+4. **处理改句。** 在「修订与复核」比较原句和建议。勾选通过核验的改句，再点「保存所选修订」。使用 OpenAI 模型时，有可引用原文的「待核验」断言还能生成**暂定修订**，并列出仍需核对的内容。打开「手动修改摘要」，对能定位到原句的改句点「一键应用」，检查编辑框后再点「保存并复核」。暂定修订保留原断言的待核验状态。
+5. **查看版本并导出。** 复核完成后，在「版本与导出」查看当前摘要和历史版本，下载当前页面所显示版本的 Markdown 或 JSON 报告。
+
+### 体验一次自动改句
+
+首次启动后，在仓库目录生成样例 PDF。Windows PowerShell 可运行下方命令。macOS 或 Linux 可把 Python 路径替换成 `uv run --locked --no-dev python`。
+
+```powershell
+.\.venv\Scripts\python.exe examples/d02/make_sample.py .review-data/sample.pdf
+```
+
+把 `.review-data/sample.pdf` 上传到网页，选「使用粘贴内容」和「本地规则」，输入下方测试句后开始审阅。报告会用数据集 A 的 **80%** 和 **88%** 复算，建议把 **10 个百分点** 改为 **8 个百分点**。
+
+```text
+On dataset A, accuracy increased by 10 percentage points.
+```
 
 ## D01 离线演示
 
