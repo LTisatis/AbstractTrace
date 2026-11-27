@@ -270,6 +270,17 @@
                 {% endif %}
               </details>
               {% endif %}
+              {% if finding.page_recheck and finding.page_recheck.status in ('adopted', 'pending') %}
+              <details class="group follow-up">
+                <summary>原页复核</summary>
+                {% if finding.page_recheck.status == 'adopted' %}
+                  <p class="muted">根据重新核对的原页证据更新了判定。</p>
+                  {{ evidence_links(finding.page_recheck.evidence_ids) }}
+                {% else %}
+                  <p class="muted">{{ finding.page_recheck.reason }}</p>
+                {% endif %}
+              </details>
+              {% endif %}
               {% if finding.reason %}
                 <div class="finding-reason"><p class="field-caption">判定理由</p><p class="muted">{{ finding.reason }}</p></div>
               {% endif %}

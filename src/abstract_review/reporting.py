@@ -57,6 +57,11 @@ def render_markdown(report: dict) -> str:
         text = item.get("proposition", item["text"]) if item.get("compound") else item["text"]
         lines.extend([f"- **{label}** · {_plain(text)}",
                       f"  {_plain(item['reason'])}", f"  {ids}" if ids else ""])
+        recheck = item.get("page_recheck", {})
+        if recheck.get("status") == "adopted":
+            lines.append("  Original-page recheck supplied the final verdict.")
+        elif recheck.get("status") == "pending":
+            lines.append(f"  Original-page recheck remained pending. {_plain(recheck['reason'])}")
         for path in item.get("retrieval_paths", ()):
             nodes = " → ".join(f"`{eid}`" for eid in path["evidence_ids"])
             steps = ", ".join(_plain(edge["relation"].replace("_", " ")) for edge in path["edges"])

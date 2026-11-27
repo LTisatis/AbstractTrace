@@ -899,6 +899,24 @@ def _extract(pdf: pymupdf.Document, doc_id: str, ocr_language: str | None) -> tu
     return pages, _abstract_text(abstract_parts), evidence
 
 
+def read_archived_pdf(data_dir: Path, document: dict) -> bytes | None:
+    checksum = document.get("sha256")
+    role = document.get("role")
+    if (not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+            or role in {"main", "supplement", "external"} and document["doc_id"] != f"{role}-{checksum}"):
+        return None
+    relative = Path("blobs", f"{checksum}.pdf")
+    if document.get("blob_path") != relative.as_posix():
+        return None
+    root = data_dir.resolve()
+    source = (root / relative).resolve()
+    if source.parent != root / "blobs":
+        return None
+    with source.open("rb") as stream:
+        payload = stream.read(MAX_PDF_BYTES + 1)
+    return payload if len(payload) <= MAX_PDF_BYTES and hashlib.sha256(payload).hexdigest() == checksum else None
+
+
 def parse_pdf(path: Path, role: str = "main", *, ocr_language: str | None = None) -> ParsedPdf:
     """Parse local page text, supported figures and clearly marked bordered tables."""
     if role not in {"main", "supplement", "external"}:

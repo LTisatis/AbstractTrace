@@ -22,6 +22,7 @@ from .compound import (
 )
 from .evidence import EvidenceIndex, _document_key, _inspection_section, _printed_table_label, _terms, with_method_scope
 from .models import EvidenceGroup, Extraction, InvalidJudgeReference, Judgement, ModelPaused, ModelUnavailable, Schema
+from .page_recheck import eligible as can_recheck_pages, recheck as recheck_pages
 from .source_queries import focused_source_context
 
 
@@ -1050,34 +1051,21 @@ def _offline(claim: dict, candidates: list[dict], calculation: dict | None) -> d
 def _figure_images(candidates: list[dict], documents: Iterable[dict], data_dir: Path) -> list[dict]:
     import pymupdf
 
-    from .ingest import MAX_PDF_BYTES
+    from .ingest import read_archived_pdf
 
     by_id = {doc["doc_id"]: doc for doc in documents}
-    root = data_dir.resolve()
     figures = []
     for evidence in candidates:
         document = by_id.get(evidence.get("doc_id"), {})
-        checksum = document.get("sha256")
-        role = document.get("role")
         locator = evidence.get("locator", {})
         index, coords = locator.get("page_index"), locator.get("bbox")
-        if (not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum)
-                or role in {"main", "supplement", "external"} and document["doc_id"] != f"{role}-{checksum}"
-                or type(index) is not int or index < 0
+        if (type(index) is not int or index < 0
                 or not any(page.get("page_index") == index for page in document.get("pages", []))
                 or not isinstance(coords, (list, tuple)) or len(coords) != 4
                 or not all(type(value) in (int, float) and isfinite(value) for value in coords)):
             continue
-        relative = Path("blobs", f"{checksum}.pdf")
-        if document.get("blob_path") != relative.as_posix():
-            continue
         try:
-            source = (root / relative).resolve()
-            if source.parent != root / "blobs":
-                continue
-            with source.open("rb") as stream:
-                payload = stream.read(MAX_PDF_BYTES + 1)
-            if len(payload) > MAX_PDF_BYTES or hashlib.sha256(payload).hexdigest() != checksum:
+            if not (payload := read_archived_pdf(data_dir, document)):
                 continue
             with pymupdf.open(stream=payload, filetype="pdf") as pdf:
                 page = pdf[index]
@@ -1811,28 +1799,41 @@ def audit_version(
     elif _recover_cached_compounds(report, version):
         refresh_compound_findings(report)
         commit()
-    index = EvidenceIndex(report["evidence"], embedder=embedder, reranker=reranker)
+    evidence = report["evidence"]
+    documents = report.get("documents", ())
+    index = EvidenceIndex(evidence, embedder=embedder, reranker=reranker)
     followups = report.setdefault("claim_followups", {})
     try:
-        done = {finding["claim_id"] for finding in report["findings"] if not finding.get("retryable")}
+        saved = {finding["claim_id"]: finding for finding in report["findings"]}
+        calculations = {row["claim_id"]: row for row in report["calculations"]}
         for claim in report["claims"]:
             claim_id = claim["claim_id"]
-            if claim_id in done:
+            previous = saved.get(claim_id, {})
+            if previous and not previous.get("retryable"):
                 continue
 
             def save_targets(targets: list[dict]) -> None:
                 followups[claim_id] = targets
                 commit()
 
-            finding, calculation = review_claim(
-                claim, index, model, documents=report.get("documents", ()), data_dir=data_dir,
-                reserve_followup=(lambda: reserve_followup(claim_id)) if reserve_followup is not None else None,
-                saved_targets=followups.get(claim_id, ()), save_targets=save_targets,
-            )
+            if previous.get("page_recheck", {}).get("status") == "queued":
+                finding, calculation = previous, calculations.get(claim_id)
+            else:
+                finding, calculation = review_claim(
+                    claim, index, model, documents=documents, data_dir=data_dir,
+                    reserve_followup=(lambda: reserve_followup(claim_id)) if reserve_followup is not None else None,
+                    saved_targets=followups.get(claim_id, ()), save_targets=save_targets,
+                )
             report["findings"] = [row for row in report["findings"] if row["claim_id"] != claim_id] + [finding]
             report["calculations"] = [row for row in report["calculations"] if row["claim_id"] != claim_id]
             if calculation is not None:
                 report["calculations"].append({**calculation, "claim_id": claim_id})
+            if can_recheck_pages(finding, model, documents, data_dir):
+                finding.update(page_recheck={"status": "queued"}, retryable=True)
+                refresh_compound_findings(report)
+                commit()
+                finding["page_recheck"] = recheck_pages(finding, index, evidence, documents, data_dir, model, calculation)
+                finding.pop("retryable", None)
             refresh_compound_findings(report)
             commit()
     finally:

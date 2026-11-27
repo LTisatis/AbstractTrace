@@ -15,7 +15,7 @@ _LABELS = ("supported", "refuted", "insufficient")
 _SAMPLE_FIELDS = {"sample_id", "pdf", "pdf_sha256", "claims", "abstract_file", "paper_family_id", "split"}
 _ANCHOR_FIELDS = ("sentence_id", "start", "end", "proposition")
 _BENCHMARK_PIPELINE_FILES = ("audit.py", "benchmark.py", "calculations.py", "compound.py", "evidence.py",
-                             "followups.py", "ingest.py", "local_ranking.py", "models.py", "review.py", "revisions.py",
+                             "followups.py", "ingest.py", "local_ranking.py", "models.py", "page_recheck.py", "review.py", "revisions.py",
                              "run_store.py", "scifact.py", "scitabalign.py", "source_queries.py", "table_ranking.py", "workflow.py")
 
 
@@ -154,7 +154,8 @@ def _prediction(sample_id: str, claim_id: str, finding: dict, claim: dict | None
            "verdict": verdict, "evidence_ids": list(dict.fromkeys(evidence))}
     candidates = finding.get("sent_candidate_ids", finding.get("candidate_ids"))
     if candidates is not None:
-        row["candidate_ids"] = list(dict.fromkeys(candidates))
+        recheck_candidates = finding.get("page_recheck", {}).get("sent_evidence_ids", ())
+        row["candidate_ids"] = list(dict.fromkeys([*candidates, *recheck_candidates]))
     if claim is not None and all(field in claim for field in _ANCHOR_FIELDS):
         row["claim_anchor"] = {key: claim[key] for key in _ANCHOR_FIELDS}
     if finding.get("stop_reason"):

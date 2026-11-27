@@ -10,6 +10,21 @@ from .models import ModelUnavailable
 from .run_store import RunBusy
 
 
+def _adopt_original_recheck(original: dict, finding: dict, new_ids) -> bool:
+    changed = (finding["review_status"], finding["verdict"]) != (original["review_status"], original["verdict"])
+    new_ids = set(new_ids)
+    if not changed or not new_ids.intersection(finding["evidence_ids"]):
+        return False
+    if (original.get("page_recheck", {}).get("status") == "adopted"
+            and finding["review_status"] == "pending"):
+        opposite = {"supported": "refute", "refuted": "support"}[original["verdict"]]
+        # A later narrow review can omit evidence cited in the original-page verdict.
+        # Downgrade it only if the later review identifies new counterevidence.
+        return any(group["role"] == opposite and new_ids.intersection(group["evidence_ids"])
+                   for group in finding.get("evidence_groups", ()))
+    return True
+
+
 def process(service, run_id: str, request_id: str | None, add_requests: int, add_seconds: int,
             *, lease_token: str | None = None) -> dict:
     from .revisions import verify_version
@@ -139,12 +154,8 @@ def _refresh_findings(report: dict, model, followups: FollowUps, embedder, data_
                                                 data_dir=data_dir, additional_evidence=added)
             if finding.get("retryable"):
                 raise ModelUnavailable("rechecking an original finding requires the model to resume")
-            changed_label = (finding["review_status"], finding["verdict"]) != (
-                original["review_status"], original["verdict"]
-            )
-            directly_cites_new = bool(set(finding["evidence_ids"]).intersection(ledger["evidence_ids"]))
             ledger["original_recheck"] = {"status": finding["review_status"], "verdict": finding["verdict"],
-                                          "adopted": changed_label and directly_cites_new}
+                                          "adopted": _adopt_original_recheck(original, finding, ledger["evidence_ids"])}
             if ledger["original_recheck"]["adopted"]:
                 changed = True
                 report.setdefault("finding_history", []).append(original)

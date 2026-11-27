@@ -1,16 +1,19 @@
+import re
 import runpy
 from pathlib import Path
 from types import SimpleNamespace
 
+import pymupdf
 import pytest
 
 from abstract_review.audit import refresh_compound_findings
 from abstract_review.followups import FollowUps
 from abstract_review.models import ModelPaused, ModelUnavailable, ResponsesModel, SmokeResult
+from abstract_review.page_recheck import recheck
 from abstract_review.reporting import render_markdown
 from abstract_review.review import PdfReviewInput, ReviewService
 from abstract_review.revisions import build_candidate, new_version
-from abstract_review.workflow import _refresh_findings
+from abstract_review.workflow import _adopt_original_recheck, _refresh_findings
 
 
 SAMPLE = Path(__file__).resolve().parents[1] / "examples" / "d02" / "make_sample.py"
@@ -102,6 +105,97 @@ def test_model_requests_use_fresh_context_and_reserve_budget():
     assert reserved == ["outcome_unknown", "outcome_unknown"]
     assert all(call["store"] is False and "previous_response_id" not in call for call in calls)
     assert all([item["role"] for item in call["input"]] == ["developer", "user"] for call in calls)
+
+
+@pytest.mark.parametrize("valid_citation", [True, False])
+def test_original_page_recheck_resumes_without_repeating_initial_judgement(tmp_path, monkeypatch, valid_citation):
+    path = tmp_path / "original.pdf"
+    with pymupdf.open() as pdf:
+        pdf.new_page().insert_text((70, 85), "Results")
+        pdf[0].insert_text((70, 130), "The prototype tracks biodiversity across the surveyed plots.")
+        pdf.save(path)
+    database = tmp_path / "state.sqlite3"
+    calls = []
+
+    class TestModel:
+        events = []
+        elapsed_seconds = 0
+
+        def __init__(self, paused):
+            self.paused = paused
+
+        def call(self, stage, material, schema):
+            calls.append(stage)
+            if stage == "judge":
+                return schema(verdict="pending", reason="The measurement needs a closer review.",
+                              evidence_groups=[], missing_fields=[], follow_up_queries=[])
+            if stage == "page_recheck":
+                if self.paused:
+                    raise ModelPaused("model budget exhausted")
+                assert "PDF PAGE 1" in material
+                match = re.search(r"\[(e\d+)\] The prototype tracks biodiversity", material)
+                assert match
+                return schema(verdict="supported", reason="The results confirm the recorded observation.",
+                              evidence_ids=[match[1] if valid_citation else "e9999"])
+            assert stage == "verify_abstract"
+            return schema(status="manual_review", reason="No revised sentence to verify.", evidence_ids=[], issues=[])
+
+    service = ReviewService(database)
+    monkeypatch.setattr(service, "_responses", lambda *args, **kwargs: TestModel(paused=True))
+    run = service.start(PdfReviewInput(path, engine="openai", provided_claims=(
+        ("claim-1", "The prototype tracks biodiversity."),)))
+    paused = service.export(run["run_id"], run["report_version_id"])
+    assert run["run_status"] == "paused" and "judge" in calls, paused.get("runtime_error")
+    assert paused["findings"][0]["page_recheck"]["status"] == "queued"
+
+    calls.clear()
+    restarted = ReviewService(database)
+    monkeypatch.setattr(restarted, "_responses", lambda *args, **kwargs: TestModel(paused=False))
+    run = restarted.resume(run["run_id"], "extra-budget", add_requests=1)
+    report = restarted.export(run["run_id"], run["report_version_id"])
+    finding, = report["findings"]
+    assert run["run_status"] == "report_ready"
+    assert calls == ["page_recheck", "verify_abstract"]
+    assert not finding.get("retryable")
+    if valid_citation:
+        evidence = {row["evidence_id"]: row for row in report["evidence"]}
+        assert finding["verdict"] == "supported" and finding["page_recheck"]["status"] == "adopted"
+        assert [evidence[eid]["locator"]["page_index"] for eid in finding["evidence_ids"]] == [0]
+        assert finding["sent_candidate_ids"] == paused["findings"][0]["sent_candidate_ids"]
+        assert set(finding["evidence_ids"]) <= set(finding["page_recheck"]["sent_evidence_ids"])
+        assert finding["claim_id"] not in {item["claim_id"] for item in report["unresolved_items"]}
+    else:
+        assert finding["verdict"] is None
+        assert finding["page_recheck"]["status"] == "invalid_citations"
+
+
+@pytest.mark.parametrize("conflict", ["same_scope", "unresolved", "different_subclaims"])
+def test_page_recheck_only_resolves_opposition_between_different_subclaims(monkeypatch, conflict):
+    finding = {"proposition": "Both metrics increased.", "stop_reason": "requires_review",
+               "review_status": "pending", "verdict": None, "evidence_ids": [],
+               "decision_trace": {"blocker_codes": ["opposing_evidence"]}}
+    pages = [{"doc_id": "paper", "page_index": 2}]
+    monkeypatch.setattr("abstract_review.page_recheck._packet",
+                        lambda *args: ("Page text", {"e1": "source"}, pages))
+
+    def call(stage, material, schema):
+        assert stage == "page_recheck_conflict"
+        return schema(verdict="refuted", evidence_ids=["e1"], reason="One metric decreased.", conflict=conflict)
+
+    result = recheck(finding, None, (), (), None, SimpleNamespace(call=call), None)
+    assert result["conflict"] == conflict
+    if conflict == "different_subclaims":
+        assert result["status"] == "adopted" and finding["verdict"] == "refuted"
+    else:
+        assert result["status"] == "pending" and finding["verdict"] is None
+
+
+@pytest.mark.parametrize(("role", "adopted"), [("limit", False), ("refute", True)])
+def test_new_counterevidence_is_required_to_reopen_a_page_recheck_verdict(role, adopted):
+    original = {"review_status": "completed", "verdict": "supported", "page_recheck": {"status": "adopted"}}
+    followup = {"review_status": "pending", "verdict": None, "evidence_ids": ["new"],
+                "evidence_groups": [{"role": role, "evidence_ids": ["new"]}]}
+    assert _adopt_original_recheck(original, followup, ["new"]) is adopted
 
 
 def test_late_model_pause_resumes_without_repeating_completed_sentence_check(tmp_path, monkeypatch):
