@@ -33,4 +33,7 @@ packages = ["src/abstract_review"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: requires an explicitly configured external service"]
+markers = [
+    "live: requires an explicitly configured external service",
+    "browser: requires Playwright and a local Chromium browser",
+]

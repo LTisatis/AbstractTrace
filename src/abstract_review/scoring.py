@@ -1,6 +1,8 @@
 import hashlib
 import json
+import re
 import unicodedata
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
@@ -8,6 +10,7 @@ from dataclasses import dataclass
 _VERDICTS = ("supported", "refuted", "insufficient")
 _REVIEW_STATUSES = ("completed", "pending", "manual_conflict")
 _DEFAULT_RANK_CUTOFFS = (1, 3, 5, 8)
+_JUDGE_ATTEMPT_STATUSES = {"checked", "model_reference_error", "citation_error", "model_paused", "model_unavailable"}
 type _CaseKey = tuple[str, str]
 type _Ratio = dict[str, int | float | None]
 
@@ -28,6 +31,7 @@ class _Prediction:
     candidate_ids: tuple[str, ...] | None
     anchor: _Anchor | None
     stop_reason: str | None
+    decision_trace: dict | None
 
 
 @dataclass(frozen=True)
@@ -40,7 +44,7 @@ class _GoldLabel:
 
 def score_predictions(
     predictions: object, gold: object, *, rank_cutoffs: tuple[int, ...] = _DEFAULT_RANK_CUTOFFS,
-    semantic_matches: object = None, verdict_projections: object = None,
+    semantic_matches: object = None, verdict_projections: object = None, run_record: object = None,
 ) -> dict[str, object]:
     """Score stored predictions, with optional independent alignment and projection reviews."""
     if not rank_cutoffs or any(type(k) is not int or k <= 0 for k in rank_cutoffs):
@@ -56,6 +60,9 @@ def score_predictions(
         raise ValueError(f"Prediction has no gold label for {sample_id}/{claim_id}")
 
     result = _score_aligned(predicted, gold_labels, extraction_samples, matches, cutoffs)
+    if run_record is not None:
+        execution = _run_execution(run_record, predictions, predicted)
+        result["run_diagnostics"] = _execution_diagnostics(result["cases"], execution)
     combined = matches
     if semantic_matches is not None:
         annotations, provenance = _parse_semantic_matches(
@@ -72,11 +79,94 @@ def score_predictions(
             "provenance": provenance,
         }
         result["semantic_scoring"] = _score_aligned(predicted, gold_labels, extraction_samples, combined, cutoffs)
+        if run_record is not None:
+            semantic = result["semantic_scoring"]
+            semantic["run_diagnostics"] = _execution_diagnostics(semantic["cases"], execution)
     if verdict_projections is not None:
         result["verdict_projection"] = _review_verdict_projections(
             verdict_projections, predictions, gold, predicted, gold_labels, extraction_samples, combined,
         )
     return result
+
+
+def _run_execution(record: object, predictions: object, predicted: dict[_CaseKey, _Prediction]) -> dict[str, str]:
+    if not isinstance(record, dict) or type(record.get("schema_version")) is not int or record["schema_version"] != 1:
+        raise ValueError("run record requires schema_version 1")
+    if record.get("predictions_sha256") != semantic_manifest_sha256(predictions):
+        raise ValueError("run record predictions SHA-256 does not match predictions")
+    raw_manifest_digest = record.get("input_manifest_sha256")
+    if not isinstance(raw_manifest_digest, str) or re.fullmatch(r"[0-9a-f]{64}", raw_manifest_digest) is None:
+        raise ValueError("run record requires input_manifest_sha256")
+    if type(record.get("prediction_count")) is not int or record["prediction_count"] != len(predicted):
+        raise ValueError("run record prediction_count does not match predictions")
+    inventory = _ordered_ids(record.get("input_sample_ids"), "run record input_sample_ids")
+    if not inventory:
+        raise ValueError("run record must contain input sample IDs")
+    execution = dict.fromkeys(inventory, "unexecuted")
+    prediction_counts = Counter(key[0] for key in predicted)
+    if prediction_counts.keys() - execution.keys():
+        raise ValueError("predictions contain a sample outside the run record input inventory")
+
+    samples = record.get("samples")
+    if not isinstance(samples, list):
+        raise ValueError("run record samples must be a list")
+    recorded = set()
+    for row in samples:
+        if not isinstance(row, dict):
+            raise ValueError("run record sample must be an object")
+        sample_id = _identifier(row.get("sample_id"), "run record sample_id")
+        if sample_id not in execution or sample_id in recorded:
+            raise ValueError("run record contains an unexpected or duplicate sample ID")
+        recorded.add(sample_id)
+        if "prediction_count" in row and (type(row["prediction_count"]) is not int
+                                          or row["prediction_count"] != prediction_counts[sample_id]):
+            raise ValueError(f"run record sample {sample_id!r} prediction_count does not match predictions")
+        status = row.get("run_status")
+        if status not in (None, "report_ready", "paused", "failed", "queued", "running"):
+            raise ValueError(f"run record sample {sample_id!r} has invalid run_status")
+        execution[sample_id] = {"paused": "paused", "failed": "failed", "queued": "queued",
+                                "running": "running"}.get(status, "processed")
+
+    if "batch" in record:
+        batch = record["batch"]
+        if (not isinstance(batch, dict) or batch.get("status") not in ("paused", "completed")
+                or type(batch.get("sample_count")) is not int or batch["sample_count"] != len(inventory)
+                or type(batch.get("processed_samples")) is not int or batch["processed_samples"] != len(recorded)
+                or prediction_counts.keys() != recorded
+                or (batch["status"] == "completed" and len(recorded) != len(inventory))):
+            raise ValueError("run record batch does not match its input or processed samples")
+        pause = batch.get("last_paused_sample")
+        if pause is not None:
+            if not isinstance(pause, dict):
+                raise ValueError("run record paused sample must be an object")
+            sample_id = _identifier(pause.get("sample_id"), "run record paused sample_id")
+            if sample_id not in execution:
+                raise ValueError("run record paused sample is outside the input inventory")
+            if sample_id not in recorded:
+                execution[sample_id] = "paused"
+    else:
+        for sample_id in prediction_counts.keys() - recorded:
+            execution[sample_id] = "processed"
+    return execution
+
+
+def _execution_diagnostics(cases: list[dict], execution: dict[str, str]) -> dict:
+    rows = []
+    for case in cases:
+        sample_id = case["sample_id"]
+        state = execution.get(sample_id, "outside_input")
+        if case["review_status"] == "completed":
+            outcome = "completed_correct" if case["label_correct"] else "completed_incorrect"
+        elif state == "processed":
+            outcome = "unresolved" if case["review_status"] is not None else "missing_after_execution"
+        else:
+            outcome = state
+        rows.append({"sample_id": sample_id, "claim_id": case["claim_id"],
+                     "sample_state": state, "outcome": outcome})
+    gold_samples = {row["sample_id"] for row in rows}
+    attempted = sum(execution.get(sample_id) in {"processed", "paused", "failed", "running"} for sample_id in gold_samples)
+    return {"sample_execution_coverage": _ratio(attempted, len(gold_samples)),
+            "outcome_counts": dict(sorted(Counter(row["outcome"] for row in rows).items())), "cases": rows}
 
 
 def _score_aligned(
@@ -132,6 +222,8 @@ def _score_aligned(
             row["split"] = label.split
         if prediction is not None and prediction.stop_reason is not None:
             row["stop_reason"] = prediction.stop_reason
+        if prediction is not None and prediction.decision_trace is not None:
+            row["decision_trace"] = prediction.decision_trace
         cases.append(row)
         phase = _failure_phase(prediction, label, correct, evidence_hit)
         if phase is not None:
@@ -205,10 +297,17 @@ def _failure_phase(prediction: _Prediction | None, gold: _GoldLabel,
         return "parsing"
     if prediction.stop_reason in {"budget_exhausted", "model_unavailable", "interrupted", "time_limit"}:
         return "execution"
+    if prediction.stop_reason == "invalid_judge_reference":
+        return "citation_validation"
     if prediction.candidate_ids is not None and gold.evidence_groups:
         if not _contains_evidence(gold.evidence_groups, prediction.candidate_ids):
             return "retrieval"
     if prediction.status != "completed":
+        if prediction.decision_trace:
+            if prediction.decision_trace["blocker_codes"]:
+                return "verdict_blocked"
+            if prediction.decision_trace["attempts"][-1]["proposed_verdict"] == "pending":
+                return "model_pending"
         return "verification_pending"
     if gold.evidence_groups and prediction.candidate_ids is None and not evidence_hit:
         return "unknown"
@@ -220,10 +319,31 @@ def _contains_evidence(groups: tuple[frozenset[str], ...], candidates: tuple[str
     return any(group <= present for group in groups)
 
 
+def _decision_trace(value: object, location: str) -> dict:
+    if not isinstance(value, dict) or value.keys() != {"attempts", "blocker_codes", "missing_requirements"}:
+        raise ValueError(f"{location} must contain the structured decision trace")
+    attempts = value["attempts"]
+    if not isinstance(attempts, list) or not attempts:
+        raise ValueError(f"{location}.attempts must be a nonempty list")
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or attempt.keys() != {"material_sha256", "repair", "proposed_verdict", "status"}:
+            raise ValueError(f"{location}.attempts contains an invalid decision attempt")
+        digest, proposed, status = attempt["material_sha256"], attempt["proposed_verdict"], attempt["status"]
+        if (not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or type(attempt["repair"]) is not bool or not isinstance(status, str) or status not in _JUDGE_ATTEMPT_STATUSES
+                or proposed not in (None, *_VERDICTS, "pending", "manual_conflict")
+                or (proposed is not None) != (status in {"checked", "citation_error"})):
+            raise ValueError(f"{location}.attempts contains an invalid decision attempt")
+    _ordered_ids(value["blocker_codes"], f"{location}.blocker_codes")
+    _ordered_ids(value["missing_requirements"], f"{location}.missing_requirements")
+    return value
+
+
 def _parse_predictions(document: object) -> dict[_CaseKey, _Prediction]:
     fields = {"sample_id", "claim_id", "review_status", "verdict", "evidence_ids"}
     predictions = {}
-    for key, row, location in _rows(document, "predictions", fields, {"candidate_ids", "claim_anchor", "stop_reason"}):
+    for key, row, location in _rows(document, "predictions", fields,
+                                   {"candidate_ids", "claim_anchor", "stop_reason", "decision_trace"}):
         status = row["review_status"]
         verdict = row["verdict"]
         if not isinstance(status, str) or status not in _REVIEW_STATUSES:
@@ -239,7 +359,8 @@ def _parse_predictions(document: object) -> dict[_CaseKey, _Prediction]:
             candidates = _ordered_ids(row["candidate_ids"], f"{location}.candidate_ids")
         anchor = _anchor(row["claim_anchor"], f"{location}.claim_anchor") if "claim_anchor" in row else None
         reason = _identifier(row["stop_reason"], f"{location}.stop_reason") if "stop_reason" in row else None
-        predictions[key] = _Prediction(status, verdict, evidence_ids, candidates, anchor, reason)
+        trace = _decision_trace(row["decision_trace"], f"{location}.decision_trace") if "decision_trace" in row else None
+        predictions[key] = _Prediction(status, verdict, evidence_ids, candidates, anchor, reason, trace)
     return predictions
 
 

@@ -13,11 +13,25 @@
     {% if preview_url %}
       <div class="toolbar pdf-tools">
         <a class="button button-small mobile-back" href="#findings">返回断言</a>
-        <button type="button" class="button button-small" data-zoom aria-pressed="false" hidden>放大</button>
+        <label class="zoom-control meta" data-zoom hidden>缩放
+          <select aria-label="页图缩放"><option value="100">100%</option><option value="125">125%</option><option value="150">150%</option><option value="200">200%</option></select>
+        </label>
         <a class="button button-small" href="{{ preview_url }}" target="_blank" rel="noopener">打开页图 <span aria-hidden="true">↗</span></a>
       </div>
     {% endif %}
   </div>
+  {% if preview_documents|length > 1 %}
+  <form class="document-switch" data-document-switch action="{{ report_url }}#pdf-preview" method="get">
+    <input type="hidden" name="version_id" value="{{ version_id }}">
+    <label for="preview-document" class="sr-only">PDF 文档</label>
+    <select id="preview-document" name="doc_id">
+      {% for document in preview_documents %}
+        <option value="{{ document.doc_id }}"{% if preview_document and preview_document.doc_id == document.doc_id %} selected{% endif %}>{{ {'main': '主论文', 'supplement': '补充材料', 'external': '外部文献'}.get(document.role, 'PDF') }} · {{ document.name }}</option>
+      {% endfor %}
+    </select>
+    <button class="button button-small" type="submit">切换</button>
+  </form>
+  {% endif %}
   {% if preview_url %}
     {% set page_url = report_url.include_query_params(version_id=version_id, doc_id=preview_document.doc_id) %}
     {% if selected %}{% set page_url = page_url.include_query_params(evidence_id=selected.evidence_id) %}{% endif %}

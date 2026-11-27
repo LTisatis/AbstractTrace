@@ -97,16 +97,48 @@ class RunStore:
             job = self._job(db, run_id) if "review_jobs" in tables else None
             snapshot = self._run(db, run_id) if "runs" in tables else None
         if snapshot is not None:
-            state = self._ref(json.loads(snapshot[1]))
+            report = json.loads(snapshot[1])
+            state = self._ref(report)
             if job is not None and job[2] in {"queued", "running"}:
                 state["run_status"] = job[2]
+            if state["run_status"] in {"queued", "running"}:
+                state["stage"] = report.get("stage", "review")
+                state["claims_done"] = len(report.get("findings", ()))
+                state["claims_total"] = len(report.get("claims", ()))
             return state
         if job is None:
             raise ValueError(f"unknown review run {run_id!r}")
         state = {"run_id": run_id, "report_version_id": None, "run_status": job[2]}
+        if job[2] == "running":
+            state["stage"] = "parse"
         if job[3] is not None:
             state["runtime_error"] = job[3]
         return state
+
+    def recent_runs(self, limit: int = 20) -> list[dict]:
+        if not self.path.is_file():
+            return []
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN")
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "runs" not in tables:
+                return []
+            job_join = "LEFT JOIN review_jobs AS job USING (run_id)" if "review_jobs" in tables else ""
+            status = "CASE WHEN job.state IN ('queued', 'running') THEN job.state END," if job_join else ""
+            saved = db.execute(
+                f"""SELECT runs.run_id, runs.report_version_id,
+                           COALESCE({status} json_extract(report_json, '$.run_status'), 'report_ready') AS run_status,
+                           json_extract(report_json, '$.documents[0].name') AS name
+                    FROM runs {job_join} ORDER BY runs.rowid DESC LIMIT ?""", (limit,),
+            ).fetchall()
+            incoming = db.execute(
+                """SELECT job.run_id, NULL AS report_version_id, job.state AS run_status,
+                          substr(json_extract(job.payload, '$.pdf'), 6) AS name
+                   FROM review_jobs AS job LEFT JOIN runs USING (run_id)
+                   WHERE runs.run_id IS NULL ORDER BY job.queued_at DESC LIMIT ?""", (limit,),
+            ).fetchall() if job_join else []
+        return [dict(row) for row in [*incoming, *saved]]
 
     def _renew(self, db, run_id: str, token: str, now: float) -> bool:
         updated = db.execute(
@@ -215,8 +247,10 @@ class RunStore:
                     report = json.loads(row[1])
                     report.update(run_status="failed", runtime_error=error)
                     self._save(db, report)
+                summary = {"pdf": job.payload["pdf"]} if job.kind == "start" and "pdf" in job.payload else {}
                 db.execute(
-                    "UPDATE review_jobs SET state='failed',payload='{}',error=? WHERE run_id=?", (error, job.run_id),
+                    "UPDATE review_jobs SET state='failed',payload=?,error=? WHERE run_id=?",
+                    (json.dumps(summary, ensure_ascii=False), error, job.run_id),
                 )
             else:
                 db.execute("DELETE FROM review_jobs WHERE run_id=?", (job.run_id,))

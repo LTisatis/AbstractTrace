@@ -3,18 +3,40 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% if report %}审阅报告{% elif state %}审阅进度{% else %}导入论文{% endif %} · AbstractTrace</title>
+  <title>{% if report %}审阅报告{% elif state %}审阅进度{% elif recent_runs is defined %}最近审阅{% else %}导入论文{% endif %} · AbstractTrace</title>
   <style>{% include 'review.css' %}</style>
 </head>
 <body class="{% if report %}report-view{% elif state %}progress-view{% else %}intake-view{% endif %}">
   <header class="app-header">
     <nav class="header-inner" aria-label="工作区">
       <a class="brand" href="{{ request.url_for('home') }}"><span class="brand-mark" aria-hidden="true"></span>AbstractTrace</a>
-      {% if report or state %}<a class="button" href="{{ request.url_for('home') }}">审阅新论文</a>{% endif %}
+      <div class="toolbar">
+        {% if recent_runs is not defined %}<a class="button" href="{{ request.url_for('recent_runs') }}">最近审阅</a>{% endif %}
+        {% if report or state or recent_runs is defined %}<a class="button" href="{{ request.url_for('home') }}">审阅新论文</a>{% endif %}
+      </div>
     </nav>
   </header>
 
-  {% if state and not report %}
+  {% if recent_runs is defined %}
+  <main class="progress-page">
+    <h1>最近审阅</h1>
+    {% if recent_runs %}
+    <ul class="card history-list">
+      {% for run in recent_runs %}
+      <li>
+        <a href="{{ request.url_for('view_run', run_id=run.run_id) }}">{{ run.name or '未命名论文' }}</a>
+        <span class="meta">任务 <code>{{ run.run_id[:12] }}</code></span>
+        <span class="pill pill-{{ run.run_status }}">{{ statuses.get(run.run_status, run.run_status) }}</span>
+        {% if run.report_version_id %}
+          <span class="meta">版本 <code>{{ run.report_version_id[:8] }}</code></span>
+          <a href="{{ request.url_for('export_review', run_id=run.run_id).include_query_params(version_id=run.report_version_id, format='md') }}">下载 Markdown</a>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">还没有本地审阅记录。</p>{% endif %}
+  </main>
+  {% elif state and not report %}
   <main class="progress-page">
     <div class="intro"><h1>审阅进度</h1><p class="meta">任务 <code>{{ state.run_id[:12] }}</code></p></div>
     {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
@@ -32,8 +54,8 @@
           <li data-step="running"{% if state.run_status == 'running' %} aria-current="step"{% endif %}>审阅论文</li>
           <li data-step="report_ready">报告就绪</li>
         </ol>
-        <p class="muted">首份报告生成后会在此显示。也可以稍后打开同一地址查看结果。</p>
-        <p class="meta" data-reconnect hidden>连接暂时中断，正在重新检查任务状态。</p>
+        <p class="muted" data-stage-text>首份报告生成后会在此显示。也可以稍后从「最近审阅」找回。</p>
+        <noscript><p><a href="{{ request.url_for('view_run', run_id=state.run_id) }}">查看最新状态</a></p></noscript>
       {% endif %}
     </section>
   </main>
@@ -45,18 +67,17 @@
   {% set documents = report.documents|default([]) %}
   {% set abstract_review = report.abstract_review|default({}) %}
   {% set verification = abstract_review.status|default('pending') %}
-  {% set selected_revision_ids = report.reviewed_abstract.revision_ids|default([]) %}
   {% set revisions = report.revisions|default([]) %}
   {% set passed_revisions = revisions|selectattr('status', 'equalto', 'passed')|list|length %}
   {% set compound_findings = report.compound_findings|default([]) %}
-  {% set finding_total = compound_findings|length + report.findings|length %}
+  {% set finding_total = report.findings|length %}
   {% set attention_total = finding_total - finding_counts.supported - finding_counts.refuted %}
   {% set has_tasks = report.unresolved_items or report.diagnostics or abstract_review.issues or report.runtime_error or state.run_status == 'paused' %}
   {% set provisional = report.provisional_revisions|default({}) %}
   {% set version_proposals = provisional.get(version_id, {}) %}
   {% set allow_provisional = is_current and state.run_status == 'report_ready' and report.configuration and report.configuration.engine == 'openai' %}
   {% set requested_finding = request.query_params.get('finding') %}
-  {% set can_select = is_current and state.run_status in ['report_ready', 'paused'] %}
+  {% set can_select = is_current and report.configuration and state.run_status in ['report_ready', 'paused', 'failed'] %}
   {% set relation_labels = {
     'row_header': '行表头', 'column_header': '列表头', 'table_note': '表注', 'same_experiment': '同一实验',
     'table_reference': '正文引用表格', 'table_caption': '表题', 'table_continuation': '续表', 'same_row': '同一行',
@@ -111,11 +132,14 @@
         <p class="eyebrow">审阅报告</p>
         <h1>{{ documents[0].name if documents else '审阅报告' }}</h1>
         <p class="report-meta"><span class="pill pill-{{ state.run_status }}" data-current-run-status aria-live="polite">{{ statuses.get(state.run_status, state.run_status) }}</span><span class="meta">版本 <code>{{ version_id[:12] }}</code>{% if not is_current %} · 历史版本{% endif %}</span></p>
+        {% if report.configuration and report.configuration.engine == 'openai' %}
+          <p class="meta">模型 {{ report.configuration.model }} · 已用 {{ report.usage.external_requests|default(0) }} / {{ report.configuration.max_requests }} 次请求 · 已用 {{ report.usage.elapsed_seconds|default(0) }} / {{ report.configuration.max_seconds }} 秒</p>
+        {% endif %}
       </div>
       <section class="report-overview" aria-labelledby="overview-title">
         <div class="section-heading">
           <h2 id="overview-title">审阅概览</h2>
-          {% if finding_total %}<span class="meta">原稿 · {{ finding_total }} 条判定</span>{% endif %}
+          {% if finding_total or compound_findings %}<span class="meta">{{ finding_total }} 条子命题或独立断言{% if compound_findings %} · {{ compound_findings|length }} 条复合句汇总{% endif %}</span>{% endif %}
         </div>
         {% if finding_total or revisions %}
         <div class="outcomes">
@@ -127,6 +151,7 @@
         {% else %}<p class="meta">断言判定完成后，会在这里汇总结果。</p>{% endif %}
         <nav class="report-nav" aria-label="审阅流程">
           <a href="#findings">核对断言与证据</a>
+          <a href="#abstract">查看摘要</a>
           <a class="mobile-preview-link" href="#pdf-preview">浏览 PDF</a>
           <a href="#revisions">处理修订</a>
           <a href="#report-delivery">查看版本与导出</a>
@@ -135,8 +160,56 @@
       </section>
     </div>
     {% if error %}<p class="alert" role="alert">{{ error }}{% if not is_current %}。<a href="{{ request.url_for('view_run', run_id=run_id) }}">打开当前版本</a>{% endif %}</p>{% endif %}
+    {% if is_current and state.run_status in ['queued', 'running'] %}
+      <p class="card meta" data-stage-text role="status">PDF 已解析，正在准备审阅。报告中的判定可能尚未完成。</p>
+    {% elif is_current and state.run_status in ['paused', 'failed'] %}
+      <section class="alert" aria-label="审阅恢复">
+        <strong>{{ '审阅已暂停' if state.run_status == 'paused' else '本次处理未完成' }}</strong>
+        {% if report.runtime_error %}<p>{{ report.runtime_error }}</p>{% endif %}
+        {% if state.run_status == 'paused' %}<a href="#review-tasks">查看用量并继续审阅</a>
+        {% elif can_select %}<a href="#abstract-editor" data-open-editor>重新编辑并复核</a>{% endif %}
+      </section>
+    {% endif %}
     <div class="layout">
       <div class="stack">
+        <section class="card" id="abstract">
+          <div class="section-heading">
+            <h2>{{ '当前摘要' if is_current else '历史摘要' }}</h2>
+            <span class="pill pill-{{ verification }}">{{ statuses.get(verification, verification) }}</span>
+          </div>
+          <p class="abstract">{{ report.reviewed_abstract.text }}</p>
+          {% if abstract_review.reason %}<p class="meta">{{ abstract_review.reason }}</p>{% endif %}
+          {% if abstract_diff %}
+          <details class="group" open>
+            <summary>与待审原摘要对照</summary>
+            <p class="meta"><del>原摘要删除</del> · <ins>当前摘要新增</ins></p>
+            <p class="abstract abstract-diff">{%- for change, text in abstract_diff -%}
+              {%- if change == 'delete' -%}<del>{{ text }}</del>
+              {%- elif change == 'insert' -%}<ins>{{ text }}</ins>
+              {%- else -%}{{ text }}
+              {%- endif -%}
+            {%- endfor -%}</p>
+          </details>
+          {% endif %}
+          {% if linked_sentences %}
+          <details class="group" data-abstract-sentences>
+            <summary>按原摘要句子查找断言和改句</summary>
+            <ol class="compact">
+            {% for sentence in linked_sentences %}
+              <li id="abstract-{{ sentence.sentence_id }}">
+                <p class="excerpt">{{ sentence.text }}</p>
+                <ul class="compact">
+                {% for target, label in sentence_links[sentence.sentence_id] %}
+                  <li><a href="#{{ target }}"{% if target.startswith('finding-') %} data-finding-link{% endif %}>{{ label }}</a></li>
+                {% endfor %}
+                </ul>
+              </li>
+            {% endfor %}
+            </ol>
+          </details>
+          {% endif %}
+          <div class="toolbar"><a href="#findings">查看断言</a><a href="#revisions">查看改句与复核</a></div>
+        </section>
         <section class="card findings-card" id="findings">
           <div class="section-heading">
             <h2>断言与证据</h2><span class="meta" data-finding-count>{{ finding_total }} 条</span>
@@ -147,10 +220,21 @@
           {% for group in compound_findings %}
             {% set verdict = group.verdict or group.review_status %}
             {% set ids = group.evidence_ids|default([]) %}
-            <details class="finding" id="finding-{{ group.compound_id }}" data-verdict="{{ verdict }}"{% if requested_finding == group.compound_id or (selected and selected.evidence_id in ids) or (not selected and not requested_finding and loop.first) %} open{% endif %}>
+            <details class="finding" id="finding-{{ group.compound_id }}" data-verdict="{{ verdict }}" data-compound{% if requested_finding == group.compound_id or (selected and selected.evidence_id in ids) or (not selected and not requested_finding and loop.first) %} open{% endif %}>
               <summary class="finding-toggle"><span class="pill pill-{{ verdict }}">{{ statuses.get(verdict, verdict) }}</span><span class="finding-text">{{ group.text }}</span></summary>
               <div class="finding-detail">
-              <p class="meta">{{ {'and': '全部条件同时成立', 'or': '至少一个条件成立'}.get(group.operator, group.operator) }}</p>
+              <p class="meta">复合句汇总 · {{ {'and': '全部条件同时成立', 'or': '至少一个条件成立'}.get(group.operator, group.operator) }}</p>
+              {% if group.members %}
+              <ul class="compact">
+                {% for member in group.members %}
+                {% set member_verdict = member.verdict or member.review_status %}
+                <li>
+                  {% if member_verdict %}<span class="pill pill-{{ member_verdict }}">{{ statuses.get(member_verdict, member_verdict) }}</span>{% endif %}
+                  <a href="#finding-{{ member.claim_id }}" data-finding-link>{{ member.proposition or member.text }}</a>
+                </li>
+                {% endfor %}
+              </ul>
+              {% endif %}
               {% if group.reason %}<p class="muted">{{ group.reason }}</p>{% endif %}
               {{ claim_sources(ids) }}
               {% if verdict == 'pending' %}
@@ -165,10 +249,11 @@
             {% set verdict = finding.verdict or finding.review_status %}
             {% set ids = finding.evidence_ids|default([]) %}
             {% set graph = evidence_graphs.get(finding.claim_id) %}
-            <details class="finding" id="finding-{{ finding.claim_id }}" data-verdict="{{ verdict }}"{% if requested_finding == finding.claim_id or (selected and (selected.evidence_id in ids or (graph and selected.evidence_id in graph.evidence_ids))) or (not selected and not requested_finding and not compound_findings and loop.first) %} open{% endif %}>
+            <details class="finding" id="finding-{{ finding.claim_id }}" data-verdict="{{ verdict }}"{% if requested_finding == finding.claim_id or (selected and (selected.evidence_id in ids or selected.evidence_id in finding.follow_up_evidence_ids|default([]) or (graph and selected.evidence_id in graph.evidence_ids))) or (not selected and not requested_finding and not compound_findings and loop.first) %} open{% endif %}>
               <summary class="finding-toggle"><span class="pill pill-{{ verdict }}">{{ statuses.get(verdict, verdict) }}</span><span class="finding-text">{{ finding.proposition if finding.compound else finding.text }}</span></summary>
               <div class="finding-detail">
               {{ claim_sources(ids) }}
+              {% if finding.sentence_id in sentence_links %}<p class="meta"><a href="#abstract-{{ finding.sentence_id }}" data-abstract-sentence-link>查看原摘要句子</a></p>{% endif %}
               {% if finding.follow_up_performed %}
               <details class="group follow-up">
                 <summary>{% if finding.follow_up_round_count %}定向补查 {{ finding.follow_up_round_count }} 轮{% else %}定向补查{% endif %}</summary>
@@ -220,12 +305,9 @@
           </div>
           {% if not report.findings and not compound_findings %}<p class="muted">这份报告尚无断言裁决。可以先查看已提取的原文证据。</p>{% endif %}
           {% if report.evidence %}
-          <details class="group"><summary>查阅原文证据（{{ report.evidence|length }}）</summary>
-            <div class="evidence-list">
-              {% for evidence in report.evidence %}
-              <div class="evidence-row"><p class="excerpt">{{ evidence.text }}</p>{{ evidence_link(evidence.evidence_id) }}</div>
-              {% endfor %}
-            </div>
+          <details class="group" id="original-evidence"{% if request.query_params.get('evidence_list') %} open{% endif %}>
+            <summary>查阅原文证据（{{ report.evidence|length }}）</summary>
+            {% include 'review_evidence_list.html' %}
           </details>
           {% endif %}
         </section>
@@ -249,18 +331,34 @@
         <section class="card revisions-card" id="revisions">
           <div class="section-heading"><h2>修订与复核</h2><span class="meta">{{ revisions|length }} 条建议</span></div>
           {% if revisions %}
-          <p class="section-note">{% if can_select and passed_revisions %}对照原句和建议，确认要采纳的改句后保存。系统会复核保存后的版本。{% elif not passed_revisions %}可查看建议和核验结果。通过核验的改句可供采纳。{% else %}以下是本版本的改句和核验结果。{% endif %}</p>
+          <p class="section-note">{% if can_select and passed_revisions %}把要采用的改句填入当前编辑稿，再统一保存并复核。{% elif not passed_revisions %}可查看建议和核验结果。通过核验的改句可供采纳。{% else %}以下是本版本的改句和核验结果。{% endif %}</p>
           <form class="selection" method="post" action="{{ request.url_for('select_revision', run_id=run_id) }}">
             <input type="hidden" name="base_version_id" value="{{ version_id }}">
             <input type="hidden" name="submission_id" value="{{ token }}-choose">
             {% for revision in revisions %}
-            <article class="revision">
+            <article class="revision" id="revision-{{ revision.revision_id }}">
               <span class="pill pill-{{ revision.status }}">{{ statuses.get(revision.status, revision.status) }}</span>
               <div class="change group">
                 <div><div class="field-caption">原句</div><p class="excerpt">{{ revision.original_text }}</p></div>
                 <div><div class="field-caption">建议改句</div><p class="excerpt">{{ revision.replacement }}</p></div>
               </div>
               {{ evidence_links(revision.evidence_ids|default([])) }}
+              {% if revision.sentence_id in sentence_links %}<p class="meta"><a href="#abstract-{{ revision.sentence_id }}" data-abstract-sentence-link>查看原摘要句子</a></p>{% endif %}
+              {% if revision.supersede_reason %}<p class="meta">{{ revision.supersede_reason }}</p>{% endif %}
+              {% if revision.superseded_by %}<p class="meta"><a href="#revision-{{ revision.superseded_by }}">查看取代它的改句</a></p>{% endif %}
+              {% set check = revision_checks.get(revision.revision_id) %}
+              {% if check and (check.reason or check.calculations) %}
+                <details class="group"{% if revision.status in ['returned', 'manual_review'] %} open{% endif %}>
+                  <summary>这条改句的复核依据</summary>
+                  {% if check.reason %}<p class="meta">{{ check.reason }}</p>{% endif %}
+                  {{ evidence_links(check.evidence_ids|default([])) }}
+                  {% for calculation in check.calculations|default([]) %}
+                    <p class="meta">{% if calculation.formula %}<code>{{ calculation.formula }}</code> = {{ calculation.result }}{% endif %} {{ calculation.reason|default('') }}</p>
+                    {{ evidence_links(calculation.evidence_ids|default([])) }}
+                    {{ evidence_links(calculation.scope_evidence_ids|default([])) }}
+                  {% endfor %}
+                </details>
+              {% endif %}
               {% if revision.semantic_diff %}
                 <details class="group"><summary>语义差异</summary>
                   <ul class="compact">
@@ -269,11 +367,17 @@
                 </details>
               {% endif %}
               {% if can_select and revision.status == 'passed' %}
-                <label class="option"><input type="checkbox" name="revision_ids" value="{{ revision.revision_id }}"{% if revision.revision_id in selected_revision_ids %} checked{% endif %}> 采用这条建议</label>
+                <button class="button button-small" type="button" data-editor-insert
+                        data-source="{{ revision.original_text }}" data-replacement="{{ revision.replacement }}" hidden>采用到编辑稿</button>
+                {% if report.reviewed_abstract.text == report.original_abstract.text %}
+                  <noscript><label class="option"><input type="checkbox" name="revision_ids" value="{{ revision.revision_id }}"> 采用这条建议</label></noscript>
+                {% endif %}
               {% endif %}
             </article>
             {% endfor %}
-            {% if can_select and (passed_revisions or selected_revision_ids) %}<div class="form-actions"><button class="button primary" type="submit">保存所选修订</button></div>{% endif %}
+            {% if can_select and passed_revisions and report.reviewed_abstract.text == report.original_abstract.text %}
+              <noscript><div class="form-actions"><button class="button primary" type="submit">保存所选修订</button></div></noscript>
+            {% endif %}
           </form>
           {% else %}
           <p class="section-note">
@@ -308,14 +412,17 @@
             </ul>
           </details>
           {% endif %}
-          {% if can_select %}
-          <details class="group"><summary>手动修改摘要</summary>
-            <form class="fields group" method="post" action="{{ request.url_for('select_revision', run_id=run_id) }}" data-abstract-edit-form>
+          {% if can_select or edited_draft is not none %}
+          <details class="group" id="abstract-editor" data-editor-details{% if edited_draft is not none or state.run_status == 'failed' %} open{% endif %}>
+            <summary>编辑摘要</summary>
+            <form class="fields group" method="post" action="{{ request.url_for('select_revision', run_id=run_id) }}" data-abstract-edit-form data-lock-submit>
               <input type="hidden" name="base_version_id" value="{{ version_id }}">
               <input type="hidden" name="submission_id" value="{{ token }}-edit">
               {% include 'review_provisional_options.html' %}
-              <label class="field">确认提交文本<textarea name="edited_text" rows="7" required>{{ report.reviewed_abstract.text }}</textarea></label>
-              <div class="form-actions"><button class="button primary" type="submit">保存并复核</button></div>
+              <label class="field">确认提交文本<textarea name="edited_text" rows="7" required>{{ edited_draft if edited_draft is not none else report.reviewed_abstract.text }}</textarea></label>
+              <p class="meta" data-editor-status role="status" hidden></p>
+              <div class="form-actions"><button class="button primary" type="submit"{% if not can_select %} disabled{% endif %}>保存并复核</button></div>
+              {% if not can_select %}<p class="meta">当前任务仍在处理。请复制这份草稿，待最新报告可用时再提交。</p>{% endif %}
             </form>
           </details>
           {% endif %}
@@ -333,10 +440,49 @@
           <ul>
             {% for item in report.external_checks %}
             <li>
-              <span class="pill">{{ statuses.get(item.support_status, item.support_status) }}</span>
+              {% if item.kind == 'novelty_search' %}
+              <strong>新颖性文献检索</strong> · <span class="pill">候选文献</span>
               {{ item.attribution.text|default(item.attribution) }}
+              <p class="meta">检索词：{{ item.query }}</p>
+              {% if item.candidates %}
+                <ul class="compact">
+                {% for candidate in item.candidates %}
+                  {% set doi = candidate.doi|default('', true)|string %}
+                  {% set openalex = candidate.id|default('', true)|string %}
+                  <li>
+                    {% if doi.startswith('https://doi.org/') or openalex.startswith('https://openalex.org/') %}
+                      <a href="{{ doi if doi.startswith('https://doi.org/') else openalex }}" rel="noreferrer">{{ candidate.display_name|default('文献记录', true) }}</a>
+                    {% else %}{{ candidate.display_name|default('文献记录', true) }}{% endif %}
+                    {% if candidate.publication_date %} · {{ candidate.publication_date }}{% endif %}
+                  </li>
+                {% endfor %}
+                </ul>
+              {% endif %}
               <p class="meta">{{ item.reason }}</p>
-              {{ evidence_links(item.evidence|default([])|map(attribute='evidence_id')|list) }}
+              {% else %}
+              <span class="pill pill-{{ item.support_status }}">{{ statuses.get(item.support_status, item.support_status) }}</span>
+              {{ item.attribution.text|default(item.attribution) }}
+              {% if item.reference %}
+                {% set reference = item.reference %}
+                <p class="meta">
+                {% if reference.provider in ['doi', 'arxiv'] and reference.identifier %}
+                  <a href="{{ ('https://doi.org/' if reference.provider == 'doi' else 'https://arxiv.org/abs/') ~ reference.identifier|urlencode }}" rel="noreferrer">{{ reference.title or reference.identifier }}</a>
+                {% else %}{{ reference.title or reference.identifier or '' }}{% endif %}
+                {% if item.citation_status %} · {{ statuses.get(item.citation_status, item.citation_status) }}{% endif %}
+                {% if item.access_status %} · {{ statuses.get(item.access_status, item.access_status) }}{% endif %}
+                </p>
+              {% endif %}
+              <p class="meta">{{ item.reason }}</p>
+              {% set adopted = item.evidence_ids|default([]) %}
+              {% if item.citation_evidence_ids %}<p class="field-caption">主论文中的引用位置</p>{{ evidence_links(item.citation_evidence_ids) }}{% endif %}
+              {% if adopted %}<p class="field-caption">裁决采用的外部证据</p>{{ evidence_links(adopted) }}{% endif %}
+              {% set candidates = item.evidence|default([])|rejectattr('evidence_id', 'in', adopted)|list %}
+              {% if candidates %}
+                <details class="group"><summary>其他候选段落（{{ candidates|length }}）</summary>
+                  <ul class="compact">{% for candidate in candidates %}<li><p class="excerpt">{{ candidate.text|default('') }}</p>{{ evidence_link(candidate.evidence_id) }}</li>{% endfor %}</ul>
+                </details>
+              {% endif %}
+              {% endif %}
             </li>
             {% endfor %}
           </ul>
@@ -354,7 +500,7 @@
             {% if report.runtime_error %}<li>{{ report.runtime_error }}</li>{% endif %}
           </ul>
           {% if is_current and state.run_status == 'paused' %}
-          <form class="form-actions" method="post" action="{{ request.url_for('resume_review', run_id=run_id) }}">
+           <form class="form-actions" method="post" action="{{ request.url_for('resume_review', run_id=run_id) }}" data-lock-submit>
             <input type="hidden" name="request_id" value="{{ token }}-resume">
             <label>追加请求 <input name="add_requests" type="number" min="0" value="0"></label>
             <label>追加秒数 <input name="add_seconds" type="number" min="0" value="0"></label>
@@ -365,14 +511,6 @@
         {% endif %}
         <section class="card delivery-card" id="report-delivery">
           <div class="section-heading"><h2>版本与导出</h2></div>
-        <details class="summary-card" id="abstract">
-          <summary><span>{{ '当前摘要' if is_current else '历史摘要' }}</span><span class="pill pill-{{ verification }}">{{ statuses.get(verification, verification) }}</span></summary>
-          <div class="summary-body">
-          <p class="abstract">{{ report.reviewed_abstract.text }}</p>
-          {% if abstract_review.reason %}<p class="meta">{{ abstract_review.reason }}</p>{% endif %}
-          {% if report.original_abstract.text != report.reviewed_abstract.text %}
-          <details><summary>查看原摘要</summary><p class="abstract group">{{ report.original_abstract.text }}</p></details>
-          {% endif %}
           {% if report.abstract_versions and report.abstract_versions|length > 1 %}
           <details><summary>摘要版本</summary>
             <ul>
@@ -380,20 +518,19 @@
                 {% set kind = {'pdf_original': 'PDF 摘要', 'pasted_original': '粘贴摘要', 'candidate': '候选改写', 'selected': '用户确认版'}.get(version.kind, version.kind) %}
                 <li>
                   {% if version.version_id == version_id %}
-                    <span>{{ kind }} · 当前显示</span>
+                    <span>{{ kind }} · <code>{{ version.version_id[:8] }}</code> · 当前显示</span>
                   {% elif version.version_id == report.original_abstract.version_id or version.kind in ['candidate', 'selected'] %}
-                    <a href="{{ request.url_for('view_run', run_id=run_id).include_query_params(version_id=version.version_id) }}">{{ kind or '历史版本' }}</a>
+                    <a href="{{ request.url_for('view_run', run_id=run_id).include_query_params(version_id=version.version_id) }}">{{ kind or '历史版本' }} · <code>{{ version.version_id[:8] }}</code></a>
                   {% else %}
-                    <details><summary>{{ kind or '备用摘要' }}</summary><p class="abstract group">{{ version.text }}</p></details>
+                    <details><summary>{{ kind or '备用摘要' }} · <code>{{ version.version_id[:8] }}</code></summary><p class="abstract group">{{ version.text }}</p></details>
                   {% endif %}
+                  {% if version.revision_ids %}<span class="meta"> · {{ version.revision_ids|length }} 条已采用改句</span>{% endif %}
                 </li>
               {% endfor %}
             </ul>
           </details>
           {% endif %}
           {% if not is_current %}<a href="{{ request.url_for('view_run', run_id=run_id) }}">返回最新版本</a>{% endif %}
-          </div>
-        </details>
           <div class="toolbar" aria-label="下载当前报告">
             <a class="button primary" href="{{ request.url_for('export_review', run_id=run_id).include_query_params(version_id=version_id, format='md') }}">下载 Markdown</a>
             <a class="button" href="{{ request.url_for('export_review', run_id=run_id).include_query_params(version_id=version_id, format='json') }}">下载 JSON</a>
@@ -412,6 +549,9 @@
   </main>
   {% endif %}
   {% if state and (not report or is_current) and state.run_status in ['queued', 'running'] %}
+  <p class="card progress-update" id="progress-update" role="status" hidden>
+    <span data-progress-message></span> <a data-progress-link href="{{ request.url_for('view_run', run_id=state.run_id) }}">查看最新报告</a>
+  </p>
   <div id="review-progress" data-status-url="{{ request.url_for('run_status', run_id=state.run_id) }}"
        data-version="{{ state.report_version_id or '' }}" data-phase="{{ state.run_status }}"
        data-queued-label="{{ statuses.get('queued') }}" data-running-label="{{ statuses.get('running') }}" hidden></div>

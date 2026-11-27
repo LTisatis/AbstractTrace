@@ -2,9 +2,9 @@ from contextlib import closing
 
 import pytest
 
-from abstract_review.audit import audit_version, extract_claims, review_claim, targeted_evidence
+from abstract_review.audit import audit_version, extract_claims, review_claim, sentences, targeted_evidence
 from abstract_review.evidence import EvidenceIndex
-from abstract_review.models import ModelPaused
+from abstract_review.models import InvalidJudgeReference, ModelPaused
 
 
 CLAIM = {
@@ -38,6 +38,72 @@ class Model:
         if isinstance(result, Exception):
             raise result
         return schema.model_validate(result)
+
+
+def test_offline_verbatim_quote_is_a_candidate_even_when_context_disputes_it():
+    rows = [_source("quote", CLAIM["quote"], "Related Work"),
+            _source("result", "Our primary trial found no biodiversity tracking effect.")]
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index)
+    assert finding["review_status"] == "pending" and finding["verdict"] is None
+    assert finding["verbatim_candidate_ids"] == ["quote"] and finding["evidence_ids"] == []
+    assert {"quote", "result"} <= set(finding["sent_candidate_ids"])
+
+
+@pytest.mark.parametrize(("verdict", "roles", "blocker"), [
+    ("supported", ["support", "refute"], "opposing_evidence"),
+    ("refuted", ["refute"], "missing_direct_contradiction"),
+])
+def test_fulltext_does_not_finalize_opposing_or_unproved_judgements(verdict, roles, blocker):
+    rows = [_source("support", "Biodiversity increased on the tested plot."),
+            _source("refute", "Biodiversity decreased on the tested plot.")]
+    output = _judgement(verdict=verdict, missing=[], groups=[{"role": role, "evidence_ids": [role]} for role in roles],
+                        observations=[{"requirement": CLAIM["requirements"][0], "status": "found", "evidence_ids": roles}])
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, Model(output), documents=[{"doc_id": "paper", "role": "main"}])
+    assert finding["review_status"] == "pending" and finding["verdict"] is None
+    assert finding["evidence_ids"] == roles
+    assert blocker in finding["decision_trace"]["blocker_codes"]
+    assert finding["decision_trace"]["attempts"][0]["proposed_verdict"] == verdict
+
+
+def test_trace_distinguishes_wire_references_from_citation_checks_and_budget():
+    rows = [_source("known", "Biodiversity was measured twice.")]
+    output = _judgement(verdict="pending", groups=[{"role": "limit", "evidence_ids": ["invented"]}])
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, Model(InvalidJudgeReference("invalid alias"), output))
+    assert finding["stop_reason"] == "invalid_judge_reference"
+    attempts = finding["decision_trace"]["attempts"]
+    assert [(a["status"], a["proposed_verdict"], a["repair"]) for a in attempts] == [
+        ("model_reference_error", None, False), ("citation_error", "pending", True),
+    ]
+    assert attempts[0]["material_sha256"] != attempts[1]["material_sha256"]
+    with closing(EvidenceIndex(rows)) as index:
+        finding, _ = review_claim(CLAIM, index, Model(InvalidJudgeReference("invalid alias"), ModelPaused("model budget exhausted")))
+    assert finding["stop_reason"] == "budget_exhausted" and finding["retryable"]
+    assert finding["decision_trace"]["attempts"][-1]["status"] == "model_paused"
+
+
+def test_academic_abbreviations_preserve_citation_offsets_and_later_sentence_ids():
+    abstract = "  We replicated the analysis by (Lee et al. 2011).\n\n We obtained 3.14 units (see Fig. 2). Next result."
+    parts = sentences(abstract)
+    assert [part["sentence_id"] for part in parts] == ["s1", "s3", "s5"]
+    assert [part["text"] for part in parts] == [
+        "We replicated the analysis by (Lee et al. 2011).",
+        "We obtained 3.14 units (see Fig. 2).",
+        "Next result.",
+    ]
+    assert all(abstract[part["start"]:part["end"]] == part["text"] for part in parts)
+    assert extract_claims(abstract)[0]["proposition"] == parts[0]["text"]
+
+
+def test_nonterminal_abbreviations_do_not_suppress_actual_sentence_ends():
+    abstract = "A result from Lee et al. We replicated Lee et al. (2021), e.g. their first trial. Next result."
+    assert [part["text"] for part in sentences(abstract)] == [
+        "A result from Lee et al.",
+        "We replicated Lee et al. (2021), e.g. their first trial.",
+        "Next result.",
+    ]
 
 
 def _methods_target():
@@ -82,6 +148,57 @@ def test_direct_refutation_requires_same_scope_and_only_supplementary_missing_fi
     assert result["verdict"] == expected
     assert ("direct_contradiction" in result) == (expected == "refuted")
     assert len(model.calls) == 1
+
+
+@pytest.mark.parametrize(("field", "proposition", "condition_text"), [
+    ("human patient population", "The intervention lowered recurrence in human patients.",
+     "The study used mice and enrolled no human patients."),
+    ("held-out test split", "The prototype improved detection on the held-out test split.",
+     "Detection was measured only on the training split."),
+    ("instrument calibration records", "With the specified instrument calibration, the prototype reduced drift.",
+     "The experiment did not record instrument calibration."),
+])
+def test_refutation_cannot_waive_decisive_conditions(field, proposition, condition_text):
+    claim = {**CLAIM, "proposition": proposition, "requirements": [field, "outcome"],
+             "support_query": condition_text, "counter_query": "opposite tested outcome"}
+    output = _judgement(verdict="refuted", missing=[field], groups=[{"role": "refute", "evidence_ids": ["scope", "opposite"]}],
+                        observations=[{"requirement": "outcome", "status": "found", "evidence_ids": ["opposite"]}])
+    output["direct_contradiction"] = {
+        "evidence_ids": ["opposite"], "scope_evidence_ids": ["scope"], "subject_and_conditions": "same",
+        "relation": "opposite_result", "scope_reason": "An opposite result was reported.", "supplementary_fields": [field],
+    }
+    model = Model(output)
+    with closing(EvidenceIndex([_source("scope", condition_text), _source("opposite", "The opposite tested outcome occurred.")])) as index:
+        result, _ = review_claim(claim, index, model)
+    assert model.calls[0]["optional_refutation_requirements"] == []
+    assert result["review_status"] == "pending" and result["verdict"] is None
+    assert result["refutation_blocker"] == "unapproved_supplementary_requirement"
+    assert result["evidence_ids"] == ["scope", "opposite"]
+
+
+@pytest.mark.parametrize(("verdict", "direction", "blocker"), [
+    ("supported", "support", "unlinked_support_requirements"),
+    ("refuted", "refute", "missing_scope_coverage"),
+])
+def test_decisive_scope_must_be_linked_to_the_directional_evidence(verdict, direction, blocker):
+    claim = {**CLAIM, "requirements": ["test split", "biodiversity outcome"],
+             "support_query": "biodiversity result test split", "counter_query": "test split"}
+    observed = _judgement(verdict=verdict, missing=[], groups=[{"role": direction, "evidence_ids": ["result"]}], observations=[
+        {"requirement": "biodiversity outcome", "status": "found", "evidence_ids": ["result"]},
+        {"requirement": "test split", "status": "found", "evidence_ids": ["other"]},
+    ])
+    if verdict == "refuted":
+        observed["direct_contradiction"] = {
+            "evidence_ids": ["result"], "subject_and_conditions": "same", "relation": "opposite_result",
+            "scope_reason": "The prototype was the same.", "supplementary_fields": [],
+        }
+    rows = [_source("result", "The biodiversity result was measured in the development run."),
+            _source("other", "The test split was used in a different experiment.")]
+    with closing(EvidenceIndex(rows)) as index:
+        result, _ = review_claim(claim, index, Model(observed))
+    assert {"result", "other"} <= set(result["sent_candidate_ids"])
+    assert result["review_status"] == "pending" and result["verdict"] is None
+    assert blocker in result["decision_trace"]["blocker_codes"]
 
 
 @pytest.mark.parametrize(("proof_mode", "blocker"), [
@@ -265,6 +382,23 @@ def test_completing_named_section_can_mark_requirement_searched_missing():
     assert [item["evidence_id"] for item in model.calls[-1]["evidence"]] == finding["sent_candidate_ids"]
 
 
+def test_primary_body_anchor_adds_its_own_source_range_to_the_review_packet():
+    rows = []
+    for page in range(2):
+        for number in range(5):
+            text = f"{'Wetland observations' if page else 'Calibration details'} were recorded at site {number}."
+            row = _source(f"p{page}-{number}", text, "Methods", page)
+            row["locator"]["bbox"] = [20, 50 + number * 12, 190, 60 + number * 12]
+            rows.append(row)
+    with closing(EvidenceIndex(rows)) as index:
+        ranked = index.ranked_body_context(["wetland observations"], page_index=1)
+        anchor = index.anchored_body_context(["p0-2"], ranked)
+        groups = index.pack_body_context([anchor, *ranked], ["p0-2"])
+    assert groups[0]["evidence_ids"] == [f"p0-{number}" for number in range(5)]
+    assert "p0-2" not in groups[0]["new_evidence_ids"]
+    assert groups[1]["evidence_ids"] == [f"p1-{number}" for number in range(5)]
+
+
 def test_truncated_named_source_is_not_exhaustive_even_with_ranked_hits():
     rows = [_source(f"m{i}", f"Paragraph {i}", "Methods", 1) for i in range(10)]
     index = EvidenceIndex([*rows, _source("r", "Biodiversity shifted.")])
@@ -295,10 +429,14 @@ def test_followup_ranks_named_methods_and_keeps_nearby_refutation_lines():
         {"query": "overflow flags", "requirement": "measurement definition", "section": "Appendix"},
     ]
     refutation = [eid for eid, _ in lines]
-    model = Model(_judgement(verdict="pending", targets=targets), _judgement(
+    reviewed = _judgement(
         verdict="refuted", missing=[], groups=[{"role": "refute", "evidence_ids": refutation}],
         observations=[{"requirement": "measurement definition", "status": "found", "evidence_ids": refutation}],
-    ))
+    )
+    reviewed["direct_contradiction"] = {"evidence_ids": refutation, "subject_and_conditions": "same",
+                                         "relation": "opposite_result", "scope_reason": "Same prototype and condition.",
+                                         "supplementary_fields": []}
+    model = Model(_judgement(verdict="pending", targets=targets), reviewed)
     with closing(EvidenceIndex(rows)) as index:
         finding, _ = review_claim(CLAIM, index, model)
 
@@ -369,7 +507,8 @@ def test_duplicate_followup_queries_leave_room_for_a_same_query_named_proof():
     saved = []
     with closing(EvidenceIndex(rows)) as index:
         finding, _ = review_claim(CLAIM, index, model, documents=[{"doc_id": "paper"}], save_targets=saved.append)
-    assert len(model.calls) == 2 and saved == [[target]]
+    assert len(model.calls) == 2 and len(saved) == 1
+    assert saved[0][0]["targets"] == [target]
     assert model.calls[1]["direct_inspections"][0]["section"] == "Methods"
     assert "proof" in finding["sent_candidate_ids"]
     assert finding["follow_up_performed"]
@@ -431,7 +570,7 @@ def test_printed_heading_hint_reaches_the_physical_page_when_the_parser_section_
                           "doc_id": hint["doc_id"], "page_index": hint["page_index"]}
                 return schema.model_validate(_judgement(verdict="pending", targets=[target]))
 
-            assert "source_hints" not in material
+            assert all(hint["page_index"] != evidence_page for hint in material.get("source_hints", []))
             scope, = material["direct_inspections"]
             assert scope["doc_id"] == "paper" and scope["page_index"] == evidence_page and scope["section"] is None
             assert scope["complete"] and scope["examined_evidence_ids"] == [evidence_id]
@@ -526,7 +665,8 @@ def test_retry_reuses_saved_target_without_reserving_a_second_round():
     audit_version(report, first, checkpoint, reserve_followup=mark_reservation)
     assert report["findings"][0]["retryable"] is True
     assert persisted[0] == [CLAIM["claim_id"]]
-    assert report["claim_followups"][CLAIM["claim_id"]] == [_methods_target()]
+    plan, = report["claim_followups"][CLAIM["claim_id"]]
+    assert plan["targets"] == [_methods_target()] and plan["sent_ids"] == ["r"]
 
     second = Model(_judgement())
     audit_version(report, second, checkpoint, reserve_followup=mark_reservation)
@@ -541,3 +681,54 @@ def test_disallowed_supplement_leaves_claim_pending_without_a_second_judgement()
     finding, _ = review_claim(CLAIM, index, model, reserve_followup=lambda: False)
     assert finding["stop_reason"] == "follow_up_budget"
     assert finding["verdict"] is None and len(model.calls) == 1
+
+
+def test_new_scoped_followup_keeps_prior_anchors_and_replays_both_rounds():
+    rows = [_source("prior", "The prototype tracks biodiversity."),
+            _source("protocol", "Sampling sites were visited twice.", "Methods", 1),
+            _source("definition", "Species counts excluded unverified sightings.", "Appendix", 2)]
+    documents = [{"doc_id": "paper", "role": "main",
+                  "pages": [{"page_index": page, "status": "parsed"} for page in range(3)]}]
+    required = "measurement definition"
+    first = {"query": "sampling protocol", "page_index": 1, "requirement": required, "doc_id": "paper"}
+    second = {"query": "species counting rules", "page_index": 2, "requirement": required, "doc_id": "paper"}
+    groups = [{"role": "support", "evidence_ids": ["prior"]}]
+    final = _judgement(verdict="supported", missing=[],
+                       groups=[{"role": "support", "evidence_ids": ["prior", "definition"]}],
+                       observations=[{"requirement": required, "status": "found", "evidence_ids": ["definition"]}])
+    initial = Model(_judgement(verdict="pending", targets=[first], groups=groups),
+                    _judgement(verdict="pending", targets=[second]), ModelPaused("interrupted"))
+    saved, reservations = [], []
+    with closing(EvidenceIndex(rows)) as index:
+        paused, _ = review_claim(CLAIM, index, initial, documents=documents, save_targets=saved.append,
+                                 reserve_followup=lambda: not reservations.append(True))
+
+    assert paused["retryable"] and paused["follow_up_round_count"] == 2
+    assert len(initial.calls) == 3 and reservations == [True]
+    assert [plan["targets"] for plan in saved[-1]] == [[first], [second]]
+    assert {row["evidence_id"] for row in initial.calls[-1]["evidence"]} >= {"prior", "definition"}
+    resumed_model = Model(final)
+    with closing(EvidenceIndex(rows)) as index:
+        result, _ = review_claim(CLAIM, index, resumed_model, documents=documents, saved_targets=saved[-1],
+                                 reserve_followup=lambda: pytest.fail("a saved inspection was reserved again"))
+    assert resumed_model.calls == [initial.calls[-1]]
+    assert result["verdict"] == "supported" and result["follow_up_round_count"] == 2
+    assert result["evidence_ids"] == ["prior", "definition"]
+
+
+@pytest.mark.parametrize("page", [1, 2])
+def test_second_followup_needs_a_new_source_and_new_sent_evidence(page):
+    records = [_source("prior", "The prototype tracks biodiversity."),
+               _source("method", "Sites used equal visits.", "Methods", 1)]
+    required = "measurement definition"
+    model = Model(_judgement(verdict="pending", targets=[{
+        "query": "visits", "requirement": required, "page_index": 1, "doc_id": "paper",
+    }]), _judgement(verdict="pending", targets=[{
+        "query": "measurement counts", "requirement": required, "page_index": page, "doc_id": "paper",
+    }]))
+    saved = []
+    with closing(EvidenceIndex(records)) as index:
+        result, _ = review_claim(CLAIM, index, model, documents=[{"doc_id": "paper"}], save_targets=saved.append)
+    assert len(model.calls) == 2 and len(saved) == 1
+    assert result["follow_up_round_count"] == 1
+    assert result["review_status"] == "pending"

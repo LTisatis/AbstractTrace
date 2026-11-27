@@ -8,6 +8,7 @@
   {{ evidence_links(proposal.evidence_ids) }}
   <p class="field-caption">仍需核对</p>
   <ul class="compact">{% for check in proposal.remaining_checks %}<li>{{ check }}</li>{% endfor %}</ul>
+  {% if can_select and proposal.replacement %}<a class="button button-small" href="#abstract-editor" data-open-editor>去编辑器应用</a>{% endif %}
   {% elif has_evidence %}
   <form method="post" action="{{ request.url_for('provisional_revision', run_id=run_id) }}" data-provisional-form>
     <input type="hidden" name="version_id" value="{{ version_id }}">

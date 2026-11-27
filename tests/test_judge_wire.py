@@ -128,6 +128,36 @@ def test_judge_compacts_typed_refs_and_restores_refs_without_touching_source_tex
     assert [target.doc_id for target in restored.follow_up_targets] == [SUPPLEMENT, None]
 
 
+def test_judge_can_only_cite_table_region_cells_actually_supplied():
+    material = _material()
+    material["table_region"] = {"reference_evidence_id": BODY, "evidence": [
+        {"evidence_id": "new-cell", "doc_id": MAIN, "text": "27 ms"},
+    ]}
+
+    def parse(**kwargs):
+        wire = json.loads(kwargs["input"][1]["content"])
+        region = wire["table_region"]
+        assert region["reference_evidence_id"] == "E3"
+        assert region["evidence"] == [{"evidence_id": "E4", "doc_id": "D1", "text": "27 ms"}]
+        result = {**_result(), "evidence_groups": [{"role": "refute", "evidence_ids": ["E4"]}]}
+        return _parsed(kwargs["text_format"], result)
+
+    restored = _model(parse).call("judge", material, _JudgeResult)
+    assert restored.evidence_groups[0].evidence_ids == ["new-cell"]
+
+
+def test_priority_evidence_order_can_refer_to_supplied_context():
+    material = _material()
+    material["priority_evidence_ids"] = [BODY, TABLE, PRIMARY]
+
+    def parse(**kwargs):
+        wire = json.loads(kwargs["input"][1]["content"])
+        assert wire["priority_evidence_ids"] == ["E3", "E2", "E1"]
+        return _parsed(kwargs["text_format"], _result())
+
+    assert _model(parse).call("judge", material, _JudgeResult).evidence_groups[0].evidence_ids == [PRIMARY, BODY]
+
+
 @pytest.mark.parametrize(("path", "bad"), [
     (("evidence_groups", 0, "evidence_ids", 0), PRIMARY),
     (("evidence_groups", 0, "evidence_ids", 0), "E4"),

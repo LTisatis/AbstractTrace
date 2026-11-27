@@ -384,9 +384,19 @@ def test_external_evidence_preview_is_limited_to_its_report_version(tmp_path, cl
     evidence_id = evidence["evidence_id"]
     with service.store.acquire(run_id) as token:
         current = service.store.read(run_id)
+        citation = current["evidence"][0]["evidence_id"]
         current["external_checks"] = [{
+            "kind": "explicit_citation", "reference": {"provider": "doi", "identifier": "10.1234/example"},
+            "citation_status": "exists", "access_status": "accessible",
             "attribution": {"text": "The publication measured samples."}, "support_status": "supported",
-            "reason": "The source reports its sample count.", "document": external_doc, "evidence": [evidence],
+            "reason": "The source reports its sample count.", "document": external_doc,
+            "citation_evidence_ids": [citation], "evidence_ids": [evidence_id],
+            "evidence": [evidence, {**evidence, "evidence_id": "uncited", "text": "Unadopted candidate"}],
+        }, {
+            "kind": "novelty_search", "support_status": "not_checked", "attribution": {"text": "First method"},
+            "reason": "Metadata is not a priority decision.", "query": "Novelty check search query",
+            "candidates": [{"id": "https://openalex.org/W123", "display_name": "Candidate prior work",
+                            "publication_date": "2026-01-01"}],
         }]
         service.store.save(current, token)
 
@@ -401,6 +411,48 @@ def test_external_evidence_preview_is_limited_to_its_report_version(tmp_path, cl
     browser = client.get(f"/runs/{run_id}", params={"version_id": latest, "evidence_id": evidence_id})
     assert browser.status_code == 200
     assert "The publication measured samples." in browser.text
+    assert "主论文中的引用位置" in browser.text
+    assert "裁决采用的外部证据" in browser.text
+    assert "其他候选段落（1）" in browser.text
+    assert "Unadopted candidate" in browser.text
+    assert "Novelty check search query" in browser.text
+    assert "Candidate prior work" in browser.text
+    assert "https://openalex.org/W123" in browser.text
     assert "已高亮所选证据" in browser.text
     assert client.get(f"/runs/{run_id}/preview", params={"version_id": older, "evidence_id": evidence_id}).status_code == 404
     assert evidence_id not in {item["evidence_id"] for item in service.export(run_id, latest)["evidence"]}
+
+
+def test_original_evidence_is_paginated_and_searchable(tmp_path, client):
+    response = client.post("/api/v1/reviews", files={"pdf": ("paper.pdf", _pdf_bytes(), "application/pdf")})
+    run_id = response.json()["run_id"]
+    version = wait_for_run(client, run_id)["report_version_id"]
+    service = ReviewService(tmp_path / "state.sqlite3")
+    with service.store.acquire(run_id) as token:
+        report = service.store.read(run_id)
+        template = report["evidence"][0]
+        for number in range(65):
+            report["evidence"].append({**template, "kind": "table_note", "evidence_id": f"fixture-{number}",
+                                       "text": f"Pagination fixture row {number:02d}."})
+        service.store.save(report, token)
+    report_url = f"/runs/{run_id}"
+    initial = client.get(report_url)
+    assert initial.text.count('class="evidence-row"') == 30
+    assert "Pagination fixture row 64." not in initial.text
+    fragment = client.get(f"{report_url}/evidence-list", params={
+        "version_id": version, "evidence_search": "Row 64", "evidence_kind": "table",
+    })
+    assert fragment.status_code == 200 and fragment.text.count('class="evidence-row"') == 1
+    assert "Pagination fixture row 64." in fragment.text
+    assert client.get(f"{report_url}/evidence-list", params={"version_id": "missing"}).status_code == 404
+
+
+def test_recent_runs_includes_ready_and_failed_intake(client):
+    assert "还没有本地审阅记录" in client.get("/runs").text
+    valid = client.post("/api/v1/reviews", files={"pdf": ("paper.pdf", _pdf_bytes(), "application/pdf")})
+    failed = client.post("/api/v1/reviews", files={"pdf": ("invalid.pdf", b"invalid", "application/pdf")})
+    wait_for_run(client, valid.json()["run_id"])
+    wait_for_run(client, failed.json()["run_id"], "failed")
+    history = client.get("/runs").text
+    assert "paper.pdf" in history and "下载 Markdown" in history
+    assert "invalid.pdf" in history and "未完成" in history

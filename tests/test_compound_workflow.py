@@ -109,6 +109,9 @@ class _ReviewModel:
         return schema(verdict="refuted" if refuted else "supported", reason="The aligned Table 2 cells give the change.",
                       evidence_groups=[{"role": "refute" if refuted else "support", "evidence_ids": evidence_ids}],
                       missing_fields=[], follow_up_queries=[],
+                      direct_contradiction={"evidence_ids": evidence_ids, "subject_and_conditions": "same",
+                                            "relation": "opposite_result", "scope_reason": "Same dataset and baseline.",
+                                            "supplementary_fields": []} if refuted else None,
                       empirical_support=None if refuted else {
                           "result_source": "direct_result", "result_evidence_ids": evidence_ids,
                           "scope_evidence_ids": evidence_ids, "same_study_and_scope": "same",

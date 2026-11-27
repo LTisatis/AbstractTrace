@@ -1,4 +1,4 @@
-"""Persist the one-round evidence budget shared by review and verification."""
+"""Persist the per-claim source-check reservation shared by review and verification."""
 
 from .evidence import EvidenceIndex
 
@@ -19,7 +19,7 @@ class FollowUps:
                 self.rounds.setdefault(finding["claim_id"], {"stage": "judge"})
 
     def reserve(self, claim_id: str) -> bool:
-        # audit_version checkpoints the round and its queries together.
+        # audit_version checkpoints the reservation and its source-check plan together.
         return self._reserve([claim_id], {"stage": "judge"})
 
     def _reserve(self, keys: list[str], record: dict) -> bool:

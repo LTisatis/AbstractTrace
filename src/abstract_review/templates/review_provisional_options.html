@@ -7,12 +7,12 @@
     <p class="excerpt">{{ option.preview }}</p>
     {% if option.replacement and option.source %}
     <button class="button button-small" type="button" data-provisional-apply
-            data-source="{{ option.source }}" data-replacement="{{ option.replacement }}">一键应用</button>
+            data-source="{{ option.source }}" data-replacement="{{ option.replacement }}"
+            {% if option.inline_source %}data-inline-source="{{ option.inline_source }}" data-inline-replacement="{{ option.inline_replacement }}" data-inline-start="{{ option.inline_start }}"{% endif %}>一键应用</button>
     {% else %}
     <p class="meta">这条改句需要结合前后文手动填写。</p>
     {% endif %}
   </div>
   {% endfor %}
-  <p class="provisional-apply-status meta" role="status" hidden></p>
   {% endif %}
 </div>

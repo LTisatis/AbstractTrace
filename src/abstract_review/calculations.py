@@ -5,12 +5,20 @@ import unicodedata
 from collections import defaultdict
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 
+from .evidence import experiment_ids
+
 
 _VALUE = r"[+−-]?(?:\d+(?:\.\d+)?|\.\d+)"
 _QUANTITY = re.compile(rf"(?<![a-z0-9.])(?P<value>{_VALUE})\s*(?P<unit>percentage points?\b|个?百分点|pp\b|%)", re.I)
 _LEVELS = re.compile(rf"(?:\bfrom\s+|从)({_VALUE})\s*(%)?\s*(?:to\s+|到|至)({_VALUE})\s*(%)?", re.I)
 _CLAUSE_BREAK = re.compile(r"[;；。]|\.(?=\s+[a-z])|\b(?:and|but|whereas|while)\b|[，,]|并且|而")
 _WIDE_SCOPE = re.compile(r"\b(?:all|each|every|both)\s+(?:data\s*sets?|splits?|groups?|samples?)\b|所有(?:数据集|样本)|各数据集", re.I)
+_NONEXACT_VALUE = re.compile(
+    r"\b(?:no|not|never|cannot|if|unless|could|might|would|at least|at most|up to|more than|less than|"
+    r"approximately|about|around|roughly|between)\b|n['’]t\b|[<>≤≥~≈]|"
+    r"至少|至多|不超过|超过|不到|约为|大约|近似|未(?:提高|增加|下降|降低)|没有|并非|如果|除非",
+    re.I,
+)
 _SPLIT = re.compile(r"\b(?:(?:fixed|held[- ]out|validation|test|train(?:ing)?|development|dev)[- ]+)+(?:split|set|partition)\b|(?:验证|测试|训练)集", re.I)
 _COMPARE_TO = re.compile(r"\b(?:against|versus|vs\.?|compared\s+(?:to|with)|relative\s+to)\s+([^,;:。；，.]+)", re.I)
 _DECREASE = re.compile(r"\b(?:decreas\w*|declin\w*|drop\w*|reduc\w*|lower\w*|fell|fall\w*)\b|降低|下降|减少", re.I)
@@ -173,6 +181,20 @@ def _comparison_baseline(text: str, fallback: str) -> str | None:
     return re.sub(r"^(?:(?:the|same|reported|original)\s+)+", "", _normal(label)).strip()
 
 
+def _experiment_scope(cells: list[dict], records: dict[str, dict], expected: frozenset[str]) -> list[str] | None:
+    row_headers = {source["evidence_id"]: refs for cell in cells
+                   if (source := records.get(cell.get("row_header_evidence_id"))) is not None
+                   and _table_key(source) == _table_key(cell) and (refs := experiment_ids(source["text"]))}
+    caption_ids = {source["evidence_id"] for cell in cells
+                   if (source := records.get(cell.get("caption_evidence_id"))) is not None
+                   and _table_key(source) == _table_key(cell)}
+    linked_ids = caption_ids | {eid for cell in cells for eid in cell.get("method_evidence_ids", ())}
+    linked = {eid: refs for eid in records if eid in linked_ids
+              and (refs := experiment_ids(records[eid]["text"]))}
+    anchors = row_headers or linked
+    return list(anchors) if frozenset().union(*anchors.values()) == expected else None
+
+
 def _scoped_pair(text: str, sentence: str, source: str, candidates: list[dict]) -> tuple[tuple[dict, dict, list[str]] | None, str]:
     by_row = defaultdict(list)
     by_id = {item["evidence_id"]: item for item in candidates}
@@ -183,6 +205,9 @@ def _scoped_pair(text: str, sentence: str, source: str, candidates: list[dict]) 
     if _WIDE_SCOPE.search(text):
         return None, "the numerical comparison covers multiple scopes"
     expected_table = _TABLE.search(text) or _TABLE.search(sentence)
+    expected_experiment = experiment_ids(text) or experiment_ids(sentence)
+    if len(expected_experiment) > 1 or (not expected_experiment and experiment_ids(source)):
+        return None, "the numerical comparison does not identify one experiment"
     expected_split = _SPLIT.search(text) or _SPLIT.search(sentence)
     if not expected_split and _SPLIT.search(source):
         return None, "the revision removed an explicit split from the comparison"
@@ -216,6 +241,11 @@ def _scoped_pair(text: str, sentence: str, source: str, candidates: list[dict]) 
             _METRIC.search(" ".join((*_column_path(item), _normal(item.get("column_header") or ""))))
             for item in [*baseline, *target]
         ):
+            continue
+        experiment_evidence = (
+            _experiment_scope([*baseline, *target], by_id, expected_experiment) if expected_experiment else []
+        )
+        if experiment_evidence is None:
             continue
         split_evidence = []
         if expected_split:
@@ -252,7 +282,7 @@ def _scoped_pair(text: str, sentence: str, source: str, candidates: list[dict]) 
             matching_rows += 1
         for first in baseline:
             for second in target:
-                pairs[first["evidence_id"], second["evidence_id"]] = (first, second, split_evidence)
+                pairs[first["evidence_id"], second["evidence_id"]] = (first, second, [*experiment_evidence, *split_evidence])
     if len(pairs) != 1 or matching_rows != 1:
         return None, "the revised dataset, split, metric, or baseline did not identify one comparable table pair"
     return next(iter(pairs.values())), ""
@@ -335,7 +365,10 @@ def check_revision_numbers(source: str, replacement: str, evidence: list[dict]) 
         values = _stated_values(clause, replacement)
         if not values:
             continue
-        pair, reason = _scoped_pair(clause, replacement, source, evidence)
+        if _NONEXACT_VALUE.search(clause):
+            pair, reason = None, "the numerical claim does not assert an exact comparison"
+        else:
+            pair, reason = _scoped_pair(clause, replacement, source, evidence)
         for operation, stated, unit, direction_conflict in values:
             if operation is None or pair is None:
                 result = {
@@ -357,6 +390,7 @@ def check_revision_numbers(source: str, replacement: str, evidence: list[dict]) 
                 with localcontext() as context:
                     context.prec = max(28, len(calculated.as_tuple().digits) + abs(stated.as_tuple().exponent) + 1)
                     rounded = calculated.quantize(Decimal(1).scaleb(stated.as_tuple().exponent), rounding=ROUND_HALF_UP)
+                result["rounded_result"] = format(rounded, "f")
                 verification = "matched" if rounded == stated and not direction_conflict else "mismatch"
             if direction_conflict:
                 result["reason"] = "the revised wording gives conflicting directions for the same change"
@@ -372,4 +406,4 @@ def comparison_for_claim(text: str, candidates: list[dict]) -> tuple[dict, Decim
     record = records[0]
     if record["operation"] not in {"percentage_points", "relative_change"}:
         return None
-    return {key: value for key, value in record.items() if key not in {"stated", "verification"}}, Decimal(record["stated"])
+    return record, Decimal(record["stated"])

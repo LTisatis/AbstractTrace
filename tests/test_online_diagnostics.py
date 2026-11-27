@@ -1,9 +1,11 @@
 import os
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import APITimeoutError
 
-from abstract_review.models import ResponsesModel, SmokeResult, online_diagnostics
+from abstract_review.models import Extraction, ModelPaused, ResponsesModel, SmokeResult, online_diagnostics
 
 
 def test_online_diagnostics_exercises_text_and_vision_requests():
@@ -24,6 +26,23 @@ def test_online_diagnostics_exercises_text_and_vision_requests():
     assert content[-1]["image_url"].startswith("data:image/png;base64,")
     assert all("W7D42" not in part.get("text", "") for part in content)
     assert all(request["store"] is False for request in requests)
+
+
+@pytest.mark.parametrize(("budget", "expected"), [(900, 120), (60, 60)])
+def test_extraction_timeout_respects_remaining_workflow_budget(monkeypatch, budget, expected):
+    monkeypatch.setattr("abstract_review.models.time", SimpleNamespace(monotonic=lambda: 0, sleep=lambda _seconds: None))
+    timeouts = []
+
+    def parse(**payload):
+        timeouts.append(payload["timeout"])
+        raise APITimeoutError(request=httpx.Request("POST", "https://example.invalid/responses"))
+
+    model = ResponsesModel("test-model", max_seconds=budget,
+                           client=SimpleNamespace(responses=SimpleNamespace(parse=parse)))
+    with pytest.raises(ModelPaused, match="model request timed out"):
+        model.call("extract", {"sentences": []}, Extraction)
+    assert timeouts == [expected] * 3
+    assert [event["status"] for event in model.events] == ["timeout"] * 3
 
 
 @pytest.mark.live
