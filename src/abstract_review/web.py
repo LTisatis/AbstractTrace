@@ -1,11 +1,13 @@
 """Local HTML review workspace and version-scoped evidence views."""
 
 import json
+import os
 import re
 import shutil
 import sqlite3
 from collections import Counter
 from contextlib import asynccontextmanager
+from difflib import SequenceMatcher
 from math import isfinite
 from pathlib import Path, PureWindowsPath
 from threading import Event
@@ -17,15 +19,18 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from jinja2 import Environment, PackageLoader, select_autoescape
 
+from .audit import sentences
 from .ingest import MAX_PDF_BYTES
 from .reporting import display_documents, display_evidence, evidence_path_tree, render_markdown
-from .review import ReviewService
+from .review import PdfReviewInput, ReviewService
 from .run_store import RunBusy
 from .worker import LocalWorker
 
 
 _TEMPLATES = Environment(loader=PackageLoader("abstract_review"), autoescape=select_autoescape())
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_EVIDENCE_PAGE_SIZE = 30
+_EVIDENCE_KINDS = {"body": "正文", "table": "表格", "figure": "图与图注", "other": "其他"}
 _STATUS_TEXT = {
     "completed": "已裁决", "pending": "待核验", "supported": "支持", "refuted": "反驳",
     "insufficient": "证据不足", "manual_conflict": "证据冲突", "manual_review": "需人工复核",
@@ -33,7 +38,52 @@ _STATUS_TEXT = {
     "queued": "排队中", "paused": "已暂停", "failed": "未完成", "running": "正在处理",
     "not_checked": "未核查", "not_supported": "未获支持", "unclear": "尚无定论",
     "unverified": "未核实", "unavailable": "不可访问", "unreadable": "无法提取",
+    "superseded": "已取代", "exists": "已查到记录", "not_found": "未查到记录",
+    "accessible": "可获取全文", "no_open_fulltext": "无开放全文",
 }
+
+
+def _abstract_diff(original: str, edited: str) -> list[tuple[str, str]]:
+    original_parts = re.findall(r"[A-Za-z0-9_]+|\s+|[^\s]", original)
+    edited_parts = re.findall(r"[A-Za-z0-9_]+|\s+|[^\s]", edited)
+    if max(len(original_parts), len(edited_parts)) > 4000:
+        return [("delete", original), ("insert", edited)]
+    result = []
+    for change, start, end, new_start, new_end in SequenceMatcher(None, original_parts, edited_parts).get_opcodes():
+        if change in {"delete", "replace"}:
+            result.append(("delete", "".join(original_parts[start:end])))
+        if change != "delete":
+            result.append(("equal" if change == "equal" else "insert", "".join(edited_parts[new_start:new_end])))
+    return result
+
+
+def _evidence_group(evidence: dict) -> str:
+    kind = evidence.get("kind", "")
+    if kind.startswith("table") or kind == "visual_table":
+        return "table"
+    if kind.startswith("figure"):
+        return "figure"
+    return "body" if kind == "body_text" else "other"
+
+
+def _evidence_listing(request: Request, report: dict) -> dict:
+    params = request.query_params
+    search = params.get("evidence_search", "").strip()[:200]
+    kind = params.get("evidence_kind", "")
+    if kind not in _EVIDENCE_KINDS:
+        kind = ""
+    records = report["evidence"]
+    matching = [item for item in records
+                if (not kind or _evidence_group(item) == kind) and search.casefold() in item["text"].casefold()]
+    pages = max(1, (len(matching) + _EVIDENCE_PAGE_SIZE - 1) // _EVIDENCE_PAGE_SIZE)
+    try:
+        page = max(1, min(pages, int(params.get("evidence_page", "1"))))
+    except ValueError:
+        page = 1
+    start = (page - 1) * _EVIDENCE_PAGE_SIZE
+    return dict(evidence_items=matching[start:start + _EVIDENCE_PAGE_SIZE], evidence_matches=len(matching),
+                evidence_page=page, evidence_pages=pages, evidence_search=search, evidence_kind=kind,
+                evidence_kinds=_EVIDENCE_KINDS)
 
 
 def _html(request: Request, *, status_code: int = 200, template_name: str = "review.html", **context) -> HTMLResponse:
@@ -128,7 +178,7 @@ def _marks(selected: dict, page_evidence: list[dict]) -> list[tuple[pymupdf.Rect
     return marks
 
 
-def _render_page(archive: Path, index: int, marks: list[tuple[pymupdf.Rect, bool]]) -> bytes:
+def _render_page(archive: Path, index: int, marks: list[tuple[pymupdf.Rect, bool]], *, detail: bool = False) -> bytes:
     try:
         with pymupdf.open(archive) as document:
             if not document.is_pdf or document.needs_pass or not 0 <= index < document.page_count:
@@ -145,7 +195,8 @@ def _render_page(archive: Path, index: int, marks: list[tuple[pymupdf.Rect, bool
                         mark, color=color, fill=color, width=1.4,
                         stroke_opacity=0.9, fill_opacity=0.22 if active else 0.13,
                     )
-            scale = min(2, 1700 / max(page.rect.width, page.rect.height))
+            scale_limit, pixels = (3, 2400) if detail else (2, 1700)
+            scale = min(scale_limit, pixels / max(page.rect.width, page.rect.height))
             pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False, annots=False)
             return pixmap.tobytes("png")
     except (pymupdf.mupdf.FzErrorBase, RuntimeError, ValueError) as exc:
@@ -213,10 +264,18 @@ def create_app(data_dir: Path) -> FastAPI:
 
     app = FastAPI(title="AbstractTrace", lifespan=lifespan)
 
+    def intake_page(request: Request, *, form=None, error=None, status_code=200) -> HTMLResponse:
+        return _html(
+            request, status_code=status_code, error=error, form=form or {}, max_pdf_bytes=MAX_PDF_BYTES,
+            model_configured=bool(os.environ.get("OPENAI_API_KEY")),
+            default_model=PdfReviewInput.__dataclass_fields__["model"].default,
+        )
+
     def report_page(
         request: Request, run_id: str, version_id: str | None = None,
         evidence_id: str | None = None, *, doc_id: str | None = None, page: int | None = None,
         error: str | None = None, status_code: int = 200, preview_only: bool = False,
+        edited_draft: str | None = None,
     ) -> HTMLResponse:
         intake = _status(service, run_id)
         if not preview_only and intake["report_version_id"] is None and version_id is None and evidence_id is None:
@@ -248,6 +307,7 @@ def create_app(data_dir: Path) -> FastAPI:
             evidence_by_id=evidence_by_id, preview_url=preview_url, preview_document=preview_document,
             preview_page=preview_page, preview_focus=preview_focus, preview_evidence=preview_evidence,
             page_numbers=page_numbers, page_position=page_position, requested_doc=doc_id, requested_page=page,
+            preview_documents=[item for item in display_documents(report) if item.get("pages")],
         )
         if preview_only:
             return _html(request, template_name="review_preview.html", **preview_context)
@@ -257,27 +317,45 @@ def create_app(data_dir: Path) -> FastAPI:
             finding["claim_id"]: evidence_path_tree(paths, evidence_by_id)
             for finding in report.get("findings", ()) if (paths := finding.get("retrieval_paths"))
         }
-        finding_counts = Counter(
-            row.get("verdict") or row.get("review_status")
-            for kind in ("compound_findings", "findings") for row in report.get(kind, ())
-        )
+        finding_counts = Counter(row.get("verdict") or row.get("review_status") for row in report["findings"])
+        original_text = report["original_abstract"]["text"]
+        reviewed_text = report["reviewed_abstract"]["text"]
+        revision_checks = {item["revision_id"]: item for item in report.get("verifications", ())
+                           if item.get("scope") == "sentence" and item.get("revision_id")}
+        sentence_links: dict[str, list[tuple[str, str]]] = {}
+        for finding in report["findings"]:
+            if sentence_id := finding.get("sentence_id"):
+                label = finding.get("proposition") or finding["text"]
+                sentence_links.setdefault(sentence_id, []).append((f"finding-{finding['claim_id']}", label))
+        for revision in report.get("revisions", ()):
+            if sentence_id := revision.get("sentence_id"):
+                link = (f"revision-{revision['revision_id']}", f"改句：{revision['replacement']}")
+                sentence_links.setdefault(sentence_id, []).append(link)
+        linked_sentences = [part for part in sentences(original_text) if part["sentence_id"] in sentence_links]
         return _html(
             request, status_code=status_code, error=error, report=report, state=state,
             is_current=version == state["report_version_id"], evidence_graphs=evidence_graphs,
-            finding_counts=finding_counts,
+            finding_counts=finding_counts, edited_draft=edited_draft, revision_checks=revision_checks,
+            linked_sentences=linked_sentences, sentence_links=sentence_links,
+            abstract_diff=_abstract_diff(original_text, reviewed_text) if original_text != reviewed_text else [],
             provisional_options=provisional_editor_options(report),
             preview_endpoint=request.url_for("evidence_preview", run_id=run_id),
             **preview_context,
+            **_evidence_listing(request, report),
         )
 
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request) -> HTMLResponse:
-        return _html(request)
+        return intake_page(request)
+
+    @app.get("/runs", response_class=HTMLResponse)
+    def recent_runs(request: Request) -> HTMLResponse:
+        return _html(request, recent_runs=service.store.recent_runs())
 
     @app.post("/runs", name="start_review")
     @app.post("/api/v1/reviews", name="api_start_review", status_code=202)
     def start_review(
-        request: Request, pdf: Annotated[UploadFile, File()],
+        request: Request, pdf: Annotated[UploadFile | None, File()] = None,
         supplements: Annotated[list[UploadFile] | None, File()] = None,
         pasted_abstract: Annotated[str | None, Form()] = None,
         abstract_source: Annotated[str, Form()] = "pdf",
@@ -287,9 +365,17 @@ def create_app(data_dir: Path) -> FastAPI:
     ) -> Response:
         _block_foreign_origin(request)
         is_html = request.url.path == "/runs"
+        if pdf is None and not is_html:
+            raise HTTPException(422, "A main PDF is required.")
+        form = {
+            "pasted_abstract": pasted_abstract, "abstract_source": abstract_source, "engine": engine,
+            "check_omissions": check_omissions, "check_external": check_external,
+        }
         run_id = uuid4().hex
         root = data_dir / "intake" / run_id
         try:
+            if pdf is None or not pdf.filename:
+                raise ValueError("请选择主论文 PDF。")
             if abstract_source not in {"pdf", "pasted"}:
                 raise ValueError("请选择有效的待审摘要来源。")
             if engine not in {"offline", "openai"}:
@@ -302,16 +388,19 @@ def create_app(data_dir: Path) -> FastAPI:
                 _upload_pdf(upload, root / f"supplement-{i}")
                 for i, upload in enumerate(supplements or []) if upload.filename
             ]
+            submitted_abstract = pasted_abstract
+            if abstract_source == "pdf" and (is_html or not (pasted_abstract or "").strip()):
+                submitted_abstract = None
             state = service.store.queue_start(run_id, {
                 "pdf": paper.relative_to(root).as_posix(),
                 "supplements": [attachment.relative_to(root).as_posix() for attachment in attachments],
-                "pasted_abstract": pasted_abstract or None, "abstract_source": abstract_source,
+                "pasted_abstract": submitted_abstract or None, "abstract_source": abstract_source,
                 "engine": engine, "check_omissions": check_omissions, "check_external": check_external,
             })
         except (ValueError, OSError, sqlite3.Error) as exc:
             shutil.rmtree(root, ignore_errors=True)
             if is_html:
-                return _html(request, error=str(exc), status_code=400)
+                return intake_page(request, form=form, error=str(exc), status_code=400)
             raise HTTPException(400, str(exc)) from exc
         wake.set()
         if is_html:
@@ -321,8 +410,8 @@ def create_app(data_dir: Path) -> FastAPI:
         })
 
     @app.get("/api/v1/reviews/{run_id}")
-    def run_status(run_id: str) -> dict:
-        return _status(service, run_id)
+    def run_status(run_id: str) -> JSONResponse:
+        return JSONResponse(_status(service, run_id), headers={"Cache-Control": "no-store"})
 
     @app.get("/runs/{run_id}", response_class=HTMLResponse, name="view_run")
     def view_run(request: Request, run_id: str, version_id: str | None = None, evidence_id: str | None = None,
@@ -333,6 +422,15 @@ def create_app(data_dir: Path) -> FastAPI:
     def evidence_preview(request: Request, run_id: str, version_id: str | None = None, evidence_id: str | None = None,
                          doc_id: str | None = None, page: int | None = None):
         return report_page(request, run_id, version_id, evidence_id, doc_id=doc_id, page=page, preview_only=True)
+
+    @app.get("/runs/{run_id}/evidence-list", response_class=HTMLResponse)
+    def evidence_list(request: Request, run_id: str, version_id: str) -> HTMLResponse:
+        _, report = _snapshot(service, run_id, version_id)
+        return _html(
+            request, template_name="review_evidence_list.html", run_id=run_id, version_id=version_id,
+            evidence_by_id={item["evidence_id"]: item for item in report["evidence"]},
+            **_evidence_listing(request, report),
+        )
 
     @app.get("/api/v1/reviews/{run_id}/evidence/{evidence_id}")
     def review_evidence(run_id: str, evidence_id: str, version_id: str | None = None) -> dict:
@@ -356,6 +454,7 @@ def create_app(data_dir: Path) -> FastAPI:
     @app.get("/runs/{run_id}/pages/{doc_id}/{page_index}.png", name="review_page_image")
     def review_page_image(
         run_id: str, doc_id: str, page_index: int, version_id: str | None = None, evidence_id: str | None = None,
+        detail: bool = False,
     ) -> Response:
         _, report = _snapshot(service, run_id, version_id)
         document = next((doc for doc in display_documents(report) if doc["doc_id"] == doc_id), None)
@@ -372,7 +471,7 @@ def create_app(data_dir: Path) -> FastAPI:
                 if e.get("doc_id") == doc_id and e["locator"]["page_index"] == page_index
             ]
             marks = _marks(selected, page_evidence)
-        return Response(_render_page(archive, page_index, marks), media_type="image/png", headers={
+        return Response(_render_page(archive, page_index, marks, detail=detail), media_type="image/png", headers={
             "Cache-Control": "no-store",
         })
 
@@ -397,7 +496,7 @@ def create_app(data_dir: Path) -> FastAPI:
             stale = _status(service, run_id)["report_version_id"] != base_version_id
             code = 409 if stale or isinstance(exc, RunBusy) else 400
             if is_html:
-                return report_page(request, run_id, error=str(exc), status_code=code)
+                return report_page(request, run_id, error=str(exc), status_code=code, edited_draft=edited_text)
             raise HTTPException(code, str(exc)) from exc
         wake.set()
         if is_html:
@@ -437,7 +536,7 @@ def create_app(data_dir: Path) -> FastAPI:
             return _html(
                 request, template_name="review_provisional.html", run_id=run_id, version_id=version_id,
                 finding_id=claim_id, proposal=proposal,
-                refresh_provisional_options=True, provisional_options=provisional_editor_options(report),
+                refresh_provisional_options=True, provisional_options=provisional_editor_options(report), can_select=True,
                 evidence_by_id={item["evidence_id"]: item for item in display_evidence(report)},
             )
         url = request.url_for("view_run", run_id=run_id).include_query_params(version_id=version_id, finding=claim_id)

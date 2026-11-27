@@ -53,6 +53,45 @@ def test_cell_search_uses_its_headers_and_normalizes_percentage_point_units():
     assert hit_ids(index.search("Dataset A Improvement", limit=1)) == ["first"]
 
 
+def test_named_table_search_ranks_inside_the_region_by_the_claim_terms():
+    decoy = node("a-other-data", "12", cell=(0, 1, 1), column_header="Memory", table_label="Table 2")
+    result = node("z-target-data", "13", cell=(0, 2, 1), column_header="Latency", table_label="Table 2")
+    other = node("b-other-table", "13", cell=(1, 2, 1), column_header="Latency", table_label="Table 3")
+    with closing(EvidenceIndex([decoy, result, other])) as index:
+        matching = index.search("Table 2 latency", limit=1)
+        assert hit_ids(matching) == ["z-target-data"]
+        assert "table_region" in matching["scope"]["channels"]
+
+
+def test_referenced_table_region_preserves_rows_and_stays_on_the_same_version_and_page():
+    reference = node("ref", "Table 2 shows latency results for the detectors.", version="v1")
+    cells = [node(f"cell-{row}-{column}", f"{row * 100 + column} ms", version="v1", table_label="Table 2",
+                  cell=(0, row, column), row_header=f"Detector {row}", column_header="Latency")
+             for row in range(1, 6) for column in range(1, 5)]
+    other = node("old", "101 ms", version="old", cell=(0, 1, 1), table_label="Table 2")
+    later = node("later", "Table 2 shows the latency results.", version="v1", page=1)
+    with closing(EvidenceIndex([reference, *cells, other, later])) as index:
+        region = index.referenced_table_region("101 ms latency", ["ref"], {"ref"})
+        assert region["reference_evidence_id"] == "ref"
+        assert hit_ids(region)[:4] == [f"cell-1-{column}" for column in range(1, 5)]
+        assert len(region["evidence"]) <= 12
+        assert all(row["doc_version_id"] == "v1" and row["locator"]["page_index"] == 0 for row in region["evidence"])
+        assert index.referenced_table_region("101 ms latency", ["later"], {"later"}) is None
+
+
+def test_packet_priority_keeps_same_metric_and_named_operands_together():
+    wrong = node("wrong", "25", cell=(0, 1, 1), column_header="Gamma")
+    label = node("metric", "Mean response time", cell=(0, 1, 0))
+    first = node("first", "69", cell=(0, 1, 2), column_header="Alpha")
+    second = node("second", "29", cell=(0, 1, 3), column_header="Beta")
+    distant = node("unrelated", "Other experiment: Beta reported 25", page=1)
+    with closing(EvidenceIndex([wrong, label, first, second, distant])) as index:
+        supplied = ["wrong", "unrelated", "metric", "second", "first"]
+        ordered = index.prioritize_packet("Alpha response time 69 exceeds Beta response time 25", supplied, limit=3)
+        assert ordered[:3] == ["metric", "second", "first"]
+        assert set(ordered) == set(supplied)
+
+
 def test_graph_path_uses_labeled_caption_to_reach_method_with_two_hops():
     value = node("value", "37.2", page=2, cell=(0, 1, 1), bbox=[60, 100, 110, 120], column_header="Gain (%)")
     header = node("header", "Gain (%)", page=2, cell=(0, 0, 1), bbox=[60, 86, 110, 100])

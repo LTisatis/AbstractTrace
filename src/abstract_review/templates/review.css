@@ -300,9 +300,28 @@ a.graph-node:hover { border-color: #8cabec; background: var(--tint); }
 .evidence-list { max-height: 20rem; overflow: auto; margin-top: .5rem; padding-right: .2rem; }
 .evidence-row { padding: .48rem 0; border-top: 1px solid var(--line); }
 .evidence-row p { margin-bottom: .25rem; }
+.abstract-diff del, #abstract del { background: #ffded4; color: #8b3521; }
+.abstract-diff ins, #abstract ins { background: #d9f0e7; color: #14594a; }
+.attachment-list li + li { margin-top: .32rem; }
+.history-list { list-style: none; padding: 1rem; }
+.history-list li { display: flex; gap: .4rem .8rem; align-items: baseline; flex-wrap: wrap; }
+.history-list li + li { border-top: 1px solid var(--line); margin-top: .6rem; padding-top: .6rem; }
+.progress-update {
+  position: fixed; inset: auto 1rem 1rem auto; z-index: 4; max-width: calc(100% - 2rem);
+  box-shadow: 0 6px 20px #192b4933; border-inline-start: 4px solid var(--accent);
+}
+.pill-not_supported { background: #ffded4; color: #8b3521; }
+.pill-unclear { background: #faf0d7; color: #654909; }
+.pill-not_checked, .pill-superseded { background: var(--soft); color: var(--muted); }
+.evidence-search { align-items: end; }
 
-.preview { position: sticky; top: calc(var(--header-height) + .85rem); padding: 0; overflow: clip; }
-.preview-content { min-width: 0; }
+.preview {
+  position: sticky; top: calc(var(--header-height) + .85rem); padding: 0; overflow: auto;
+  max-height: calc(100dvh - var(--header-height) - 1.7rem);
+  display: flex; flex-direction: column;
+}
+.preview-content { min-width: 0; display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.preview-content > :not(.pdf) { flex-shrink: 0; }
 .pdf-heading { display: flex; align-items: start; justify-content: space-between; gap: .55rem; flex-wrap: wrap; padding: .84rem .95rem .68rem; }
 .pdf-heading h2 { margin-bottom: .22rem; }
 .pdf-tools { flex-shrink: 0; }
@@ -319,6 +338,9 @@ a.graph-node:hover { border-color: #8cabec; background: var(--tint); }
   font: inherit; font-size: .85rem; font-variant-numeric: tabular-nums; padding: .18rem .3rem;
 }
 .page-jump .meta { white-space: nowrap; min-width: 2.2rem; }
+.document-switch { display: flex; padding: 0 .95rem .6rem; align-items: center; gap: .5rem; }
+.document-switch select { min-width: 0; }
+.zoom-control select { width: auto; min-height: 30px; padding: .15rem .3rem; }
 .preview[aria-busy="true"] .preview-content { opacity: .68; }
 .preview-error { margin: .75rem .9rem; }
 .source-hint { color: var(--muted); font-size: .86rem; padding: .46rem .95rem; }
@@ -327,14 +349,13 @@ a.graph-node:hover { border-color: #8cabec; background: var(--tint); }
 .source-label span { color: var(--muted); font-weight: 500; }
 .source-quote blockquote { max-height: 5.7rem; overflow: auto; margin-top: .18rem; font-size: .87rem; }
 .pdf {
-  height: clamp(16rem, calc(100dvh - 19rem), 48rem); overflow: auto; padding: .7rem;
+  flex: 1 1 48rem; min-height: 8rem; overflow: auto; padding: .7rem;
   overscroll-behavior: contain; border-block: 1px solid var(--line);
   background:
     radial-gradient(circle, #59739330 1px, transparent 1.2px) 0 0 / 15px 15px,
     linear-gradient(130deg, #dde6f2, #edf1f7);
 }
-.pdf img { display: block; width: 100%; height: auto; background: #fff; box-shadow: 0 2px 12px #20345621; }
-.pdf.is-zoomed img { width: 155%; max-width: none; }
+.pdf img { display: block; width: var(--pdf-zoom, 100%); max-width: none; height: auto; background: #fff; box-shadow: 0 2px 12px #20345621; }
 .source-links { max-height: 7rem; overflow: auto; padding: .5rem .95rem; }
 .source-links .anchors:last-child { margin-bottom: .3rem; }
 .source-links .meta { margin-block: .22rem; }
@@ -352,8 +373,8 @@ a.graph-node:hover { border-color: #8cabec; background: var(--tint); }
 @media (max-width: 970px) {
   .intake { gap: 2rem; }
   .layout { grid-template-columns: minmax(0, 1fr); }
-  .preview { position: static; }
-  .pdf { height: clamp(17rem, 64dvh, 42rem); }
+  .preview { position: static; max-height: none; }
+  .pdf { flex: none; height: clamp(17rem, 64dvh, 42rem); }
   .mobile-back { display: inline-flex; }
   .report-nav .mobile-preview-link { display: inline-block; }
 }

@@ -48,6 +48,7 @@ def process(service, run_id: str, request_id: str | None, add_requests: int, add
             service.store.save(report, token)
 
         report["run_status"] = "running"
+        report["stage"] = "verify" if report["reviewed_abstract"].get("kind") == "selected" else "review"
         report.pop("runtime_error", None)
         checkpoint()
         try:
@@ -104,6 +105,8 @@ def _review_original(report: dict, model, checkpoint, data_dir, followups: Follo
     if configuration["check_omissions"] or configuration["check_external"]:
         from .references import check_external, check_omissions
 
+        report["stage"] = "checks"
+        checkpoint()
         if configuration["check_omissions"] and not report.get("omissions_checked"):
             report["omissions"] = check_omissions(report, model)
             report["omissions_checked"] = True
@@ -170,11 +173,15 @@ def _review_candidate(report: dict, model, followups: FollowUps, embedder, data_
     original = report["original_abstract"]
     while True:
         if "candidate_proposal" not in report:
+            report["stage"] = "revise"
+            followups.checkpoint()
             report["candidate_proposal"] = build_candidate(report, model, followups=followups, data_dir=data_dir)
             followups.checkpoint()
         if _refresh_findings(report, model, followups, embedder, data_dir):
             continue
         candidate = report["candidate_proposal"]
+        report["stage"] = "verify"
+        followups.checkpoint()
         review = verify_version(report, original, candidate or original, model, followups=followups, data_dir=data_dir)
         if _refresh_findings(report, model, followups, embedder, data_dir):
             continue
@@ -238,6 +245,7 @@ def submit_selection(service, run_id: str, base_version_id: str, submission_id: 
         report["report_version_id"] = version["version_id"]
         report["abstract_review"] = {"version_id": version["version_id"], "status": "pending"}
         report["run_status"] = "queued"
+        report["stage"] = "verify"
         if enqueue:
             service.store.save(report, token, enqueue=("resume", {}))
             return service._run_ref(report)

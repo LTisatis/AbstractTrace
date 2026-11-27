@@ -53,6 +53,18 @@ def test_release_coordinate_origin_and_input_isolation(tmp_path):
         run_scitabalign(altered)
 
 
+def test_comparison_keeps_each_named_row_with_the_shared_metric_header(tmp_path):
+    row = annotation("comparison", [[1, 3], [2, 1], [2, 3], [3, 1], [3, 3]])
+    row["claim"] = "Variant Blue reaches 72% accuracy, lower than Baseline Red."
+    row["table_content_values"] = [["Variant Blue", "72%", "84%"], ["Baseline Red", 8, "93%"],
+                                   ["Variant Gold", "72%", "72%"]]
+    inputs, _ = prepare(tmp_path, [row])
+    result, = run_scitabalign(inputs)
+    assert set(result["candidate_ids"][:5]) == {f"scitabalign:comparison:cell:{r}:{c}"
+                                              for r, c in [(1, 2), (1, 0), (0, 2), (2, 2), (2, 0)]}
+    assert len(result["candidate_ids"]) <= 8
+
+
 def test_score_uses_macro_cutoffs_and_preserves_excluded_case_counts(tmp_path):
     inputs, gold = prepare(tmp_path, [
         annotation("first", [[1, 3], [2, 3]]), annotation("missing", [[2, 3]]),
@@ -73,6 +85,36 @@ def test_score_uses_macro_cutoffs_and_preserves_excluded_case_counts(tmp_path):
     assert result["cases"][1]["scores_at_k"]["3"]["f1"] == 0
     assert result["cases"][2]["scores_at_k"] is None
     assert result["cases"][3]["gold_cells"] == []
+
+
+def test_capacity_diagnostics_separate_oversize_groups_and_missing_predictions(tmp_path):
+    grid = [(row, col) for row in range(3) for col in range(3)]
+    _, gold = prepare(tmp_path, [
+        annotation("oversize", [[row + 1, col + 1] for row, col in grid]),
+        annotation("complete", [[1, 1], [1, 2]]),
+        annotation("missing", [[1, 1], [1, 2]]),
+        annotation("empty", []),
+    ])
+    predictions = {"schema_version": 1, "predictions": [
+        prediction("oversize", grid[:8]), prediction("complete", [(0, 0), (0, 1)]),
+    ]}
+
+    result = score_scitabalign(predictions, gold)
+    by_capacity = result["rationale_capacity_at_k"]
+    assert by_capacity["1"]["eligible_complete_rationale_recall"] == {
+        "numerator": 0, "denominator": 0, "value": None,
+    }
+    assert by_capacity["1"]["eligible_macro_recall"] is None
+    assert by_capacity["8"]["complete_rationale_ceiling"] == {
+        "numerator": 2, "denominator": 3, "value": 2 / 3,
+    }
+    assert by_capacity["8"]["eligible_complete_rationale_recall"] == {
+        "numerator": 1, "denominator": 2, "value": 0.5,
+    }
+    assert by_capacity["8"]["eligible_macro_recall"] == 0.5
+    assert by_capacity["8"]["over_capacity_macro_recall"] == 8 / 9
+    assert by_capacity["8"]["macro_recall_ceiling"] == pytest.approx((2 + 8 / 9) / 3)
+    assert result["cell_retrieval_at_k"]["8"]["macro_complete_rationale"] == 1 / 3
 
 
 @pytest.mark.parametrize("cell_id", ["scitabalign:other:cell:1:2", "scitabalign:first:cell:1:3"])

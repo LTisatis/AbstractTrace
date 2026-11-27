@@ -191,38 +191,96 @@ def run_benchmark(args: argparse.Namespace) -> None:
     import hashlib
     import time
 
+    from .scoring import semantic_manifest_sha256
+
     started = time.perf_counter()
     results = []
     output_path = args.output_dir / "predictions.json"
     record_path = args.output_dir / "run.json"
-    checkpoints = args.output_dir / "sample-checkpoints.json"
+    online_dataset = args.engine == "openai" and args.dataset in {"scifact", "scitabalign"}
+    checkpoints = args.output_dir / ("sample-checkpoints.sqlite3" if online_dataset else "sample-checkpoints.json")
     files = {output_path.resolve(), record_path.resolve(), checkpoints.resolve(), args.input_manifest.resolve()}
     if len(files) != 4:
         raise ValueError("benchmark outputs and input manifest must use distinct files")
-    manifest_hash = hashlib.sha256(args.input_manifest.read_bytes()).hexdigest()
+    manifest_bytes = args.input_manifest.read_bytes()
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{args.input_manifest}: invalid UTF-8 JSON ({exc})") from exc
     retrieval_options = {"embed_model": args.embed_model, "rerank_model": args.rerank_model}
     if any(retrieval_options.values()) and (args.dataset or not args.engine):
         raise ValueError("local retrieval models require a PDF benchmark engine without --dataset")
+    batch_limits = {key: value for key, value in (("max_requests", args.max_requests), ("max_seconds", args.max_seconds))
+                    if value is not None}
+    if batch_limits and not online_dataset:
+        raise ValueError("benchmark-wide limits are available for online SciFact and SciTabAlign")
+    if args.table_cell_limit is not None and args.dataset != "scitabalign":
+        raise ValueError("--table-cell-limit requires --dataset scitabalign")
+
+    def finish(predictions: list[dict], configuration: dict, batch: dict | None = None) -> None:
+        if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
+            raise ValueError("benchmark input manifest changed during review")
+        document = {"schema_version": 1, "predictions": predictions}
+        write_json(output_path, document)
+        record = {"schema_version": 1, "input_manifest_sha256": manifest_hash,
+                  "input_sample_ids": [row["sample_id"] for row in manifest["samples"]],
+                  "predictions_sha256": semantic_manifest_sha256(document), "configuration": configuration,
+                  "wall_seconds": round(time.perf_counter() - started, 6), "prediction_count": len(predictions),
+                  "samples": results}
+        summary = {"predictions_path": str(output_path), "prediction_count": len(predictions)}
+        if batch is not None:
+            record["batch"] = summary["batch"] = batch
+        write_json(record_path, record)
+        emit(summary)
 
     if args.dataset == "scifact":
         from .benchmark import benchmark_configuration
-        from .scifact import run_scifact
+        from .scifact import run_scifact, scifact_checkpoint
 
-        if args.resume:
-            raise ValueError("--resume is available for local PDF benchmarks")
         engine = args.engine or "offline"
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scifact-cited-abstracts"
-        predictions = run_scifact(read_json(args.input_manifest), engine, args.model)
+        if online_dataset:
+            with scifact_checkpoint(checkpoints, manifest_hash, configuration, resume=args.resume, **batch_limits) as batch:
+                predictions = run_scifact(manifest, engine, args.model, batch=batch)
+                results.extend(batch.results)
+                finish(predictions, configuration, batch.summary(len(manifest["samples"])))
+            return
+        if args.resume:
+            raise ValueError("--resume is available for PDF benchmarks and online SciFact or SciTabAlign")
+        predictions = run_scifact(manifest, engine, args.model)
     elif args.dataset == "scitabalign":
         from .benchmark import benchmark_configuration
         from .scitabalign import run_scitabalign
 
-        if args.resume or args.engine not in {None, "offline"}:
-            raise ValueError("SciTabAlign cell ranking uses the offline engine without --resume")
-        configuration = benchmark_configuration("offline", args.model)
+        engine = args.engine or "offline"
+        configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scitabalign-cells"
-        predictions = run_scitabalign(read_json(args.input_manifest))
+        configuration["table_cell_limit"] = (
+            args.table_cell_limit if args.table_cell_limit is not None else ("adaptive" if online_dataset else 8)
+        )
+        if online_dataset:
+            from .models import ModelUnavailable, ResponsesModel
+            from .scifact import benchmark_checkpoint
+
+            max_output_tokens = 2048
+            configuration["max_output_tokens"] = max_output_tokens
+            with benchmark_checkpoint(checkpoints, manifest_hash, configuration, dataset="SciTabAlign",
+                                      resume=args.resume, include_request_usage=True, **batch_limits) as batch:
+                try:
+                    model = ResponsesModel(args.model, max_requests=batch.max_requests,
+                                           max_seconds=batch.remaining_seconds, previous_attempts=batch.requests_used,
+                                           before_call=batch.reserve, max_output_tokens=max_output_tokens)
+                except ModelUnavailable as exc:
+                    raise ValueError(str(exc)) from exc
+                predictions = run_scitabalign(manifest, model=model, batch=batch, cell_limit=args.table_cell_limit)
+                results.extend(batch.results)
+                finish(predictions, configuration, batch.summary(len(manifest["samples"])))
+            return
+        if args.resume:
+            raise ValueError("--resume is available for PDF benchmarks and online SciFact or SciTabAlign")
+        predictions = run_scitabalign(manifest, cell_limit=args.table_cell_limit)
     elif args.engine:
         from .benchmark import benchmark_configuration, run_pdf_samples
 
@@ -236,8 +294,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
             recovered[sample_id] = {"input_digest": input_digest, "predictions": rows, "result": results[-1]}
             write_json(checkpoints, recovered)
 
+        def save_pause(sample_id: str, input_digest: str, run: dict) -> None:
+            recovered[sample_id] = {"input_digest": input_digest, "pause": run}
+            write_json(checkpoints, recovered)
+
         predictions = run_pdf_samples(service, args.input_manifest, args.engine, args.model,
-                                      recovered=recovered, on_sample=save_sample, on_result=results.append,
+                                      recovered=recovered, on_sample=save_sample, on_pause=save_pause,
+                                      on_result=results.append,
                                       configuration=configuration, **retrieval_options)
     else:
         if args.resume:
@@ -256,21 +319,17 @@ def run_benchmark(args: argparse.Namespace) -> None:
                     "verdict": finding["verdict"],
                     "evidence_ids": finding["evidence_ids"],
                 })
-    if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
-        raise ValueError("benchmark input manifest changed during review")
-    write_json(output_path, {"schema_version": 1, "predictions": predictions})
-    write_json(record_path, {
-        "schema_version": 1, "input_manifest_sha256": manifest_hash, "configuration": configuration,
-        "wall_seconds": round(time.perf_counter() - started, 6), "prediction_count": len(predictions),
-        "samples": results,
-    })
-    emit({"predictions_path": str(output_path), "prediction_count": len(predictions)})
+    finish(predictions, configuration)
 
 
 def score_benchmark(args: argparse.Namespace) -> None:
     from .scoring import score_predictions
 
     source_paths = {args.predictions.resolve(), args.gold_manifest.resolve()}
+    if args.run_record:
+        if args.dataset not in (None, "scifact"):
+            raise ValueError("--run-record is available for generic claim and SciFact scoring")
+        source_paths.add(args.run_record.resolve())
     annotations = {}
     for name in ("semantic_matches", "verdict_projections"):
         path = getattr(args, name)
@@ -283,10 +342,15 @@ def score_benchmark(args: argparse.Namespace) -> None:
     if args.output.resolve() in source_paths:
         raise ValueError("score output must differ from scoring input files")
     predictions, gold = read_json(args.predictions), read_json(args.gold_manifest)
+    run_record = None
+    if args.run_record:
+        run_record = read_json(args.run_record)
+        if not isinstance(run_record, dict):
+            raise ValueError("run record must be a JSON object")
     if args.dataset == "scifact":
         from .scifact import score_scifact
 
-        result = score_scifact(predictions, gold)
+        result = score_scifact(predictions, gold, run_record=run_record)
     elif args.dataset == "claimbench":
         from .claimbench import score_claimbench
 
@@ -300,7 +364,7 @@ def score_benchmark(args: argparse.Namespace) -> None:
         for name, content in reviews.items():
             if not isinstance(content, dict):
                 raise ValueError(f"{name.replace('_', ' ')} must be a JSON object")
-        result = score_predictions(predictions, gold, **reviews)
+        result = score_predictions(predictions, gold, run_record=run_record, **reviews)
     write_json(args.output, result)
     emit(result)
 
@@ -451,18 +515,27 @@ def build_parser() -> argparse.ArgumentParser:
     run = bench_commands.add_parser("run", help="predict from an input-only manifest")
     run.add_argument("--input-manifest", type=Path, required=True)
     run.add_argument("--output-dir", type=Path, required=True)
-    run.add_argument("--engine", choices=("offline", "openai"), help="review a PDF or SciFact benchmark manifest")
+    run.add_argument("--engine", choices=("offline", "openai"), help="benchmark engine for PDF, SciFact or SciTabAlign")
     run.add_argument("--dataset", choices=("scifact", "scitabalign"), help="select a public benchmark adapter")
+    run.add_argument("--table-cell-limit", type=int, choices=(8, 16),
+                     help="override SciTabAlign selection size (online default: adaptive; offline default: 8)")
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     run.add_argument("--embed-model", type=Path, help="path to an installed local Sentence Transformers model")
     run.add_argument("--rerank-model", type=Path, help="path to an installed local CrossEncoder")
-    run.add_argument("--resume", action="store_true", help="reuse matching persisted PDF sample checkpoints")
+    run.add_argument("--resume", action="store_true",
+                     help="reuse completed checkpoints and resume matching paused PDF or online dataset runs")
+    run.add_argument("--max-requests", type=int,
+                     help="total online SciFact or SciTabAlign provider attempts, including resumes (default: 8)")
+    run.add_argument("--max-seconds", type=int,
+                     help="total online SciFact or SciTabAlign elapsed seconds, including resumes (default: 180)")
     run.set_defaults(handler=run_benchmark)
 
     score = bench_commands.add_parser("score", help="score predictions independently of review")
     score.add_argument("--predictions", type=Path, required=True)
     score.add_argument("--gold-manifest", type=Path, required=True)
     score.add_argument("--output", type=Path, required=True)
+    score.add_argument("--run-record", type=Path,
+                       help="predictions-bound run.json for execution and pause diagnostics alongside scores")
     score.add_argument("--semantic-matches", type=Path, help="independent one-to-one proposition equivalence annotations")
     score.add_argument("--verdict-projections", type=Path, help="independent annotations of refuted conjuncts")
     score.add_argument("--dataset", choices=("scifact", "claimbench", "scitabalign"), help="select dataset-specific metrics")

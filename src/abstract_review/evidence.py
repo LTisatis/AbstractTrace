@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -51,6 +52,26 @@ _CONTEXT_WINDOW_LINES = 8
 _CONTEXT_MAX_LINES = 24
 _CONTEXT_MAX_CHARS = 1800
 _CONTEXT_SHORTLIST = 12
+_TABLE_REGION_CELLS = 12
+_TABLE_REGION_CHARS = 800
+_PARAMETER_COUNT_QUERY = re.compile(
+    r"\b(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    r"[\s-]+(?:free[\s-]+)?parameters?\b|\b(?:number|count) of (?:free )?parameters\b"
+)
+_PARAMETER_COUNT_HEADER = re.compile(
+    r"(?:df|degrees of freedom|(?:(?:number|count) of )?(?:free )?parameters?)"
+)
+_PARAMETER_LABEL = re.compile(r"\bparameters?\b")
+_RESULT_LANGUAGE = re.compile(
+    r"\b(?:as shown in|results? (?:indicate|show|suggest)|outperform\w*|perform\w* comparably|"
+    r"(?:increase|improve|decrease|reduce)\w* by|measured|observed)\b", re.I,
+)
+_INLINE_REFERENCE_CONTINUATION = re.compile(
+    r"\s*(?:19|20)\d{2}[a-z]?(?:[;,]\s*[^;,.\d]{1,32}(?:\s+et al\.)?,\s*(?:19|20)\d{2}[a-z]?)+"
+    r"\s*\)?(?:\s+(?:and|or))?\s*", re.I,
+)
+_TABLE_AXIS_QUERY = re.compile(r"\b(?:all|each|every)\s+(?:other\s+)?(?:rows?|columns?|intervals?|bins?|ranges?)\b"
+                               r"|(?:每[一个]|所有)(?:行|列|区间)", re.I)
 _SUMMARY_SECTION = re.compile(r"^(?:abstract|introduction|conclusions?|摘要|引言|结论)(?:\b|$)")
 _LINE_END = re.compile(r"[.!?。！？][\"'”’）)】\]]*$")
 _ABBREVIATION_END = re.compile(r"\b(?:e\.g|i\.e|et al|fig|eq|ref|no|vs|pp|vol|dr|prof)\.$", re.IGNORECASE)
@@ -58,8 +79,15 @@ _TRAILING_TRANSITION = re.compile(
     r"[.!?。！？]\s*(?:first|second|third|fourth|finally|alternatively|next|however|moreover|for example|"
     r"首先|其次|然后|最后|另外|例如|第[一二三四])[，,]$", re.IGNORECASE,
 )
+_PAGE_BODY_LABEL = re.compile(r"^(?:fig(?:ure)?\.?|table|图|表)\s*[A-Z]?\d", re.IGNORECASE)
+_PAGE_CONTINUATION_START = re.compile(r"^(?:[a-z\u3400-\u9fff]|[\[{(]\s*\d)")
 _WRAPPED_WORD = re.compile(r"(?<=[^\W\d_])[-\u00ad]\n\s*(?=[^\W\d_])")
 _WITNESS_QUERY = re.compile(r"\b(?:counter[\s-]?examples?|witness(?:es)?|constructive|examples?)\b|反例|构造性")
+_PRINTED_PROOF_LABEL = re.compile(
+    r"^(?:Proof of (?:Theorem|Lemma|Proposition|Corollary)|Theorem|Lemma|Proposition|Corollary)"
+    r"\s+\d+(?:\.\d+)*(?=[.:(\s]|$)"
+)
+_NON_PROOF_SECTION = re.compile(r"^(?:abstract|references?|bibliography|acknowledg\w*|摘要|参考文献)(?:\b|$)")
 _WITNESS_TEXT = re.compile(
     r"\b(?:can|could)\s+(?:(?:also|directly|exactly|successfully|always|still)\s+){0,2}"
     r"(?:(?:recognize|represent|express|simulate|separate|implement|compute|model|solve|realize|accept|classify|"
@@ -73,6 +101,9 @@ _PASSAGE_QUERY_NOISE = frozenset(
     "a an and or both under by between can could same any whether as at be been for from in is it of on that the "
     "their this these to was were will with would which theorem proof construction paper field assumption assumptions "
     "constructive example examples witness witnesses counterexample counterexamples result results supported observed".split()
+)
+_PACKET_QUERY_NOISE = _PASSAGE_QUERY_NOISE | frozenset(
+    "also we show shows can used use our further prior earlier reported using about how much than new".split()
 )
 _SECTION_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*|[ivx]+)[.)]?\s+")
 _METHOD_NAMES = frozenset(("method", "methods", "materials and methods", "material and methods", "methodology",
@@ -243,6 +274,10 @@ class _Edge:
     target_id: str
     relation: str
     anchors: tuple[str, ...]
+
+
+def experiment_ids(text: str) -> frozenset[str]:
+    return frozenset(_EXPERIMENT.findall(_normalize(text)))
 
 
 def with_method_scope(records: Iterable[dict], paths: Iterable[dict]) -> list[dict]:
@@ -509,11 +544,11 @@ class EvidenceIndex:
 
     def _experiment_anchor(self, eid: str) -> tuple[frozenset[str], str]:
         record = self._records[eid]
-        explicit = frozenset(_EXPERIMENT.findall(_normalize(record["text"])))
+        explicit = experiment_ids(record["text"])
         header_id = self._row_headers.get(eid)
         if header_id is not None:
             header = self._records[header_id]
-            row_refs = frozenset(_EXPERIMENT.findall(_normalize(header["text"])))
+            row_refs = experiment_ids(header["text"])
             if row_refs:
                 return explicit | row_refs, header_id
         return explicit, eid
@@ -652,6 +687,18 @@ class EvidenceIndex:
                 raise ValueError(f"evidence is outside the current scope: {eid!r}")
             result.append(deepcopy(self._records[eid]))
         return result
+
+    @cached_property
+    def proof_navigation_labels(self) -> tuple[tuple[str, int, str], ...]:
+        """Locate printed proof labels in text when PDF heading detection omits them."""
+        labels = {}
+        for row in self._records.values():
+            loc = row["locator"]
+            if row.get("kind") != "body_text" or _NON_PROOF_SECTION.match(_inspection_section(_text_field(loc, "section"))):
+                continue
+            if match := _PRINTED_PROOF_LABEL.match(" ".join(row["text"].split())):
+                labels[row["doc_id"], loc["page_index"], match[0]] = None
+        return tuple(labels)
 
     @staticmethod
     def _rank(postings: dict[str, set[str]], tokens: set[str], active: set[str]) -> list[str]:
@@ -843,6 +890,98 @@ class EvidenceIndex:
             results.setdefault(window.expanded_ids, window)
         return list(results.values())
 
+    def anchored_body_context(
+        self, candidate_ids: Iterable[str], windows: Iterable[_ContextWindow],
+    ) -> _ContextWindow | None:
+        """Complete a body range around a primary hit omitted by the ranked windows."""
+        covered = {eid for window in windows for eid in window.expanded_ids}
+        primary = dict.fromkeys(candidate_ids)
+        for eid in primary:
+            if eid in covered or self._records[eid].get("kind") != "body_text":
+                continue
+            matches = [window for window in self._index_context_windows().values()
+                       if eid in window.evidence_ids and set(window.expanded_ids) - primary.keys()]
+            if matches:
+                return max(matches, key=lambda window: (sum(item in primary for item in window.evidence_ids),
+                                                        len(window.expanded_ids)))
+        return None
+
+    @staticmethod
+    def _page_heading_keys(page: dict) -> set[str]:
+        headings = page.get("source_headings")
+        if not isinstance(headings, (list, tuple)):
+            return set()
+        return {_section_key(heading) for heading in headings if isinstance(heading, str) and heading.strip()}
+
+    def _page_lines(self, record: dict, page_index: int) -> Iterator[tuple[str, tuple]]:
+        page_key = _document_key(record), page_index
+        return (line for location, lines in self._body_lines.items() if location[:2] == page_key for line in lines)
+
+    def _page_prose(self, record: dict, page: dict) -> list[tuple[str, tuple]]:
+        width, height = page["width"], page["height"]
+        headings = self._page_heading_keys(page)
+        prose = []
+        for eid, box in self._page_lines(record, page["page_index"]):
+            text = self._records[eid]["text"].strip()
+            if (box[2] - box[0] >= 0.18 * width and box[1] >= 0.025 * height and box[3] <= 0.94 * height
+                    and sum(char.isalpha() for char in text) >= 8
+                    and not _PAGE_BODY_LABEL.search(text) and _section_key(text) not in headings):
+                prose.append((eid, box))
+        return prose
+
+    def page_continuation(self, candidate_ids: Iterable[str], documents: Iterable[dict]) -> tuple[str, _ContextWindow] | None:
+        """Find a displayed page-tail line and the physically continuous prose on the next page."""
+        pages = {(doc["doc_id"], page["page_index"]): page for doc in documents for page in doc.get("pages", ())
+                 if isinstance(page, dict) and type(page.get("page_index")) is int and page.get("status") == "parsed"
+                 and all(isinstance(page.get(axis), (int, float)) and page[axis] > 0 for axis in ("width", "height"))}
+        for eid in dict.fromkeys(candidate_ids):
+            row = self._records[eid]
+            box, text = _bbox(row), row["text"].rstrip()
+            if row.get("kind") != "body_text" or box is None or _LINE_END.search(text) or _TRAILING_TRANSITION.search(text):
+                continue
+            page_index = row["locator"]["page_index"]
+            current = pages.get((row["doc_id"], page_index))
+            next_page = pages.get((row["doc_id"], page_index + 1))
+            if not current or not next_page or current.get("rotation", 0) != next_page.get("rotation", 0):
+                continue
+            if box[3] < 0.82 * current["height"] or self._adjacent_line(eid, 1):
+                continue
+            prose = self._page_prose(row, current)
+            if (eid, box) not in prose or any(other != eid and (
+                rect[0] >= box[2] or (rect[1] > box[1] and rect[2] > box[0] and rect[0] < box[2])
+            ) for other, rect in prose):
+                continue
+            starts = [(other, rect) for other, rect in self._page_prose(row, next_page)
+                      if rect[1] <= 0.17 * next_page["height"]]
+            if not starts:
+                continue
+            left = min(rect[0] for _, rect in starts)
+            head, head_box = min((item for item in starts if item[1][0] <= left + box[3] - box[1]),
+                                 key=lambda item: (item[1][1], item[1][0], item[0]))
+            start_text = self._records[head]["text"].lstrip()
+            section = _section_key(_text_field(row["locator"], "section"))
+            if (not section or section in {"abstract", "references", "bibliography"}
+                    or section != _section_key(_text_field(self._records[head]["locator"], "section"))
+                    or not _PAGE_CONTINUATION_START.match(start_text)
+                    or (start_text[0] in "[{(" and text.count("(") <= text.count(")")
+                        and text.count("[") <= text.count("]") and text.count("{") <= text.count("}"))
+                    or not 0.65 * (box[3] - box[1]) <= head_box[3] - head_box[1] <= 1.5 * (box[3] - box[1])):
+                continue
+            headings = self._page_heading_keys(next_page)
+            if headings and any(rect[1] <= head_box[1] and rect[0] < head_box[2] and rect[2] > head_box[0]
+                                and _section_key(self._records[other]["text"]) in headings
+                                for other, rect in self._page_lines(row, page_index + 1)):
+                continue
+            anchors = [head]
+            while len(anchors) < _CONTEXT_WINDOW_LINES and (following := self._adjacent_line(anchors[-1], 1)):
+                if not self._wrap_to_next(anchors[-1], following):
+                    break
+                anchors.append(following)
+            ids = tuple(anchors)
+            passage = "\n".join(self._records[item]["text"] for item in ids)
+            return eid, _ContextWindow(passage, ids, ids)
+        return None
+
     def pack_body_context(self, windows: Iterable[_ContextWindow], primary_ids: Iterable[str]) -> list[dict]:
         """Attach original anchors under one extra-text budget across all passages."""
         primary = set(primary_ids)
@@ -860,8 +999,22 @@ class EvidenceIndex:
             chars -= text_length
             return True
 
+        def expand(window: _ContextWindow) -> tuple[str, ...]:
+            expanded = window.expanded_ids
+            start = expanded.index(window.evidence_ids[0])
+            stop = start + len(window.evidence_ids)
+            left, right = 0, len(expanded)
+            while left < start or right > stop:
+                if reserve(expanded[left:right]):
+                    return expanded[left:right]
+                if start - left >= right - stop:
+                    left += 1
+                else:
+                    right -= 1
+            return window.evidence_ids
+
         cores = [window for window in windows if reserve(window.evidence_ids)]
-        units = [window.expanded_ids if reserve(window.expanded_ids) else window.evidence_ids for window in cores]
+        units = [expand(window) for window in cores]
         groups = []
         for unit in units:
             fresh = [eid for eid in unit if eid not in primary]
@@ -875,6 +1028,10 @@ class EvidenceIndex:
     ) -> tuple[list[str], list[str]]:
         exact, query_without_exact = _exact_terms(query)
         lexical = _terms(query_without_exact if exact else query)
+        table_labels = {term for term in exact if term.startswith("table:")}
+        focus = self._table_focus(table_labels, lexical, exact - table_labels, active)
+        if focus:
+            exact -= table_labels
         ranks = {
             "lexical": self._lexical_rank(lexical, active),
             "exact": self._rank(self._exact, exact, active),
@@ -887,14 +1044,30 @@ class EvidenceIndex:
                 scores[eid] += 1 / (60 + rank)
         shortlist = sorted(scores, key=lambda eid: (-scores[eid], eid))[:_MAX_CANDIDATES]
         channels = list(ranks)
+        if focus:
+            shortlist = list(dict.fromkeys((*focus, *shortlist)))[:_MAX_CANDIDATES]
+            channels.append("table_region")
         passage_seeds = self._passage_seeds(query, active, limit) if passage_query else []
         if passage_seeds:
             shortlist = list(dict.fromkeys((*passage_seeds, *shortlist)))[:_MAX_CANDIDATES]
             channels.append("passage")
         if self._reranker is not None and shortlist:
-            shortlist = self._rerank(query, shortlist, active, set(ranks["exact"]) | set(passage_seeds))
+            protected = set(ranks["exact"]) | set(passage_seeds) | set(focus)
+            shortlist = self._rerank(query, shortlist, active, protected)
             channels.append("reranker")
         return shortlist, channels
+
+    def _table_focus(self, labels: set[str], lexical: set[str], exact: set[str], active: set[str]) -> list[str]:
+        """Use a named table as a region, then rank the cells by the rest of the query."""
+        if len(labels) != 1 or not (lexical or exact):
+            return []
+        label, = labels
+        region = active & self._named_tables.get(label.removeprefix("table:"), set())
+        if not region:
+            return []
+        exact_hits = self._rank(self._exact, exact, region)
+        lexical_hits = self._lexical_rank(lexical, region)
+        return list(dict.fromkeys((*exact_hits, *lexical_hits)))[:4]
 
     def _rerank(self, query: str, ranked: list[str], active: set[str], exact: set[str]) -> list[str]:
         if self._reranker is None:
@@ -1007,6 +1180,89 @@ class EvidenceIndex:
     def body_passages(self, candidate_ids: Iterable[str]) -> list[dict]:
         """Link only context lines present in the current packet, using their existing evidence IDs."""
         return [{"evidence_ids": list(unit)} for unit in self.evidence_units(candidate_ids) if len(unit) > 1]
+
+    def prioritize_packet(self, query: str, evidence_ids: Iterable[str], *, limit: int = 8) -> list[str]:
+        """Give a coherent source excerpt the first review slot without dropping other supplied anchors."""
+        ordered = list(dict.fromkeys(evidence_ids))
+        tokens = _terms(query) - _PACKET_QUERY_NOISE
+        if len(tokens) < 2 or len(ordered) <= limit:
+            return ordered
+        if cells := self._comparison_packet(query, ordered, limit):
+            return list(dict.fromkeys([*cells, *ordered]))
+
+        available = set(ordered)
+        ranks = {eid: position for position, eid in enumerate(ordered)}
+        best = (0, 0, 0, 0)
+        promoted = ()
+        for eid in ordered:
+            previous = self._adjacent_line(eid, -1)
+            if previous in available and self._adjacent_line(previous, 1) == eid:
+                continue
+            run = [eid]
+            while (following := self._adjacent_line(run[-1], 1)) in available:
+                if self._adjacent_line(following, -1) != run[-1]:
+                    break
+                run.append(following)
+            for start in range(len(run) - 1):
+                span = tuple(run[start:start + limit])
+                text = "\n".join(self._records[aid]["text"] for aid in span)
+                joined = " ".join(_WRAPPED_WORD.sub("", text).split())
+                matched = tokens & _terms(joined)
+                if len(matched) < 2:
+                    continue
+                section = _section_key(_text_field(self._records[span[0]]["locator"], "section"))
+                strength = len(matched) + bool(_RESULT_LANGUAGE.search(joined))
+                if section in {"references", "bibliography"}:
+                    strength -= 2
+                following = self._adjacent_line(span[-1], 1)
+                complete_end = following is None or not self._wrap_to_next(span[-1], following)
+                score = (strength, complete_end, -min(ranks[aid] for aid in span), -len(span))
+                if score > best:
+                    best, promoted = score, span
+        if len(promoted) == limit:
+            promoted = self._restore_comparison_scope(query, promoted, available)
+        return list(dict.fromkeys([*promoted, *ordered]))
+
+    def _restore_comparison_scope(self, query: str, span: tuple[str, ...], available: set[str]) -> tuple[str, ...]:
+        """Promote a clipped amount-comparison lead-in over a references-only line."""
+        exact, _ = _exact_terms(query)
+        numbers = [term for term in exact if term.startswith("number:")]
+        if len(numbers) < 2 or not any(term.endswith((":%", ":pp")) for term in numbers):
+            return span
+        previous = self._adjacent_line(span[0], -1)
+        if (previous not in available or previous in span or self._adjacent_line(previous, 1) != span[0]
+                or not self._wrap_to_next(previous, span[0])):
+            return span
+        reference = next((eid for eid in span[1:-1]
+                          if _INLINE_REFERENCE_CONTINUATION.fullmatch(self._records[eid]["text"])), None)
+        return (previous, *(eid for eid in span if eid != reference)) if reference else span
+
+    def _comparison_packet(self, query: str, ordered: list[str], limit: int) -> list[str]:
+        exact, without_numbers = _exact_terms(query)
+        if sum(term.startswith("number:") for term in exact) < 2:
+            return []
+        terms = _terms(without_numbers) - _PACKET_QUERY_NOISE
+        rows = defaultdict(list)
+        for eid in ordered:
+            record = self._records[eid]
+            if (record.get("kind") == "table_cell" and (table := _table_key(record)) is not None
+                    and (position := _cell_position(record)) is not None):
+                rows[table, position[0]].append(eid)
+        best = (0, 0)
+        promoted = []
+        for row in rows.values():
+            matched = []
+            for eid in row:
+                record = self._records[eid]
+                header = _text_field(record, "column_header")
+                cell_terms = terms.intersection(_terms(header or record["text"]))
+                if cell_terms:
+                    matched.append(eid)
+            if 2 <= len(matched) <= limit:
+                score = (len(matched), len(row))
+                if score > best:
+                    best, promoted = score, matched
+        return promoted
 
     def _followup_order(
         self, ranked: list[str], active: set[str], limit: int, prior: set[str], *, passage_limit: int,
@@ -1163,6 +1419,155 @@ class EvidenceIndex:
                 by_seed[seed_id] = list(ids)
                 all_ids.update(ids)
         return {"evidence": self.get(all_ids), "paths": paths, "by_seed": by_seed}
+
+    def _table_method_path(self, cell_id: str, query_terms: set[str]) -> tuple[_Edge, _Edge] | None:
+        walks = []
+        for caption in self._graph.get(cell_id, ()):
+            if caption.relation != "table_caption":
+                continue
+            for reference in self._graph[caption.target_id]:
+                method = self._records[reference.target_id]
+                text = _normalize(method["text"])
+                if (reference.relation == "table_reference" and reference.anchors[0] == reference.target_id
+                        and self._methods(method) and not _TABLE_CAPTION.match(text)
+                        and len(terms := (_terms(text) - _PACKET_QUERY_NOISE)) >= 3):
+                    walks.append((caption, reference, len(query_terms & terms)))
+        if walks:
+            caption, reference, _ = min(walks, key=lambda item: (
+                -item[2], self._edge_order(item[0]), self._edge_order(item[1]),
+            ))
+            return caption, reference
+        return None
+
+    def _parameter_count_cell(self, query: str, source_ids: list[str], query_terms: set[str]) -> str | None:
+        """Select by a named model and count column, independently of the asserted value."""
+        sources = defaultdict(list)
+        for rank, eid in enumerate(self.prioritize_packet(query, source_ids)[:12], 1):
+            record = self._records[eid]
+            if self._methods(record) or record.get("kind") == "figure":
+                sources[_document_key(record)].append((rank, _normalize(record["text"])))
+        documents = {_document_key(self._records[eid]) for eid in source_ids}
+        matches = defaultdict(list)
+        for table, cells in self._table_indexes.items():
+            if table[0] not in documents:
+                continue
+            for eid in cells:
+                cell = self._records[eid]
+                header = " ".join(_normalize(_text_field(cell, "column_header")).split())
+                row = " ".join(_normalize(_text_field(cell, "row_header")).split())
+                if (not row or not _data_cell(cell) or not _PARAMETER_COUNT_HEADER.fullmatch(header)
+                        or not _normalize(cell["text"]).strip().isdecimal()):
+                    continue
+                mention = re.compile(rf"(?<!\w){re.escape(row)}(?!\w)")
+                rank = 0 if mention.search(query) else next(
+                    (number for number, text in sources[table[0]] if mention.search(text)), None,
+                )
+                if rank is None or not (path := self._table_method_path(eid, query_terms)):
+                    continue
+                if (_PARAMETER_LABEL.search(header)
+                        or _PARAMETER_LABEL.search(_normalize(self._records[path[0].target_id]["text"]))):
+                    matches[rank].append(eid)
+        if matches and len(best := matches[min(matches)]) == 1:
+            return best[0]
+        return None
+
+    def linked_table_method(
+        self, query: str, source_ids: Iterable[str], *, retained_cell_id: str | None = None,
+    ) -> dict | None:
+        """Keep a selected table cell and an explicit methods reference in one bounded packet."""
+        scoped = list(dict.fromkeys(source_ids))
+        normalized = _normalize(query)
+        terms = _terms(normalized) - _PACKET_QUERY_NOISE
+        cells = [eid for eid in scoped if _data_cell(self._records[eid])]
+        if retained_cell_id in self._records and _data_cell(self._records[retained_cell_id]):
+            cells.insert(0, retained_cell_id)
+        elif _PARAMETER_COUNT_QUERY.search(normalized) and (count_cell := self._parameter_count_cell(normalized, scoped, terms)):
+            cells.insert(0, count_cell)
+        selected = next(((eid, path) for eid in dict.fromkeys(cells)
+                         if (path := self._table_method_path(eid, terms))), None)
+        if selected is None:
+            return None
+        cell_id, edges = selected
+        caption_id, method_id = (edge.target_id for edge in edges)
+        method_ids = [method_id]
+        while len(method_ids) < 4 and (following := self._adjacent_line(method_ids[-1], 1)):
+            if not self._wrap_to_next(method_ids[-1], following):
+                break
+            method_ids.append(following)
+        nodes = (cell_id, caption_id, method_id)
+        context = self.table_context([cell_id], max_per_cell=4)
+        known = set(scoped)
+        fresh = dict.fromkeys(eid for eid in (cell_id, caption_id, *method_ids,
+                              *(row["evidence_id"] for row in context["evidence"])) if eid not in known)
+        return {
+            "cell_evidence_id": cell_id, "reference_evidence_id": method_id, "evidence": self.get(fresh),
+            "method_ids": method_ids,
+            "paths": [{"evidence_ids": list(nodes), "edges": self._serialize_path(nodes, edges)}, *context["paths"]],
+        }
+
+    def referenced_table_region(self, query: str, source_ids: Iterable[str], known_ids: Iterable[str]) -> dict | None:
+        """Retrieve a bounded region of one verified same-page table referenced in the source text."""
+        known = set(known_ids)
+        for source_id in dict.fromkeys(source_ids):
+            source = self._records[source_id]
+            if source.get("kind") != "body_text" or not _TABLE_REFERENCE.search(_normalize(source["text"])):
+                continue
+            tables = self._referenced_page_tables(source_id)
+            if len(tables) != 1:
+                continue
+            table, = tables
+            cells = self._ranked_table_rows(query, self._table_indexes[table], known)
+            if cells:
+                return {"reference_evidence_id": source_id, "evidence": self.get(cells)}
+        return None
+
+    def _referenced_page_tables(self, source_id: str) -> set[tuple]:
+        source = self._records[source_id]
+        page_key = _document_key(source), source["locator"]["page_index"]
+        targets = [edge.target_id for edge in self._graph[source_id]
+                   if edge.relation == "table_reference" and edge.anchors[0] == source_id]
+        tables = set()
+        for target in targets:
+            record = self._records[target]
+            if record.get("kind") == "table_cell":
+                neighbors = [target]
+            else:
+                neighbors = [edge.target_id for edge in self._graph[target] if edge.relation == "table_caption"
+                             and self._records[edge.target_id].get("kind") == "table_cell"]
+            tables.update(table for eid in neighbors if (table := _table_key(self._records[eid])) and table[:2] == page_key)
+        return tables
+
+    def _ranked_table_rows(self, query: str, cell_ids: list[str], known: set[str]) -> list[str]:
+        coordinates = {eid: position for eid in cell_ids if (position := _cell_position(self._records[eid])) is not None}
+        if len(set(coordinates.values())) != len(coordinates):
+            return []
+        ranked, _ = self._query_rank(query, set(coordinates))
+        axis_query = bool(_TABLE_AXIS_QUERY.search(query))
+        if axis_query:
+            from .table_ranking import rank_table_cells
+
+            cells = [self._records[eid] for eid in coordinates]
+            structured = rank_table_cells(query, cells, ranked, limit=_TABLE_REGION_CELLS)
+            ranked = list(dict.fromkeys([*structured, *ranked]))
+        rows = defaultdict(list)
+        for eid, (row, _) in sorted(coordinates.items(), key=lambda entry: entry[1]):
+            rows[row].append(eid)
+        selected = {}
+        remaining = _TABLE_REGION_CHARS
+        for seed in ranked:
+            row, _ = coordinates[seed]
+            related = [edge.target_id for edge in sorted(self._graph[seed], key=self._edge_order)
+                       if edge.relation in _TABLE_CONTEXT]
+            cell_with_context = dict.fromkeys([seed, *related])
+            row_with_context = dict.fromkeys([*rows[row], *related])
+            for group in ((cell_with_context,) if axis_query else (row_with_context, cell_with_context)):
+                fresh = [eid for eid in group if eid not in known and eid not in selected]
+                size = sum(len(self._records[eid]["text"]) for eid in fresh)
+                if len(selected) + len(fresh) <= _TABLE_REGION_CELLS and size <= remaining:
+                    selected.update(dict.fromkeys(fresh))
+                    remaining -= size
+                    break
+        return list(selected)
 
     def search(
         self, query: str, *, limit: int = 8, section: str | None = None, expand: bool = True,

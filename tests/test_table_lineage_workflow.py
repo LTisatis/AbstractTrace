@@ -1,10 +1,14 @@
+from html.parser import HTMLParser
+
 import pymupdf
+import pytest
 from fastapi.testclient import TestClient
 
+from abstract_review.audit import review_claim, supplied_claims
 from abstract_review.calculations import check_revision_numbers
 from abstract_review.evidence import EvidenceIndex, with_method_scope
 from abstract_review.ingest import parse_pdf
-from abstract_review.reporting import render_markdown
+from abstract_review.reporting import evidence_path_tree, render_markdown
 from abstract_review.review import PdfReviewInput, ReviewService
 from abstract_review.web import create_app
 
@@ -196,6 +200,21 @@ def test_pdf_accuracy_result_reaches_its_header_note_and_experiment_method(tmp_p
             assert f"`{eid}`" in markdown
 
 
+class _GraphLinks(HTMLParser):
+    def __init__(self, html):
+        super().__init__()
+        self.links = {}
+        self.current = set()
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        fields = dict(attrs)
+        if tag == "a" and fields.get("class") == "graph-node":
+            self.links[fields["data-evidence-id"]] = fields["href"]
+            if fields.get("aria-current") == "true":
+                self.current.add(fields["data-evidence-id"])
+
+
 def test_report_links_open_the_anchored_header_note_and_method_pages(tmp_path, monkeypatch):
     pdf = tmp_path / "experiments.pdf"
     _paper(pdf)
@@ -214,13 +233,90 @@ def test_report_links_open_the_anchored_header_note_and_method_pages(tmp_path, m
         html = client.get(f"/runs/{run['run_id']}", params=params)
         assert html.status_code == 200
         assert "同一实验" in html.text and "表注" in html.text and "表头" in html.text
+        assert "<summary>证据关系图</summary>" in html.text
+        graph = _GraphLinks(html.text)
+        assert result["evidence_id"] in graph.current
         for row in linked:
-            assert f"evidence_id={row['evidence_id']}" in html.text
+            eid = row["evidence_id"]
+            href = graph.links[eid]
+            assert f"version_id={run['report_version_id']}" in href and href.endswith("#pdf-preview")
+            view = client.get(href)
+            assert view.status_code == 200 and eid in _GraphLinks(view.text).current
             page = row["locator"]["page_index"]
             preview = client.get(f"/runs/{run['run_id']}/pages/{row['doc_id']}/{page}.png", params={
-                **params, "evidence_id": row["evidence_id"],
+                **params, "evidence_id": eid,
             })
             assert preview.status_code == 200 and preview.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_graph_merges_shared_prefixes_and_keeps_only_recorded_edges():
+    header = {"from_id": "cell", "to_id": "header", "relation": "column_header"}
+    method = {"from_id": "header", "to_id": "method", "relation": "same_experiment"}
+    note = {"from_id": "cell", "to_id": "note", "relation": "table_note"}
+    paths = [
+        {"evidence_ids": ["cell", "header"], "edges": [header]},
+        {"evidence_ids": ["cell", "header", "method"], "edges": [header, method]},
+        {"evidence_ids": ["cell", "note"], "edges": [note]},
+        {"evidence_ids": ["cell", "missing"], "edges": [{"relation": "table_caption"}]},
+        {"evidence_ids": ["cell", "method"], "edges": [method]},
+    ]
+    graph = evidence_path_tree(paths, dict.fromkeys(("cell", "header", "method", "note")))
+    root, = graph["roots"]
+    assert graph["evidence_ids"] == {"cell", "header", "method", "note"}
+    assert root["id"] == "cell" and root["relation"] is None
+    assert list(root["children"]) == [("header", "column_header"), ("note", "table_note")]
+    first = root["children"]["header", "column_header"]
+    assert list(first["children"]) == [("method", "same_experiment")]
+
+@pytest.mark.parametrize("quantity", ["six", "seven"])
+def test_parameter_count_and_explicit_methods_reference_are_sent_together(tmp_path, quantity):
+    text = f"Our {quantity}-parameter computational model uses hierarchical competition and static attention."
+    method = "The free parameters of each model in Table 2 were fitted to the training set."
+    foil = "Parameters in Table 3 were selected on a validation set."
+    pdf_path = tmp_path / "models.pdf"
+    with pymupdf.open() as pdf:
+        page = pdf.new_page()
+        page.insert_text((60, 50), "1. Methods", fontsize=13)
+        page.insert_text((60, 82), "Orion is our computational model with hierarchical competition and static attention.", fontsize=10)
+        page.insert_text((60, 110), method, fontsize=10)
+        page.insert_text((60, 138), foil, fontsize=10)
+        page = pdf.new_page()
+        page.insert_text((60, 80), "Table 2. Model parameters.")
+        _table(page, (("Model", "df"), ("Orion", "6"), ("Other", "7")))
+        page = pdf.new_page()
+        page.insert_text((60, 80), "Table 3. Validation parameters.")
+        _table(page, (("Model", "df"), ("Other", "7")))
+        pdf.save(pdf_path)
+
+    parsed = parse_pdf(pdf_path)
+    by_text = {row["text"]: row for row in parsed.evidence}
+    expected = [by_text[value]["evidence_id"] for value in ("6", "Table 2. Model parameters.", method)]
+    wire_calls = []
+
+    class Model:
+        def call(self, stage, material, schema):
+            assert stage == "judge"
+            wire_calls.append(material)
+            group, = [group for group in material["table_context"] if "reference_evidence_id" in group]
+            assert group["cell_evidence_id"] == expected[0]
+            assert group["reference_evidence_id"] == expected[-1]
+            assert set(expected) <= _actual_material(material).keys()
+            return schema(verdict="pending", reason="Test the supplied packet.", evidence_groups=[],
+                          missing_fields=[], follow_up_queries=[])
+
+    claim, = supplied_claims((("count", text),))
+    index = EvidenceIndex(parsed.evidence)
+    try:
+        finding, _ = review_claim(claim, index, Model(), documents=[parsed.document])
+    finally:
+        index.close()
+
+    assert len(wire_calls) == 1
+    assert set(expected) <= set(finding["sent_candidate_ids"])
+    path, = [row for row in finding["retrieval_paths"] if row["evidence_ids"] == expected]
+    assert [edge["relation"] for edge in path["edges"]] == ["table_caption", "table_reference"]
+    assert [edge["anchors"][0]["text"] for edge in path["edges"]] == ["Table 2. Model parameters.", method]
+    assert [edge["anchors"][0]["locator"]["page_index"] for edge in path["edges"]] == [1, 0]
 
 
 def test_only_the_verified_experiment_method_can_supply_an_unnoted_test_split(tmp_path):

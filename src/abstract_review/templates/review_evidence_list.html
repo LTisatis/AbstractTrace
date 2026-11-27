@@ -1,0 +1,30 @@
+{% from 'review_evidence.html' import evidence_link with context %}
+{% set report_url = request.url_for('view_run', run_id=run_id) %}
+{% set list_url = report_url.include_query_params(version_id=version_id, evidence_list=1, evidence_search=evidence_search, evidence_kind=evidence_kind) %}
+<div data-evidence-list data-endpoint="{{ request.url_for('evidence_list', run_id=run_id) }}">
+  <form class="form-actions group evidence-search" data-evidence-search action="{{ report_url }}#original-evidence" method="get">
+    <input type="hidden" name="version_id" value="{{ version_id }}">
+    <input type="hidden" name="evidence_list" value="1">
+    <label class="field">搜索证据<input type="search" name="evidence_search" value="{{ evidence_search }}" maxlength="200"></label>
+    <label class="field">证据类型
+      <select name="evidence_kind"><option value="">全部</option>
+      {% for kind, label in evidence_kinds.items() %}<option value="{{ kind }}"{% if kind == evidence_kind %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <button class="button button-small" type="submit">搜索</button>
+  </form>
+  <p class="meta group" data-evidence-result tabindex="-1">共 {{ evidence_matches }} 条 · 第 {{ evidence_page }} / {{ evidence_pages }} 页</p>
+  {% if evidence_items %}
+  <div class="evidence-list">
+    {% for evidence in evidence_items %}
+      <div class="evidence-row"><p class="excerpt">{{ evidence.text }}</p>{{ evidence_link(evidence.evidence_id) }}</div>
+    {% endfor %}
+  </div>
+  {% else %}<p class="meta">没有符合条件的原文证据。</p>{% endif %}
+  {% if evidence_pages > 1 %}
+  <nav class="toolbar group" aria-label="证据列表翻页">
+    {% if evidence_page > 1 %}<a class="button button-small" data-evidence-page href="{{ list_url.include_query_params(evidence_page=evidence_page - 1) }}#original-evidence">上一组</a>{% endif %}
+    {% if evidence_page < evidence_pages %}<a class="button button-small" data-evidence-page href="{{ list_url.include_query_params(evidence_page=evidence_page + 1) }}#original-evidence">下一组</a>{% endif %}
+  </nav>
+  {% endif %}
+</div>

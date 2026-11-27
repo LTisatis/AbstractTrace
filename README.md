@@ -39,7 +39,7 @@ $env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', $key).Password
 1. **导入论文。** 选择有可选中文本的 PDF。选「从 PDF 提取」审阅论文原摘要，或选「使用粘贴内容」审阅自己的版本。选择审阅方式后，点「开始审阅」。
 2. **先看概览。** 报告就绪后，点「反驳」或「待确认」的数量查看相关断言。「待确认」汇总待核验、证据不足和证据冲突。
 3. **回查原文。** 在「断言与证据」展开一条断言，点击「判定引用」下方的页码链接，右侧会打开并高亮 PDF 原页。用「上一页」「下一页」或输入页码浏览全文。点「返回证据页」恢复引用位置和高亮。
-4. **处理改句。** 在「修订与复核」比较原句和建议。勾选通过核验的改句，再点「保存所选修订」。使用 OpenAI 模型时，有可引用原文的「待核验」断言还能生成**暂定修订**，并列出仍需核对的内容。打开「手动修改摘要」，对能定位到原句的改句点「一键应用」，检查编辑框后再点「保存并复核」。暂定修订保留原断言的待核验状态。
+4. **处理改句。** 在「修订与复核」比较原句和建议，点「采用到编辑稿」把通过核验的改句填入当前草稿。使用 OpenAI 模型时，有可引用原文的「待核验」断言还能生成**暂定修订**。点「去编辑器应用」，再点「一键应用」填入暂定改句。检查草稿后点「保存并复核」。暂定修订保留原断言的待核验状态。
 5. **查看版本并导出。** 复核完成后，在「版本与导出」查看当前摘要和历史版本，下载当前页面所显示版本的 Markdown 或 JSON 报告。
 
 ### 体验一次自动改句
@@ -98,7 +98,7 @@ uv run abstract-review review export $run.run_id --version-id $run.report_versio
 
 下面的离线样例以同一 PDF 为证据，把初稿里的 `10` 复算并修订为 `8` 个百分点。离线判定适用于可核算的同表比较与能回查的原句。整篇一致性由模型或人工复核。
 
-对能明确拆分的复合断言，报告保留每个分项和整句的判定。每次改稿核验针对该版本重新计算可核实的数字，并在报告中保留复算值和原文证据。结果有歧义时，报告会标记需要确认的数值。
+对能明确拆分的复合断言，审稿器保留各分项的原文位置、共享条件和例外。它分别取证和判定，再按原句的逻辑关系合并结论。每次改稿核验针对该版本重新计算可核实的数字，并在报告中保留复算值和原文证据。结果有歧义时，报告会标记需要确认的数值。
 
 ```powershell
 Set-Content .review-data/alternate.txt 'On dataset A, accuracy increased by 10 percentage points.' -Encoding utf8
@@ -107,11 +107,11 @@ uv run abstract-review review export $run.run_id --format md --output .review-da
 uv run abstract-review serve
 ```
 
-网页从 `http://127.0.0.1:8000` 打开，可提交 PDF、查看原页和高亮、下载报告、选择改句或提交手改版本。Web 审稿和改后核验进入 SQLite 队列，页面会显示排队、运行和完成状态。服务重启后会接手续跑任务和租约已过期的任务。命令行支持 `review submit-selection`。每次提交携带当前版本 ID，旧报告仍可按旧 ID 导出。
+网页从 `http://127.0.0.1:8000` 打开。「最近审阅」可找回本地任务。报告页可切换论文与补充材料、查看证据高亮、下载报告，也可把建议改句填进当前编辑稿，再统一保存并复核。Web 审稿和改后核验进入 SQLite 队列，页面会显示阶段及完成提示。服务重启后会接手续跑任务和租约已过期的任务。命令行支持 `review submit-selection`。每次提交携带当前版本 ID，旧报告仍可按旧 ID 导出。
 
 `--engine openai` 显式使用 `OPENAI_API_KEY` 和 Responses API。`uv run abstract-review doctor --online` 用自拟文本和合成裁图检查结构化响应，并记录模型、耗时和用量。也可以用 `uv run pytest -m live --run-live` 进行显式联调。模型默认 `gpt-6.2-sol`，可用 `--model` 指定。运行暂挂后用 `review resume RUN_ID` 从检查点继续。扩额时使用新 `--request-id` 和 `--add-requests` 或 `--add-seconds`。同一请求 ID 重试沿用原值。
 
-原页没有可读文本时，可用 `--ocr-language eng` 启用本机 Tesseract。需要语言数据时，按安装方式配置 `TESSDATA_PREFIX`。检索默认使用 SQLite FTS5、精确词元和图扩展。补查在证据预算内优先送入完整的相邻正文组，报告保留每行原页锚点。跨页关联仅用于有明确续表标记且表头对齐的表格。
+原页没有可读文本时，可用 `--ocr-language eng` 启用本机 Tesseract。需要语言数据时，按安装方式配置 `TESSDATA_PREFIX`。检索默认使用 SQLite FTS5、精确词元和图扩展。报告保留正文每行的原页锚点。跨页表格只有在有明确续表标记且表头对齐时才会关联。
 
 `uv sync --locked --extra embeddings` 后，可在 `review start` 和 PDF `bench run` 使用 `--embed-model PATH` 启用本地混合召回，或用 `--rerank-model PATH` 对候选段落进行本地 CrossEncoder 重排。模型需预先保存在本机，权重使用 safetensors。批跑记录模型文件哈希，恢复时仅复用与模型内容相符的检查点。
 
@@ -125,7 +125,9 @@ uv run abstract-review bench run --engine offline --input-manifest .review-data/
 uv run abstract-review bench score --predictions .review-data/d11/out/predictions.json --gold-manifest .review-data/d11/gold.json --output .review-data/d11/out/scores.json
 ```
 
-PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `abstract_file`、`paper_family_id`、`split` 和给定 `claims`。给定断言每项含 `claim_id` 与 `text`，省略时由引擎从摘要抽取。金标从独立清单载入评分器。`run.json` 记录输入和配置指纹、用量与耗时。评分区分已完成项的分类成绩和所有金标的交付比例，并按实际送审顺序计算完整证据组的 `Recall@K`。样例为合成的多个论文族，跨学科质量评测需要独立标注的全文留出集。
+PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `pdf_sha256`、`abstract_file`、`paper_family_id`、`split` 和给定 `claims`。给定断言每项含 `claim_id` 与 `text`，省略时由引擎从摘要抽取。批跑开始前会计算每个 PDF 的实际 SHA-256 并验证清单中提供的校验值。即使文件名和论文族不同，内容完全相同的 PDF 也不能跨划分。使用相同输入、配置、数据目录和输出目录加上 `--resume`，可复用已完成项，并沿用原有额度恢复已保存的暂停项。
+
+金标从独立清单载入评分器。`run.json` 记录输入和配置指纹、用量与耗时。通用评分和 SciFact 评分可加上 `--run-record`，传入同一轮生成的 `run.json`。评分器按预测文件内容的 SHA-256 校验两者，`run_diagnostics` 会列出未执行、暂停、已执行未决和已判定等结果。评分区分已完成项的分类成绩和所有金标的交付比例，并按实际送审顺序计算完整证据组的 `Recall@K`。样例为合成的多个论文族，跨学科质量评测需要独立标注的全文留出集。
 
 自主抽取的严格评分按同句区间和规范化命题匹配。独立核对等义命题后，可以向 `bench score` 增加 `--semantic-matches equivalents.json`。原严格结果保留在顶层，`semantic_extraction` 记录补充匹配，`semantic_scoring` 记录相应的判定、覆盖和取证指标。
 
@@ -135,6 +137,10 @@ PDF 输入清单列出 `sample_id`、相对于清单的 `pdf`，以及可选 `ab
 
 SciFact 适配器读取作者发布的 JSONL，将每条断言与它的给定引用摘要配对，并保留原始文档和句子 ID。这组指标的适用范围是给定引用摘要。 [SciFact 数据和评估协议](https://github.com/allenai/scifact#dataset)
 
+在线裁决逐条引用摘要中的句子，系统校验编号后恢复为原始证据 ID。支持和反驳仍需满足证据与研究范围校验。摘要只送审了一部分时，未找到证据的断言保留为待查。
+
+SciFact 在线批跑默认最多预留 8 次请求和 180 秒，可用 `--max-requests` 与 `--max-seconds` 调整。预算内的预测逐样本保存到输出目录。使用相同输入、模型和输出目录并加上 `--resume` 可以续跑，两项限额均按累计用量计算。`run.json` 记录暂停原因和样本用量，`batch.last_paused_sample` 保留最近一次已捕获暂停的详细诊断。
+
 ```powershell
 uv run abstract-review bench prepare-scifact --corpus data/corpus.jsonl --claims data/claims_dev.jsonl --split dev --dataset-version author-release-2020 --output-dir .review-data/scifact
 uv run abstract-review bench run --dataset scifact --engine offline --input-manifest .review-data/scifact/inputs.json --output-dir .review-data/scifact/out
@@ -143,9 +149,9 @@ uv run abstract-review bench score --dataset scifact --predictions .review-data/
 
 CLAIM-BENCH 适配器需要本地标注文件及其对应的 PDF。它把能在单一原页上唯一匹配的正文或表格片段绑定到证据 ID，并单独记录对齐覆盖率。评分衡量原文片段定位。原有的严格 `quoted_passage_recall_at_k` 继续要求前 K 条覆盖全部金标锚点。`diagnostics` 另外报告锚点召回、前 K 条可容纳片段的完整召回，以及完整证据包的召回。 [CLAIM-BENCH 作者数据](https://github.com/shashidharjavaji/CLAIM_BENCH)
 
-审稿器保留八条主候选，并可附上按同页同栏组装的正文。启用本地重排时，全文查询命中同一正文范围，可以再选一个不同范围。补查有明确页码或章节时，优先在该范围内检索段落。每个证据包最多附加 24 行、1,800 个原文字符，原始证据 ID 和页坐标可用于回链。
+审稿器保留八条主候选，并可附上按同页同栏组装的正文。主候选所在的原文范围未被已选上下文覆盖时，系统会补入该范围。启用本地重排时，全文查询命中同一正文范围，可以再选一个不同范围。每个证据包最多附加 24 行、1,800 个原文字符，原始证据 ID 和页坐标可用于回链。
 
-重新解析原生 PDF 时，系统会提取能确认的章节标题，为首轮裁决提供物理页导航。裁决器可以按该页提出补查，再引用实际读到的原文。重复提交已跑过且没有缩小来源范围的全文查询时，系统保留首轮证据和待查状态。
+裁决器可以选择要补查的条件和来源。第一次补查优先检查指定页码、章节或表格，并保留此前已核对的关键引证。仍有必要条件待查时，系统只在另一处指定来源找到了尚未送审的证据后发起第二轮补查。两轮沿用同一断言的预算，补查目标和证据包在暂停后可恢复。遇到同节正文在页尾中断且有续接依据时，系统会在现有证据预算内读取相邻页开头，并保留两页各自的引用锚点。
 
 实证主张的支持裁决分别记录观察结果和实际测试范围，二者须来自同一研究并有送审引证。只有总结性表述时，系统可在原有补查轮次内检索原始结果。模型也可以引用一个实际送审正文段的首尾锚点，系统校验连续范围后展开原文引用。裁决请求中的简短编号在写报告前恢复成原始证据 ID。
 
@@ -155,12 +161,19 @@ uv run abstract-review bench run --engine offline --input-manifest .review-data/
 uv run abstract-review bench score --dataset claimbench --predictions .review-data/claimbench/out/predictions.json --gold-manifest .review-data/claimbench/gold.json --output .review-data/claimbench/out/scores.json
 ```
 
-SciTabAlign 适配器读取作者发布的表格和单元格标注。运行器在给定表格内排列单元格，评分输出固定 K 的精确率、召回率和 F1，并单列空标注和越界坐标的覆盖情况。这个指标适用于本项目的候选排序。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
+SciTabAlign 适配器读取作者发布的表格和单元格标注。离线默认排列最多 8 格。启用 `--engine openai` 后，系统根据断言匹配的行列及比较范围选择 8 格或 16 格的上限。模型读取完整表格和表题，返回经过坐标校验的原始单元格。可用 `--table-cell-limit 8` 或 `--table-cell-limit 16` 复跑固定上限，`run.json` 记录所用策略。两种模式报告前 1、3、5、8、16 格的选证指标和完整组命中，并单列空标注和越界金标。 [SciTabAlign 作者数据](https://github.com/Alab-NII/SciTabAlign)
 
 ```powershell
 uv run abstract-review bench prepare-scitabalign --annotations data/data.json --dataset-version author-release --output-dir .review-data/scitabalign
 uv run abstract-review bench run --dataset scitabalign --input-manifest .review-data/scitabalign/inputs.json --output-dir .review-data/scitabalign/out
 uv run abstract-review bench score --dataset scitabalign --predictions .review-data/scitabalign/out/predictions.json --gold-manifest .review-data/scitabalign/gold.json --output .review-data/scitabalign/out/scores.json
+```
+
+在线模式按批次累计请求和时间，并在 `run.json` 中记录进度和用量。用同一输入、模型及输出目录加上 `--resume` 可继续已有批次。与离线结果做配对比较时，两组使用同一输入清单和金标，分别写入输出目录。
+
+```powershell
+uv run abstract-review bench run --dataset scitabalign --engine openai --input-manifest .review-data/scitabalign/inputs.json --output-dir .review-data/scitabalign/online --max-requests 8 --max-seconds 180
+uv run abstract-review bench score --dataset scitabalign --predictions .review-data/scitabalign/online/predictions.json --gold-manifest .review-data/scitabalign/gold.json --output .review-data/scitabalign/online/scores.json
 ```
 
 PDF 批跑的 `run.json` 保留每篇的版本、修订、复算和调用用量。恢复批跑时复用同配置下已保存的记录。人工复核后，可以把标注单独交给评分器。

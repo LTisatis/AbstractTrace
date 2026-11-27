@@ -2,7 +2,7 @@ import hashlib
 
 import pytest
 
-from abstract_review.audit import extract_claims, refresh_compound_findings, supplied_claims
+from abstract_review.audit import extract_claims, refresh_compound_findings, sentences, supplied_claims
 from abstract_review.compound import aggregate_compound_findings, shared_procedure_parts
 
 
@@ -117,6 +117,87 @@ def test_shared_procedure_refuses_ambiguous_or_dependent_conjuncts(sentence):
     assert claim["quote"] == sentence and "compound" not in claim
 
 
+def test_reported_role_and_ablation_use_independent_source_ranges():
+    sentence = "We ﬁnd that calibration serves as a safeguard and removing it causes unstable predictions."
+    source = f"We studied the model. {sentence}"
+    _, *claims = extract_claims(source)
+    assert [claim["quote"] for claim in claims] == [
+        "calibration serves as a safeguard", "removing it causes unstable predictions.",
+    ]
+    assert [claim["proposition"] for claim in claims] == [
+        "We ﬁnd that calibration serves as a safeguard", "We ﬁnd that removing calibration causes unstable predictions.",
+    ]
+    assert all(source[claim["start"]:claim["end"]] == claim["quote"] for claim in claims)
+    assert all(claim["compound"]["text"] == sentence for claim in claims)
+
+
+def test_reported_absolute_metrics_and_comparative_gains_keep_their_units():
+    source = (
+        "We evaluate classifiers on medical transcripts, and the compact and full models achieve an average "
+        "of 82.5% and 91.4% precision respectively, a 7.2% and 2.5% improvement over the prior system."
+    )
+    absolute, relative = extract_claims(source)
+    assert absolute["quote"] == "the compact and full models achieve an average of 82.5% and 91.4% precision respectively"
+    assert relative["quote"] == "a 7.2% and 2.5% improvement over the prior system"
+    assert all(claim["kind"] == "quantitative" and "medical transcripts" in claim["proposition"]
+               for claim in [absolute, relative])
+    assert "7.2% and 2.5% improvement in precision over the prior system" in relative["proposition"]
+    assert all(source[claim["start"]:claim["end"]] == claim["quote"] for claim in [absolute, relative])
+
+
+@pytest.mark.parametrize("marker", ["1 1", "12\t12", "¹²"])
+def test_terminal_layout_footnote_preserves_source_offsets_and_other_claim_ids(marker):
+    first = "The system reduced loss by 4.2%."
+    sentence = "We show that tuning improves precision, and pruning reduces latency."
+    last = "The baseline also completed."
+    source = f"{first} {sentence}{marker}\n{last}"
+    assert sentences(source)[1]["text"] == sentence + marker
+    before, *atoms, after = extract_claims(source)
+    assert [claim["quote"] for claim in atoms] == ["tuning improves precision", "pruning reduces latency."]
+    assert all(claim["compound"]["text"] == sentence for claim in atoms)
+    assert before["claim_id"] == extract_claims(first)[0]["claim_id"]
+    assert after["sentence_id"] == "s3"
+    after_start = source.index(last)
+    assert after["claim_id"] == hashlib.sha256(f"{after_start}:{last}:{last}".encode()).hexdigest()[:20]
+    assert "4.2%" in before["proposition"]
+    assert all(source[claim["start"]:claim["end"]] == claim["quote"] for claim in [before, *atoms, after])
+
+
+@pytest.mark.parametrize("source", [
+    "The measured rate was 2.1 1", "We used variant v.1 1", "We observed a result.1 2",
+    "The model is available.1", "The upper bound was 4.2%.", "See Fig.12 12",
+])
+def test_ambiguous_numeric_suffixes_are_kept(source):
+    claim, = extract_claims(source)
+    assert claim["quote"] == source
+
+
+def test_shared_negated_capability_retains_its_exception_for_both_operands():
+    source = "In both settings, the finite-state controller cannot recognize mirrored tokens, nor balanced markers, unless memory grows with sequence length."
+    claims = extract_claims(source)
+    assert [atom["quote"] for atom in claims] == [
+        "In both settings, the finite-state controller cannot recognize mirrored tokens", "nor balanced markers",
+    ]
+    assert [atom["proposition"] for atom in claims] == [
+        f"In both settings, the finite-state controller cannot recognize {subject}, unless memory grows with sequence length"
+        for subject in ["mirrored tokens", "balanced markers"]
+    ]
+    assert all(not atom.get("logic_review_required") and atom["compound"]["operator"] == "and" for atom in claims)
+    assert all("scope in which the exception does not hold (memory grows with sequence length)" in atom["requirements"]
+               for atom in claims)
+
+
+@pytest.mark.parametrize("source", [
+    "We find that calibration acts as an alternative to averaging and removing it causes instability.",
+    "We show that the fast model improves accuracy, and the large model improves recall, when deployed on edge devices.",
+    "The team investigates whether the system cannot recognize mirrored tokens, nor balanced markers, unless memory grows.",
+    "It is not true that the system cannot recognize mirrored tokens, nor balanced markers, unless memory grows.",
+])
+def test_reported_compounds_keep_ambiguous_scope_and_antecedents_together(source):
+    atom, = extract_claims(source)
+    assert atom["quote"] == source and "compound" not in atom
+
+
 def test_conjunction_uses_only_refuting_operands_for_its_decisive_evidence():
     claims = extract_claims(CONJUNCTION)
     findings = _verdicts(claims, [
@@ -162,6 +243,28 @@ class ExtractionModel:
              "requirements": ["observed result"], "support_query": quote, "counter_query": quote}
             for sid, quote in self.quotes
         ], "compounds": self.groups})
+
+
+def test_model_whole_sentence_falls_back_to_grounded_reporting_split():
+    source = "We also show—both through analysis and testing—that training improves calibration, and tuning further reduces error."
+    assert [claim["quote"] for claim in extract_claims(source, ExtractionModel([("s1", source)], []))] == [
+        "training improves calibration", "tuning further reduces error.",
+    ]
+
+
+def test_model_extracts_from_clean_sentence_without_rewriting_the_source():
+    sentence = "The hardware is available."
+    source = f"  {sentence}4 4"
+
+    class FootnoteModel(ExtractionModel):
+        def call(self, role, material, schema):
+            assert material["sentences"] == [
+                {"sentence_id": "s1", "text": sentence, "start": 2, "end": 2 + len(sentence)}
+            ]
+            return super().call(role, material, schema)
+
+    claim, = extract_claims(source, FootnoteModel([("s1", "hardware")], []))
+    assert source[claim["start"]:claim["end"]] == "hardware"
 
 
 def test_structured_compound_maps_model_indices_to_source_order_and_anchored_ids():
