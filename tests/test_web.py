@@ -5,6 +5,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
 import pymupdf
 import pytest
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 from abstract_review.ingest import parse_pdf
 from abstract_review.models import ModelUnavailable
 from abstract_review.review import PdfReviewInput, ReviewService
+from abstract_review.revisions import provisional_editor_options
 from abstract_review.run_store import RunStore
 from abstract_review.web import create_app
 
@@ -53,6 +55,73 @@ def wait_for_run(client, run_id, status="report_ready"):
     pytest.fail(f"review {run_id} did not become {status}")
 
 
+def test_provisional_wording_keeps_the_pending_verdict(tmp_path, client, monkeypatch):
+    upload = client.post("/api/v1/reviews", files={"pdf": ("paper.pdf", _pdf_bytes(), "application/pdf")})
+    run_id = upload.json()["run_id"]
+    version = wait_for_run(client, run_id)["report_version_id"]
+    store = RunStore(tmp_path / "state.sqlite3")
+    report = store.read(run_id)
+    evidence_id = next(item["evidence_id"] for item in report["evidence"] if item["text"].startswith("Evidence paragraph"))
+    report["configuration"]["engine"] = "openai"
+    report["findings"] = [{"claim_id": "pending-claim", "text": report["original_abstract"]["text"], "sentence_id": "s1",
+                           "verdict": None, "review_status": "pending", "evidence_ids": [evidence_id],
+                           "reason": "The results excerpt does not cover all sites."}]
+    store.save(report)
+
+    calls = []
+
+    def responses(self, report, *, time_limit):
+        assert time_limit == 65
+
+        def call(stage, material, schema):
+            assert stage == "provisional_revision"
+            assert [row["evidence_id"] for row in material["evidence"]] == ["E1"]
+            calls.append(stage)
+            return schema(replacement="The study reports the error rate.", reason="The source reports the measure.",
+                          remaining_checks=["Verify the direction of change for each site."], evidence_ids=["E1"])
+
+        return SimpleNamespace(call=call, events=[{"stage": "provisional_revision"}], elapsed_seconds=1)
+
+    monkeypatch.setattr(ReviewService, "_responses", responses)
+    report_url = f"/runs/{run_id}"
+    endpoint = report_url + "/provisional-revision"
+    headers = {"X-AbstractTrace-Fragment": "provisional"}
+    payload = {"version_id": version, "claim_id": "pending-claim"}
+    assert 'data-provisional-form' in client.get(report_url).text
+    assert client.post(endpoint, data={**payload, "version_id": "stale"}, headers=headers).status_code == 409
+    result = client.post(endpoint, data=payload, headers=headers)
+    assert result.status_code == 200 and "The study reports the error rate." in result.text
+    assert "Verify the direction of change for each site." in result.text
+    assert evidence_id in result.text and "暂定修订 · 待核验" in result.text
+    assert 'data-provisional-apply' in result.text
+    assert 'data-replacement="The study reports the error rate."' in client.get(report_url).text
+    assert client.post(endpoint, data=payload, headers=headers).status_code == 200
+    assert calls == ["provisional_revision"]
+    redirect = client.post(endpoint, data=payload, follow_redirects=False)
+    assert redirect.status_code == 303
+    assert 'id="finding-pending-claim" data-verdict="pending" open' in client.get(redirect.headers["location"]).text
+    stored = store.read(run_id)
+    assert stored["report_version_id"] == version
+    assert stored["reviewed_abstract"] == report["reviewed_abstract"]
+    assert stored["findings"] == report["findings"] and stored["revisions"] == report["revisions"]
+
+
+def test_provisional_application_preserves_other_clauses():
+    sentence = "Error fell at every site, and all sites completed follow-up."
+    claim = "Error fell at every site"
+    proposal = {"replacement": "Error fell at some sites.", "inline_replacement": "Error fell at some sites"}
+    report = {"report_version_id": "v1", "original_abstract": {"text": sentence},
+              "provisional_revisions": {"v1": {"claim": proposal}},
+              "findings": [{"claim_id": "claim", "sentence_id": "s1", "text": claim, "verdict": "pending",
+                            "start": 0, "end": len(claim)}]}
+    [option] = provisional_editor_options(report)
+    assert option["source"] == sentence
+    assert option["replacement"] == "Error fell at some sites, and all sites completed follow-up."
+    proposal.pop("inline_replacement")
+    [legacy] = provisional_editor_options(report)
+    assert legacy["replacement"] is None
+
+
 def test_pdf_upload_report_export_and_version_bound_image(tmp_path, client):
     pdf = _pdf_bytes()
     home = client.get("/")
@@ -80,6 +149,30 @@ def test_pdf_upload_report_export_and_version_bound_image(tmp_path, client):
     browser = client.get(browser_url, params={"evidence_id": evidence_id, "version_id": version_id})
     assert browser.status_code == 200, browser.text
     assert "下载 Markdown" in browser.text and "已高亮所选证据" in browser.text
+    fragment = client.get(f"{browser_url}/preview", params={"evidence_id": evidence_id, "version_id": version_id})
+    assert fragment.status_code == 200
+    assert f'data-selected-evidence="{evidence_id}"' in fragment.text
+    assert "data-focus-y=" in fragment.text and "已高亮所选证据" in fragment.text
+    assert "<main" not in fragment.text
+    assert 'data-pdf-nav="next"' in fragment.text
+    assert 'data-pdf-nav="previous"' not in fragment.text
+
+    second_page = {"doc_id": doc_id, "page": 2, "version_id": version_id, "evidence_id": evidence_id}
+    for path in (browser_url, f"{browser_url}/preview"):
+        browsed = client.get(path, params=second_page)
+        assert browsed.status_code == 200
+        assert 'data-page-number="2"' in browsed.text
+        assert 'data-pdf-nav="previous"' in browsed.text
+        assert 'data-pdf-nav="next"' not in browsed.text
+        assert 'data-pdf-nav="evidence"' in browsed.text
+        assert f'/pages/{doc_id}/1.png?version_id={version_id}"' in browsed.text
+        assert "已高亮所选证据" not in browsed.text
+        assert client.get(path, params={**second_page, "page": 3}).status_code == 404
+        assert client.get(path, params={**second_page, "doc_id": "not-in-version"}).status_code == 404
+
+    returned = client.get(f"{browser_url}/preview", params={**second_page, "page": 1})
+    assert 'data-page-number="1"' in returned.text
+    assert "已高亮所选证据" in returned.text
     markdown = client.get(f"{api}/export", params={"version_id": version_id, "format": "md"})
     assert markdown.status_code == 200
     assert markdown.headers["content-type"].startswith("text/markdown")
@@ -291,9 +384,19 @@ def test_external_evidence_preview_is_limited_to_its_report_version(tmp_path, cl
     evidence_id = evidence["evidence_id"]
     with service.store.acquire(run_id) as token:
         current = service.store.read(run_id)
+        citation = current["evidence"][0]["evidence_id"]
         current["external_checks"] = [{
+            "kind": "explicit_citation", "reference": {"provider": "doi", "identifier": "10.1234/example"},
+            "citation_status": "exists", "access_status": "accessible",
             "attribution": {"text": "The publication measured samples."}, "support_status": "supported",
-            "reason": "The source reports its sample count.", "document": external_doc, "evidence": [evidence],
+            "reason": "The source reports its sample count.", "document": external_doc,
+            "citation_evidence_ids": [citation], "evidence_ids": [evidence_id],
+            "evidence": [evidence, {**evidence, "evidence_id": "uncited", "text": "Unadopted candidate"}],
+        }, {
+            "kind": "novelty_search", "support_status": "not_checked", "attribution": {"text": "First method"},
+            "reason": "Metadata is not a priority decision.", "query": "Novelty check search query",
+            "candidates": [{"id": "https://openalex.org/W123", "display_name": "Candidate prior work",
+                            "publication_date": "2026-01-01"}],
         }]
         service.store.save(current, token)
 
@@ -308,5 +411,48 @@ def test_external_evidence_preview_is_limited_to_its_report_version(tmp_path, cl
     browser = client.get(f"/runs/{run_id}", params={"version_id": latest, "evidence_id": evidence_id})
     assert browser.status_code == 200
     assert "The publication measured samples." in browser.text
+    assert "主论文中的引用位置" in browser.text
+    assert "裁决采用的外部证据" in browser.text
+    assert "其他候选段落（1）" in browser.text
+    assert "Unadopted candidate" in browser.text
+    assert "Novelty check search query" in browser.text
+    assert "Candidate prior work" in browser.text
+    assert "https://openalex.org/W123" in browser.text
     assert "已高亮所选证据" in browser.text
+    assert client.get(f"/runs/{run_id}/preview", params={"version_id": older, "evidence_id": evidence_id}).status_code == 404
     assert evidence_id not in {item["evidence_id"] for item in service.export(run_id, latest)["evidence"]}
+
+
+def test_original_evidence_is_paginated_and_searchable(tmp_path, client):
+    response = client.post("/api/v1/reviews", files={"pdf": ("paper.pdf", _pdf_bytes(), "application/pdf")})
+    run_id = response.json()["run_id"]
+    version = wait_for_run(client, run_id)["report_version_id"]
+    service = ReviewService(tmp_path / "state.sqlite3")
+    with service.store.acquire(run_id) as token:
+        report = service.store.read(run_id)
+        template = report["evidence"][0]
+        for number in range(65):
+            report["evidence"].append({**template, "kind": "table_note", "evidence_id": f"fixture-{number}",
+                                       "text": f"Pagination fixture row {number:02d}."})
+        service.store.save(report, token)
+    report_url = f"/runs/{run_id}"
+    initial = client.get(report_url)
+    assert initial.text.count('class="evidence-row"') == 30
+    assert "Pagination fixture row 64." not in initial.text
+    fragment = client.get(f"{report_url}/evidence-list", params={
+        "version_id": version, "evidence_search": "Row 64", "evidence_kind": "table",
+    })
+    assert fragment.status_code == 200 and fragment.text.count('class="evidence-row"') == 1
+    assert "Pagination fixture row 64." in fragment.text
+    assert client.get(f"{report_url}/evidence-list", params={"version_id": "missing"}).status_code == 404
+
+
+def test_recent_runs_includes_ready_and_failed_intake(client):
+    assert "还没有本地审阅记录" in client.get("/runs").text
+    valid = client.post("/api/v1/reviews", files={"pdf": ("paper.pdf", _pdf_bytes(), "application/pdf")})
+    failed = client.post("/api/v1/reviews", files={"pdf": ("invalid.pdf", b"invalid", "application/pdf")})
+    wait_for_run(client, valid.json()["run_id"])
+    wait_for_run(client, failed.json()["run_id"], "failed")
+    history = client.get("/runs").text
+    assert "paper.pdf" in history and "下载 Markdown" in history
+    assert "invalid.pdf" in history and "未完成" in history

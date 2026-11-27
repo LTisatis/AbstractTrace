@@ -54,6 +54,14 @@ _CONTEXT_MAX_CHARS = 1800
 _CONTEXT_SHORTLIST = 12
 _TABLE_REGION_CELLS = 12
 _TABLE_REGION_CHARS = 800
+_PARAMETER_COUNT_QUERY = re.compile(
+    r"\b(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    r"[\s-]+(?:free[\s-]+)?parameters?\b|\b(?:number|count) of (?:free )?parameters\b"
+)
+_PARAMETER_COUNT_HEADER = re.compile(
+    r"(?:df|degrees of freedom|(?:(?:number|count) of )?(?:free )?parameters?)"
+)
+_PARAMETER_LABEL = re.compile(r"\bparameters?\b")
 _RESULT_LANGUAGE = re.compile(
     r"\b(?:as shown in|results? (?:indicate|show|suggest)|outperform\w*|perform\w* comparably|"
     r"(?:increase|improve|decrease|reduce)\w* by|measured|observed)\b", re.I,
@@ -882,6 +890,22 @@ class EvidenceIndex:
             results.setdefault(window.expanded_ids, window)
         return list(results.values())
 
+    def anchored_body_context(
+        self, candidate_ids: Iterable[str], windows: Iterable[_ContextWindow],
+    ) -> _ContextWindow | None:
+        """Complete a body range around a primary hit omitted by the ranked windows."""
+        covered = {eid for window in windows for eid in window.expanded_ids}
+        primary = dict.fromkeys(candidate_ids)
+        for eid in primary:
+            if eid in covered or self._records[eid].get("kind") != "body_text":
+                continue
+            matches = [window for window in self._index_context_windows().values()
+                       if eid in window.evidence_ids and set(window.expanded_ids) - primary.keys()]
+            if matches:
+                return max(matches, key=lambda window: (sum(item in primary for item in window.evidence_ids),
+                                                        len(window.expanded_ids)))
+        return None
+
     @staticmethod
     def _page_heading_keys(page: dict) -> set[str]:
         headings = page.get("source_headings")
@@ -1395,6 +1419,91 @@ class EvidenceIndex:
                 by_seed[seed_id] = list(ids)
                 all_ids.update(ids)
         return {"evidence": self.get(all_ids), "paths": paths, "by_seed": by_seed}
+
+    def _table_method_path(self, cell_id: str, query_terms: set[str]) -> tuple[_Edge, _Edge] | None:
+        walks = []
+        for caption in self._graph.get(cell_id, ()):
+            if caption.relation != "table_caption":
+                continue
+            for reference in self._graph[caption.target_id]:
+                method = self._records[reference.target_id]
+                text = _normalize(method["text"])
+                if (reference.relation == "table_reference" and reference.anchors[0] == reference.target_id
+                        and self._methods(method) and not _TABLE_CAPTION.match(text)
+                        and len(terms := (_terms(text) - _PACKET_QUERY_NOISE)) >= 3):
+                    walks.append((caption, reference, len(query_terms & terms)))
+        if walks:
+            caption, reference, _ = min(walks, key=lambda item: (
+                -item[2], self._edge_order(item[0]), self._edge_order(item[1]),
+            ))
+            return caption, reference
+        return None
+
+    def _parameter_count_cell(self, query: str, source_ids: list[str], query_terms: set[str]) -> str | None:
+        """Select by a named model and count column, independently of the asserted value."""
+        sources = defaultdict(list)
+        for rank, eid in enumerate(self.prioritize_packet(query, source_ids)[:12], 1):
+            record = self._records[eid]
+            if self._methods(record) or record.get("kind") == "figure":
+                sources[_document_key(record)].append((rank, _normalize(record["text"])))
+        documents = {_document_key(self._records[eid]) for eid in source_ids}
+        matches = defaultdict(list)
+        for table, cells in self._table_indexes.items():
+            if table[0] not in documents:
+                continue
+            for eid in cells:
+                cell = self._records[eid]
+                header = " ".join(_normalize(_text_field(cell, "column_header")).split())
+                row = " ".join(_normalize(_text_field(cell, "row_header")).split())
+                if (not row or not _data_cell(cell) or not _PARAMETER_COUNT_HEADER.fullmatch(header)
+                        or not _normalize(cell["text"]).strip().isdecimal()):
+                    continue
+                mention = re.compile(rf"(?<!\w){re.escape(row)}(?!\w)")
+                rank = 0 if mention.search(query) else next(
+                    (number for number, text in sources[table[0]] if mention.search(text)), None,
+                )
+                if rank is None or not (path := self._table_method_path(eid, query_terms)):
+                    continue
+                if (_PARAMETER_LABEL.search(header)
+                        or _PARAMETER_LABEL.search(_normalize(self._records[path[0].target_id]["text"]))):
+                    matches[rank].append(eid)
+        if matches and len(best := matches[min(matches)]) == 1:
+            return best[0]
+        return None
+
+    def linked_table_method(
+        self, query: str, source_ids: Iterable[str], *, retained_cell_id: str | None = None,
+    ) -> dict | None:
+        """Keep a selected table cell and an explicit methods reference in one bounded packet."""
+        scoped = list(dict.fromkeys(source_ids))
+        normalized = _normalize(query)
+        terms = _terms(normalized) - _PACKET_QUERY_NOISE
+        cells = [eid for eid in scoped if _data_cell(self._records[eid])]
+        if retained_cell_id in self._records and _data_cell(self._records[retained_cell_id]):
+            cells.insert(0, retained_cell_id)
+        elif _PARAMETER_COUNT_QUERY.search(normalized) and (count_cell := self._parameter_count_cell(normalized, scoped, terms)):
+            cells.insert(0, count_cell)
+        selected = next(((eid, path) for eid in dict.fromkeys(cells)
+                         if (path := self._table_method_path(eid, terms))), None)
+        if selected is None:
+            return None
+        cell_id, edges = selected
+        caption_id, method_id = (edge.target_id for edge in edges)
+        method_ids = [method_id]
+        while len(method_ids) < 4 and (following := self._adjacent_line(method_ids[-1], 1)):
+            if not self._wrap_to_next(method_ids[-1], following):
+                break
+            method_ids.append(following)
+        nodes = (cell_id, caption_id, method_id)
+        context = self.table_context([cell_id], max_per_cell=4)
+        known = set(scoped)
+        fresh = dict.fromkeys(eid for eid in (cell_id, caption_id, *method_ids,
+                              *(row["evidence_id"] for row in context["evidence"])) if eid not in known)
+        return {
+            "cell_evidence_id": cell_id, "reference_evidence_id": method_id, "evidence": self.get(fresh),
+            "method_ids": method_ids,
+            "paths": [{"evidence_ids": list(nodes), "edges": self._serialize_path(nodes, edges)}, *context["paths"]],
+        }
 
     def referenced_table_region(self, query: str, source_ids: Iterable[str], known_ids: Iterable[str]) -> dict | None:
         """Retrieve a bounded region of one verified same-page table referenced in the source text."""

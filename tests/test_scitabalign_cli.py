@@ -62,6 +62,8 @@ def test_scitabalign_cli_online_budget_saves_and_recovers_actual_rows(tmp_path, 
     assert first["candidate_ids"] == ["scitabalign:1:cell:0:1", "scitabalign:1:cell:1:1"]
     assert partial["prediction_count"] == partial["batch"]["requests_used"] == len(calls) == 1
     assert partial["batch"]["stop_reason"] == "request_budget_exhausted"
+    assert main([*limited, "--table-cell-limit", "16", "--resume"]) == 1
+    assert "configuration changed" in capsys.readouterr().err and len(calls) == 1
 
     assert main(limited) == 1
     assert "use --resume" in capsys.readouterr().err

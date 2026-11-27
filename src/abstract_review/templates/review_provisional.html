@@ -1,0 +1,25 @@
+{% from 'review_evidence.html' import evidence_links with context %}
+{% if proposal or allow_provisional %}
+<div class="provisional group" id="provisional-{{ finding_id }}">
+  {% if proposal %}
+  <h3 class="field-caption" tabindex="-1">暂定修订 · 待核验</h3>
+  {% if proposal.replacement %}<p class="excerpt provisional-text">{{ proposal.replacement }}</p>{% endif %}
+  <p class="meta">{{ proposal.reason }}</p>
+  {{ evidence_links(proposal.evidence_ids) }}
+  <p class="field-caption">仍需核对</p>
+  <ul class="compact">{% for check in proposal.remaining_checks %}<li>{{ check }}</li>{% endfor %}</ul>
+  {% if can_select and proposal.replacement %}<a class="button button-small" href="#abstract-editor" data-open-editor>去编辑器应用</a>{% endif %}
+  {% elif has_evidence %}
+  <form method="post" action="{{ request.url_for('provisional_revision', run_id=run_id) }}" data-provisional-form>
+    <input type="hidden" name="version_id" value="{{ version_id }}">
+    <input type="hidden" name="claim_id" value="{{ finding_id }}">
+    <button class="button button-small" type="submit">生成暂定修订</button>
+    <p class="meta">根据已有原文生成一版供参考的措辞，并标出仍需核对的内容。</p>
+    <p class="meta provisional-status" role="status" hidden></p>
+  </form>
+  {% else %}
+  <p class="meta">找到可引用的原文后，可以生成暂定修订。</p>
+  {% endif %}
+</div>
+{% endif %}
+{% if refresh_provisional_options %}{% include 'review_provisional_options.html' %}{% endif %}

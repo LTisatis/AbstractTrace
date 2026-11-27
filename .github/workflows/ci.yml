@@ -24,4 +24,6 @@ jobs:
           python-version: "3.12"
       - run: uv sync --locked
       - run: uv run abstract-review doctor
-      - run: uv run pytest -m "not live"
+      - run: uv run pytest -m "not live and not browser"
+      - run: uv run --with playwright==1.65.2 python -m playwright install chromium
+      - run: uv run --with playwright==1.65.2 pytest -m browser

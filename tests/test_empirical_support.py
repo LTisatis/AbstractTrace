@@ -60,7 +60,8 @@ def test_author_summary_triggers_one_grounded_check_for_primary_results():
     with closing(EvidenceIndex(records)) as index:
         finding, _ = review_claim(claim, index, model, documents=documents, save_targets=targets.extend)
     assert len(model.materials) == 2
-    target, = targets
+    plan, = targets
+    target, = plan["targets"]
     assert target["doc_id"] == "paper" and target["page_index"] == 1
     assert "Error Breakdown" in target["query"] and target["source_kind"] == "results"
     assert model.materials[0]["empirical_support_required"] is True

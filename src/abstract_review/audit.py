@@ -20,7 +20,7 @@ from .compound import (
     adjudicable_shared_exception, aggregate_compound_findings, attach_compound, offline_compound_parts,
     reported_compound_parts, requires_whole_sentence, shared_procedure_parts,
 )
-from .evidence import EvidenceIndex, _document_key, _terms, with_method_scope
+from .evidence import EvidenceIndex, _document_key, _inspection_section, _printed_table_label, _terms, with_method_scope
 from .models import EvidenceGroup, Extraction, InvalidJudgeReference, Judgement, ModelPaused, ModelUnavailable, Schema
 from .source_queries import focused_source_context
 
@@ -81,20 +81,28 @@ class ScopedJudgement(Judgement):
     evidence_ranges: list[CitationRange] = Field(default_factory=list)
 
 
+class CitedAbstractJudgement(ScopedJudgement):
+    """A cited abstract exposes individual sentences, not PDF citation ranges."""
+
+    evidence_ranges: None = None
+
+
 _SCOPE_KEYS = ("section", "table_label", "page_index", "doc_id")
 _SOURCE_SECTIONS = {"methods": "Methods", "results": "Results"}
 _CITED_ABSTRACT_MAX_SENTENCES = 16
 _CITED_ABSTRACT_MAX_CHARS = 5500
+_MAX_ORIGINAL_FOLLOWUPS = 2
 _CITED_ABSTRACT_INSTRUCTIONS = (
-    "Judge whether this cited abstract supports or directly contradicts the claim as written. The cited abstract is "
-    "the entire task scope. Do not request the paper, external sources or follow-up queries. Use the exact supplied "
-    "requirement names in coverage and missing_fields. For support or refutation, cite the original sentences and "
-    "mark the decided requirements found. For refutation, provide direct_contradiction with the same outcome and "
-    "scope, and cite its anchors in one refute group. An association, a population burden estimate and a measure "
-    "of individual prediction establish different things. Match the outcome and relationship asserted. Treat "
-    "contradiction as requiring positive evidence of incompatibility. If evidence_boundary.complete is true and "
-    "the abstract does not settle the claim, return insufficient, mark each unresolved requirement searched_missing, "
-    "and explain what the abstract does not provide. For partial coverage that cannot settle the claim, return pending."
+    "Decide from the cited abstract alone. Combine sentences from the same study and recognize paraphrases that "
+    "preserve the population, outcome, direction, and strength of the claim. Supported requires evidence for the "
+    "claim as stated, including a reported absence when the claim reports that same absence. Refuted requires an "
+    "incompatible finding or in-scope counterexample. A different outcome or population, missing data, and a "
+    "non-significant estimate without demonstrated equivalence do not by themselves establish contradiction. "
+    "For support or refutation, mark the exact supplied requirements found and cite their sentence IDs together "
+    "in one group. For refutation, provide direct_contradiction with its same-scope anchors in the refute group. "
+    "If the complete abstract does not settle the claim, return insufficient and mark unresolved requirements "
+    "searched_missing. If the supplied abstract is incomplete and the evidence does not settle it, return pending. "
+    "Leave follow-up fields empty. For consecutive sentences, list each ID explicitly. Set evidence_ranges to null."
 )
 _EMPIRICAL_RESULT = re.compile(
     r"\b(?:evaluation results?|experimental results?|experiment(?:s)? show|measured (?:effect|performance)|"
@@ -345,6 +353,13 @@ def _field_key(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
+def _target_location(target: dict, documents: Sequence[dict]) -> tuple:
+    doc_id = target.get("doc_id") or (documents[0]["doc_id"] if len(documents) == 1 else None)
+    table = target.get("table_label", "")
+    return (doc_id, target.get("page_index"), _inspection_section(target.get("section", "")),
+            _printed_table_label(table) or _field_key(table))
+
+
 def _pending_targets(output, requirements: list[str], documents, *, initial_queries: Iterable[str] = ()) -> list[dict]:
     proposals = [target.model_dump() for target in getattr(output, "follow_up_targets", [])]
     typed = normalize_targets(proposals, documents, initial_queries=initial_queries)
@@ -363,6 +378,23 @@ def _pending_targets(output, requirements: list[str], documents, *, initial_quer
         for target in targets:
             target.setdefault("requirement", requirement)
     return targets
+
+
+def _additional_inspection(index, targets, previous, coverage, requirements, documents, sent, limit):
+    unresolved = {_field_key(field["requirement"]) for field in coverage if field["status"] != "found"}
+    unresolved.intersection_update(_field_key(field) for field in requirements)
+    visited = {_target_location(target, documents) for target in previous}
+    targets = [target for target in targets
+               if target.keys() & {"page_index", "section", "table_label"}
+               and _field_key(target.get("requirement", "")) in unresolved
+               and _target_location(target, documents) not in visited]
+    if not targets:
+        return [], None
+    results = targeted_evidence(index, targets, documents=documents, limit=limit, prior_ids=sorted(sent))
+    fresh = {row["evidence_id"] for row in results["evidence"]} - set(sent)
+    if any(fresh.intersection(scope["examined_evidence_ids"]) for scope in results["scopes"] if scope["mode"] == "direct"):
+        return targets, results
+    return [], None
 
 
 def _coverage(requirements: list[str], output, scopes: list[dict], sent: list[str], offline_ids=()) -> list[dict]:
@@ -960,7 +992,8 @@ def _judge_attempt(model, material: dict, sent: list[str], scoped: dict[str, dic
                "proposed_verdict": None, "status": "model_unavailable"}
     attempts.append(attempt)
     try:
-        output = model.call("judge", material, ScopedJudgement)
+        schema = CitedAbstractJudgement if "evidence_boundary" in material else ScopedJudgement
+        output = model.call("judge", material, schema)
     except InvalidJudgeReference:
         attempt["status"] = "model_reference_error"
         raise
@@ -1120,6 +1153,7 @@ def review_claim(
     sent_passages = []
     sent_table_context = []
     sent_table_region = None
+    sent_linked_paths = []
     sent_priority = []
     inspected_body_windows = []
     continuation_windows = []
@@ -1146,12 +1180,17 @@ def review_claim(
             examined_scopes.append({**result["scope"], "mode": "ranked"})
             remember(result)
 
-    def inspect(targets: Sequence[dict], previous: list[str], known: set[str], *, context_ids=(), retain=()) -> bool:
-        results = targeted_evidence(index, targets, documents=documents, prior_ids=sorted(known - set(context_ids)))
+    def inspect(plan: dict, *, second: bool, results: dict | None = None) -> bool:
+        previous, known = plan["primary_ids"], set(plan["sent_ids"])
+        if results is None:
+            limit = primary_limit - len(plan["retained_ids"]) if second else primary_limit
+            prior = known if second else known - set(plan["context_ids"])
+            results = targeted_evidence(index, plan["targets"], documents=documents, limit=limit,
+                                        prior_ids=sorted(prior))
         examined_scopes.extend(results["scopes"])
         remember(results)
         selected = [item["evidence_id"] for item in results["evidence"]]
-        retained_rows = index.get(retain)
+        retained_rows = index.get(plan["retained_ids"])
         retained = [item["evidence_id"] for item in retained_rows] or previous[:1]
         by_id.update((item["evidence_id"], item) for item in retained_rows)
         exhaustive = {eid for scope in results["scopes"] if scope.get("complete")
@@ -1169,6 +1208,7 @@ def review_claim(
                 if previous_id not in exhaustive and previous_id not in grouped and previous_id not in retained:
                     selected[offset] = eid
                     break
+        previous_windows = len(inspected_body_windows)
         for scope in results["scopes"]:
             if scope["mode"] == "direct" and scope["matching_count"] and scope["table_label"] is None:
                 if scope["page_index"] is not None:
@@ -1187,19 +1227,32 @@ def review_claim(
                     [query or scope["query"]], doc_id=scope["doc_id"], doc_version_id=scope["doc_version_id"],
                     page_index=scope["page_index"], section=scope["section"],
                 ))
+        if second:
+            prioritized.clear()
+            inspected_body_windows[:] = inspected_body_windows[previous_windows:] + inspected_body_windows[:previous_windows]
         prioritized.extend(selected)
-        follow_up_evidence_ids.extend(eid for eid in selected if eid not in known)
-        if follow_up_evidence_ids or any(scope.get("complete") for scope in results["scopes"]):
+        fresh = [eid for eid in selected if eid not in known]
+        follow_up_evidence_ids.extend(fresh)
+        if fresh or any(scope.get("complete") for scope in results["scopes"]):
             return True
         if not inspected_body_windows:
             return False
         primary = candidate_order()
         table_ids = [item["evidence_id"] for item in index.table_context(primary)["evidence"]]
         return any(not known.issuperset(group["new_evidence_ids"])
-                   for group in index.pack_body_context(context_windows(), [*primary, *table_ids]))
+                   for group in index.pack_body_context(context_windows(primary), [*primary, *table_ids]))
 
-    def context_windows():
-        return list(dict.fromkeys(inspected_body_windows or body_windows))[:2]
+    def context_windows(primary_ids):
+        if inspected_body_windows:
+            # A targeted check adds a source. Keep the original supporting range in the shared text budget.
+            windows = list(dict.fromkeys([*inspected_body_windows[:1], *body_windows[:1],
+                                          *inspected_body_windows[1:2], *body_windows[1:2]]))
+        else:
+            windows = list(dict.fromkeys(body_windows))[:2]
+        if documents and not cited_abstract and claim["kind"] not in {"background", "purpose"}:
+            if anchored := index.anchored_body_context(primary_ids, windows):
+                windows.insert(len(windows) if inspected_body_windows else 0, anchored)
+        return windows
 
     def candidate_order() -> list[str]:
         # Keep context from each lane together when combining support and counter searches.
@@ -1253,16 +1306,24 @@ def review_claim(
         supplements = index.get(item["evidence_id"] for item in additional_evidence)
         prioritized.extend(item["evidence_id"] for item in supplements)
         by_id.update((item["evidence_id"], item) for item in supplements)
-    followup = bool(saved_targets or additional_evidence)
-    saved = normalize_targets(saved_targets, documents, initial_queries=initial_queries)
-    if saved:
+    rounds = []
+    if saved_targets and isinstance(saved_targets[0], dict) and "targets" in saved_targets[0]:
+        rounds = list(saved_targets[:_MAX_ORIGINAL_FOLLOWUPS])
+    elif saved := normalize_targets(saved_targets, documents, initial_queries=initial_queries):
+        # Older checkpoints stored one flat list without the originating packet.
         previous = candidate_order()
         context = index.table_context(previous)
-        retain = saved_targets[0].get("retained_evidence_ids", ()) if isinstance(saved_targets[0], dict) else ()
-        known = set(previous) | {item["evidence_id"] for item in context["evidence"]} | set(retain)
-        inspect(saved, previous, known, retain=retain)
+        retained = list(saved_targets[0].get("retained_evidence_ids", ())) if isinstance(saved_targets[0], dict) else []
+        known = set(previous) | {item["evidence_id"] for item in context["evidence"]} | set(retained)
+        rounds = [{"targets": saved, "primary_ids": previous, "sent_ids": sorted(known),
+                   "context_ids": [], "retained_ids": retained}]
+    for ordinal, plan in enumerate(rounds):
+        inspect(plan, second=bool(ordinal))
+    followup = bool(rounds or saved_targets or additional_evidence)
     calculation = None
     while True:
+        second_followup = bool(documents and len(rounds) == _MAX_ORIGINAL_FOLLOWUPS - 1
+                               and not additional_evidence)
         candidates = [by_id[eid] for eid in candidate_order()]
         passages = index.body_passages(item["evidence_id"] for item in candidates)
         context = index.table_context(item["evidence_id"] for item in candidates)
@@ -1275,18 +1336,33 @@ def review_claim(
             for eid, related_ids in sorted(context["by_seed"].items())
         ]
         scoped = {item["evidence_id"]: item for item in [*candidates, *context["evidence"]]}
-        body_context = index.pack_body_context(context_windows(), scoped)
+        body_context = index.pack_body_context(context_windows([item["evidence_id"] for item in candidates]), scoped)
         body_ids = [eid for group in body_context for eid in group["new_evidence_ids"]]
         body_rows = {row["evidence_id"]: row for row in index.get(body_ids)}
         scoped.update(body_rows)
         table_region = None
+        linked_table = None
         if documents and claim["kind"] not in {"background", "purpose"}:
             source_ids = [item["evidence_id"] for item in candidates]
             table_region = index.referenced_table_region(claim["support_query"], [*source_ids, *body_ids], scoped)
             if table_region:
                 scoped.update((row["evidence_id"], row) for row in table_region["evidence"])
+            previous_cell = rounds[-1].get("linked_table_cell_id") if rounds else None
+            linked_table = index.linked_table_method(proposition, scoped, retained_cell_id=previous_cell)
+            if linked_table:
+                cell_id = linked_table["cell_evidence_id"]
+                group = next((row for row in table_context if row["cell_evidence_id"] == cell_id), None)
+                if group is None:
+                    group = {"cell_evidence_id": cell_id, "evidence": []}
+                    table_context.append(group)
+                group["reference_evidence_id"] = linked_table["reference_evidence_id"]
+                group["evidence"].extend(blind_evidence(linked_table["evidence"], preserve_order=True))
+                scoped.update((row["evidence_id"], row) for row in linked_table["evidence"])
+                if len(linked_table["method_ids"]) > 1:
+                    passages.append({"evidence_ids": linked_table["method_ids"]})
+        linked_paths = linked_table["paths"] if linked_table else []
         comparison = None if claim.get("logic_review_required") else comparison_for_claim(
-            claim["proposition"], with_method_scope(scoped.values(), paths)
+            claim["proposition"], with_method_scope(scoped.values(), [*paths, *linked_paths])
         )
         calculation = comparison[0] if comparison else None
         packet_order = list(scoped)
@@ -1301,6 +1377,7 @@ def review_claim(
             sent_passages = passages
             sent_table_context = table_context
             sent_table_region = table_region
+            sent_linked_paths = linked_paths
             break
         if claim["kind"] in {"background", "purpose"}:
             finding = _pending(claim, "This sentence is outside original-paper result verification.")
@@ -1355,10 +1432,14 @@ def review_claim(
                 "If the evidence covers only one condition or changes the comparison setup, request the missing result."
             )
         hints = []
-        if documents and not followup:
+        if documents and (not followup or second_followup):
             proof_claim = claim["kind"] == "theoretical" or _PROOF_NAVIGATION.search(proposition)
             hints = _source_hints(documents, (proposition, *requirements, *initial_queries),
                                   index.proof_navigation_labels if proof_claim else ())
+            if second_followup:
+                inspected_pages = {(scope["doc_id"], scope["page_index"]) for scope in examined_scopes
+                                   if scope["mode"] == "direct" and scope.get("complete")}
+                hints = [hint for hint in hints if (hint["doc_id"], hint["page_index"]) not in inspected_pages]
         if hints:
             material["source_hints"] = hints
             material["coverage_instructions"] += (
@@ -1368,8 +1449,18 @@ def review_claim(
                 "it to the heading's page. A known table can be targeted by table_label. Use a targeted search if "
                 "no listed source fits. Base judgments on the returned source anchors."
             )
+        if second_followup:
+            material["coverage_instructions"] += (
+                " One further check is available if a required condition is still unresolved. Use a structured "
+                "follow_up_target with the exact requirement and a different named page, section or table."
+            )
         if table_context:
             material["table_context"] = table_context
+            if linked_table:
+                material["coverage_instructions"] += (
+                    " A table_context group with reference_evidence_id pairs a table value with a Methods passage "
+                    "that explicitly references its table. Read anchors elsewhere in the packet when already supplied."
+                )
         if table_region:
             material["table_region"] = {**table_region, "evidence": blind_evidence(table_region["evidence"], preserve_order=True)}
             material["coverage_instructions"] += (
@@ -1421,8 +1512,15 @@ def review_claim(
                 "direct_contradiction empty."
             )
         if cited_abstract:
-            material["evidence_boundary"] = evidence_boundary(packet_order)
-            material["coverage_instructions"] = _CITED_ABSTRACT_INSTRUCTIONS
+            material = {
+                "claim": claim["proposition"],
+                "requirements": requirements,
+                "evidence": [{"evidence_id": row["evidence_id"], "text": row["text"]} for row in material["evidence"]],
+                "evidence_boundary": evidence_boundary(packet_order),
+                "coverage_instructions": _CITED_ABSTRACT_INSTRUCTIONS,
+            }
+            if calculation is not None:
+                material["calculation"] = calculation
             if empirical:
                 material["coverage_instructions"] += (
                     " For empirical support, identify the directly reported result and its conditions in empirical_support, "
@@ -1449,6 +1547,7 @@ def review_claim(
             sent_passages = passages
             sent_table_context = table_context
             sent_table_region = table_region
+            sent_linked_paths = linked_paths
             if output is None:
                 repair = {**material, "retry": "Review the supplied IDs and citation ranges carefully."}
                 output, ids, citation_ranges = _judge_attempt(model, repair, sent_candidate_ids, scoped,
@@ -1480,24 +1579,36 @@ def review_claim(
             proof_error = _contradiction_error(output, sent_candidate_ids)
             proof_blocker = proof_error or _direct_refutation_blocker(claim, output, coverage)
         direct_proof = verdict == "refuted" and proof_blocker is None
-        if not cited_abstract and not direct_proof and not followup:
+        if not cited_abstract and not direct_proof and (not followup or second_followup):
             targets = _pending_targets(output, requirements, documents, initial_queries=initial_queries)
-            if not targets and empirical_blocker:
+            if not targets and empirical_blocker and not followup:
                 fallback = _empirical_followup(claim, empirical_blocker, hints)
                 if fallback is not None:
                     targets = [fallback]
+            retained = list(dict.fromkeys([
+                *(eid for group in output.evidence_groups if group.role in {"support", "refute"}
+                  for eid in group.evidence_ids),
+                *(eid for field in coverage if field["status"] == "found" for eid in field["evidence_ids"]),
+            ]))[:2]
+            results = None
+            if second_followup and targets:
+                retained = list(dict.fromkeys([*retained, *(
+                    eid for eid in rounds[0]["retained_ids"] if eid in scoped
+                )]))[:2]
+                targets, results = _additional_inspection(index, targets, rounds[0]["targets"], coverage,
+                                                         requirements, documents, sent_candidate_ids,
+                                                         primary_limit - len(retained))
             if targets:
-                if reserve_followup is None or reserve_followup():
+                if followup or reserve_followup is None or reserve_followup():
                     followup = True
-                    retained = list(dict.fromkeys([
-                        *(eid for group in output.evidence_groups if group.role in {"support", "refute"}
-                          for eid in group.evidence_ids),
-                        *(eid for field in coverage if field["status"] == "found" for eid in field["evidence_ids"]),
-                    ]))[:2]
+                    plan = {"targets": targets, "primary_ids": [item["evidence_id"] for item in candidates],
+                            "sent_ids": sent_candidate_ids, "context_ids": body_ids, "retained_ids": retained}
+                    if linked_table:
+                        plan["linked_table_cell_id"] = linked_table["cell_evidence_id"]
+                    rounds.append(plan)
                     if save_targets is not None:
-                        save_targets([{**targets[0], "retained_evidence_ids": retained}, *targets[1:]] if retained else targets)
-                    if inspect(targets, [item["evidence_id"] for item in candidates], set(sent_candidate_ids),
-                               context_ids=body_ids, retain=retained):
+                        save_targets(list(rounds))
+                    if inspect(plan, second=second_followup, results=results):
                         continue
                     stop = "no_progress"
                 else:
@@ -1517,12 +1628,15 @@ def review_claim(
         follow_up_requested = bool(output.follow_up_queries or output.follow_up_targets)
         decisive_fields_checked = checked <= {"found"} and not follow_up_requested
         invalid_contradiction = verdict == "refuted" and not direct_proof
+        required = {_field_key(field) for field in requirements}
+        insufficiency_checks = {field["status"] for field in coverage
+                                 if not cited_abstract or _field_key(field["requirement"]) in required}
+        # In a bounded abstract, explanations in missing_fields do not add new requirements.
         can_call_insufficient = (
-            "searched_missing" in checked and checked <= {"found", "searched_missing"}
+            "searched_missing" in insufficiency_checks and insufficiency_checks <= {"found", "searched_missing"}
             and not follow_up_requested and not conflicting & {"support", "refute"}
         )
         if cited_abstract:
-            required = {_field_key(field) for field in requirements}
             marked_missing = any(check.status == "searched_missing" and _field_key(check.requirement) in required
                                  and set(sent_candidate_ids).issuperset(check.evidence_ids) for check in output.coverage)
             can_call_insufficient = can_call_insufficient and full_abstract and marked_missing
@@ -1574,6 +1688,9 @@ def review_claim(
             reason = f"Required sources have not been fully checked. Proposed assessment: {output.reason}"
         else:
             reason = output.reason
+        if cited_abstract and verdict == "refuted" and direct_proof:
+            proof = output.direct_contradiction
+            ids = list(dict.fromkeys([*proof.evidence_ids, *proof.scope_evidence_ids, *ids]))
         finding = {**claim, "review_status": status, "verdict": verdict if status == "completed" else None,
                    "reason": reason, "evidence_ids": ids,
                    "evidence_groups": [group.model_dump() for group in output.evidence_groups],
@@ -1601,7 +1718,7 @@ def review_claim(
     if documents:
         finding["retrieval_trace"] = {
             "retrieved_evidence_ids": list(dict.fromkeys(eid for lane in breadth for eid in lane)),
-            "body_window_evidence_ids": list(dict.fromkeys(eid for window in context_windows()
+            "body_window_evidence_ids": list(dict.fromkeys(eid for window in context_windows(candidate_ids)
                                                            for eid in window.expanded_ids)),
             "priority_evidence_ids": sent_priority,
         }
@@ -1612,10 +1729,10 @@ def review_claim(
         ]:
             finding["retrieval_trace"]["page_continuations"] = continuations
     finding["searched_scope"] = examined_scopes
-    finding["retrieval_paths"] = _sent_paths([*paths, *context["paths"]], sent_candidate_ids)
+    finding["retrieval_paths"] = _sent_paths([*sent_linked_paths, *paths, *context["paths"]], sent_candidate_ids)
     if sent_table_context:
         finding["table_context"] = [
-            {"cell_evidence_id": group["cell_evidence_id"],
+            {**{key: value for key, value in group.items() if key != "evidence"},
              "evidence_ids": [item["evidence_id"] for item in group["evidence"]]}
             for group in sent_table_context
         ]
@@ -1629,6 +1746,7 @@ def review_claim(
     if sent_body_context:
         finding["body_context"] = sent_body_context
     finding["follow_up_performed"] = followup
+    finding["follow_up_round_count"] = len(rounds)
     follow_up_evidence_ids.extend(eid for eid in sent_candidate_ids if eid in new_continuation_ids)
     if follow_up_evidence_ids:
         finding["follow_up_evidence_ids"] = list(dict.fromkeys(follow_up_evidence_ids))

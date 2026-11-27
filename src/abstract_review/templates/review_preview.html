@@ -1,0 +1,82 @@
+{% from 'review_evidence.html' import evidence_href, evidence_link, evidence_links with context %}
+{% set report_url = request.url_for('view_run', run_id=run_id) %}
+<div class="preview-content" data-preview-content data-requested-page="{{ requested_page if requested_page is not none else '' }}"
+     data-requested-doc="{{ requested_doc or '' }}"{% if selected %} data-selected-evidence="{{ selected.evidence_id }}"{% endif %}
+     {% if preview_url %}data-page-number="{{ preview_page + 1 }}"{% endif %}>
+  <div class="pdf-heading">
+    <div>
+      <h2>PDF 原页</h2>
+      {% if preview_document %}
+        <p class="meta">{{ preview_document.name }}</p>
+      {% endif %}
+    </div>
+    {% if preview_url %}
+      <div class="toolbar pdf-tools">
+        <a class="button button-small mobile-back" href="#findings">返回断言</a>
+        <label class="zoom-control meta" data-zoom hidden>缩放
+          <select aria-label="页图缩放"><option value="100">100%</option><option value="125">125%</option><option value="150">150%</option><option value="200">200%</option></select>
+        </label>
+        <a class="button button-small" href="{{ preview_url }}" target="_blank" rel="noopener">打开页图 <span aria-hidden="true">↗</span></a>
+      </div>
+    {% endif %}
+  </div>
+  {% if preview_documents|length > 1 %}
+  <form class="document-switch" data-document-switch action="{{ report_url }}#pdf-preview" method="get">
+    <input type="hidden" name="version_id" value="{{ version_id }}">
+    <label for="preview-document" class="sr-only">PDF 文档</label>
+    <select id="preview-document" name="doc_id">
+      {% for document in preview_documents %}
+        <option value="{{ document.doc_id }}"{% if preview_document and preview_document.doc_id == document.doc_id %} selected{% endif %}>{{ {'main': '主论文', 'supplement': '补充材料', 'external': '外部文献'}.get(document.role, 'PDF') }} · {{ document.name }}</option>
+      {% endfor %}
+    </select>
+    <button class="button button-small" type="submit">切换</button>
+  </form>
+  {% endif %}
+  {% if preview_url %}
+    {% set page_url = report_url.include_query_params(version_id=version_id, doc_id=preview_document.doc_id) %}
+    {% if selected %}{% set page_url = page_url.include_query_params(evidence_id=selected.evidence_id) %}{% endif %}
+    <nav class="pdf-pagination" aria-label="PDF 页码">
+      {% if page_position > 0 %}
+        <a class="button button-small" data-pdf-nav="previous" href="{{ page_url.include_query_params(page=page_numbers[page_position - 1]) }}#pdf-preview">上一页</a>
+      {% else %}<span class="button button-small" aria-disabled="true">上一页</span>{% endif %}
+      <form class="page-jump" data-page-jump action="{{ report_url }}#pdf-preview" method="get">
+        <input type="hidden" name="version_id" value="{{ version_id }}">
+        <input type="hidden" name="doc_id" value="{{ preview_document.doc_id }}">
+        {% if selected %}<input type="hidden" name="evidence_id" value="{{ selected.evidence_id }}">{% endif %}
+        <label class="sr-only" for="pdf-page-number">PDF 页码，从 1 到 {{ page_numbers[-1] }}</label>
+        <input id="pdf-page-number" name="page" type="number" min="1" max="{{ page_numbers[-1] }}" step="1" required value="{{ preview_page + 1 }}">
+        <span class="meta">/ {{ page_numbers[-1] }} 页</span>
+        <button class="button button-small" type="submit">跳转</button>
+      </form>
+      {% if page_position + 1 < page_numbers|length %}
+        <a class="button button-small" data-pdf-nav="next" href="{{ page_url.include_query_params(page=page_numbers[page_position + 1]) }}#pdf-preview">下一页</a>
+      {% else %}<span class="button button-small" aria-disabled="true">下一页</span>{% endif %}
+    </nav>
+    {% if preview_evidence %}
+      <div class="source-quote">
+        <div class="source-label">所选证据{% if selected.locator.section %}<span>{{ selected.locator.section }}</span>{% endif %}</div>
+        {% if selected.text %}<blockquote class="excerpt">{{ selected.text }}</blockquote>{% endif %}
+      </div>
+    {% elif selected and selected.locator.bbox %}
+      <div class="source-hint"><a class="button button-small" data-pdf-nav="evidence" href="{{ evidence_href(selected.evidence_id) }}">返回证据页 · 第 {{ selected.locator.page_index + 1 }} 页</a></div>
+    {% else %}
+      <p class="source-hint">点左侧引用可定位并高亮原文，也可以输入页码浏览全文。</p>
+    {% endif %}
+    <div class="pdf" tabindex="0" role="region" aria-label="PDF 页图"
+         {% if preview_focus %}data-focus-x="{{ preview_focus[0] }}" data-focus-y="{{ preview_focus[1] }}"{% endif %}>
+      <img src="{{ preview_url }}" alt="第 {{ preview_page + 1 }} 页原文{% if preview_evidence %}，已高亮所选证据{% endif %}">
+    </div>
+    {% if preview_evidence and (selected.row_header_evidence_id or selected.column_header_evidence_ids or selected.note_evidence_ids) %}
+      <div class="source-links">
+        {% if selected.row_header_evidence_id or selected.column_header_evidence_ids %}
+          <p class="meta">相关表头</p>
+          <div class="anchors">
+            {% if selected.row_header_evidence_id %}{{ evidence_link(selected.row_header_evidence_id) }}{% endif %}
+            {% for id in selected.column_header_evidence_ids|default([]) %}{{ evidence_link(id) }}{% endfor %}
+          </div>
+        {% endif %}
+        {% if selected.note_evidence_ids %}<p class="meta">表注</p>{{ evidence_links(selected.note_evidence_ids) }}{% endif %}
+      </div>
+    {% endif %}
+  {% else %}<p class="source-hint">当前报告没有可打开的 PDF 页。</p>{% endif %}
+</div>

@@ -27,6 +27,9 @@ _DATASET = "scitabalign-cells"
 _STATUSES = ("aligned", "empty_explanation", "invalid_coordinates")
 _COORDINATE = re.compile(r"(0|[1-9][0-9]*):(0|[1-9][0-9]*)")
 _SELECTION_LIMIT = max(_DEFAULT_RANK_CUTOFFS)
+_ONLINE_SELECTION_LIMIT = 24
+_TABLE_CELL_LIMITS = (_SELECTION_LIMIT, 16, _ONLINE_SELECTION_LIMIT, 48)
+_TABLE_CUTOFFS = (*_DEFAULT_RANK_CUTOFFS, *_TABLE_CELL_LIMITS[1:])
 
 
 class _CellCoordinate(Schema):
@@ -170,31 +173,50 @@ def _load_inputs(manifest: object) -> list[dict]:
     return samples
 
 
-def _offline_selection(sample: dict) -> tuple[list[str], str]:
+def _selection_limit(sample: dict) -> int:
+    """Give larger tables room for the full rationale, including headers and comparisons."""
+    grid = sample["grid"]
+    return _SELECTION_LIMIT if len(grid) * len(grid[0]) <= _SELECTION_LIMIT else _ONLINE_SELECTION_LIMIT
+
+
+def _offline_selection(sample: dict, limit: int) -> tuple[list[str], str]:
     cells = _table_cells(sample, sample["grid"])
     with closing(EvidenceIndex(cells)) as index:
         seeds = [item["evidence_id"] for item in index.search(sample["claim"], limit=_MAX_CANDIDATES)["evidence"]]
-    return rank_table_cells(sample["claim"], cells, seeds, limit=_SELECTION_LIMIT), "ranking_only"
+    return rank_table_cells(sample["claim"], cells, seeds, limit=limit), "ranking_only"
 
 
-def _model_selection(sample: dict, model) -> tuple[list[str], str]:
+def _rerank_selected_cells(sample: dict, selected: list[str]) -> list[str]:
+    if len(selected) <= _SELECTION_LIMIT:
+        return selected
+    cells = _table_cells(sample, sample["grid"])
+    ranked = rank_table_cells(sample["claim"], cells, selected, limit=len(cells))
+    chosen = set(selected)
+    # Use the table context to rank the model's evidence without adding or dropping a coordinate.
+    return list(dict.fromkeys([*(eid for eid in ranked if eid in chosen), *selected]))
+
+
+def _model_selection(sample: dict, model, limit: int) -> tuple[list[str], str]:
     material = {key: sample[key] for key in ("claim", "caption", "grid")}
-    choice = model.call("select_table_cells", {**material, "selection_limit": _SELECTION_LIMIT}, _CellSelection)
+    choice = model.call("select_table_cells", {**material, "selection_limit": limit}, _CellSelection)
     if not isinstance(choice, _CellSelection):
         return [], "invalid_model_cell_selection"
     coordinates = [[cell.row, cell.column] for cell in choice.cells]
     shape = _shape(sample["grid"])
-    if (len(coordinates) > _SELECTION_LIMIT or any(not _within(cell, shape, first=0) for cell in coordinates)
+    if (len(coordinates) > limit or any(not _within(cell, shape, first=0) for cell in coordinates)
             or len(set(map(tuple, coordinates))) != len(coordinates)):
         return [], "invalid_model_cell_selection"
     reason = "model_cell_selection" if coordinates else "model_cell_selection_empty"
-    return [_cell_id(sample["sample_id"], row, column) for row, column in coordinates], reason
+    selected = [_cell_id(sample["sample_id"], row, column) for row, column in coordinates]
+    return _rerank_selected_cells(sample, selected), reason
 
 
-def run_scitabalign(manifest: object, *, model=None, batch=None) -> list[dict]:
-    """Select up to eight given-table cells through the offline ranker or a supplied model."""
+def run_scitabalign(manifest: object, *, model=None, batch=None, cell_limit: int | None = None) -> list[dict]:
+    """Select ranked evidence from the given table under a fixed or adaptive budget."""
     if batch is not None and model is None:
         raise ValueError("SciTabAlign batch checkpoints are for model selection")
+    if cell_limit is not None and (type(cell_limit) is not int or cell_limit not in _TABLE_CELL_LIMITS):
+        raise ValueError("SciTabAlign cell limit must be 8, 16, 24, or 48")
     samples = _load_inputs(manifest)
     predictions = []
     for sample in samples:
@@ -209,7 +231,10 @@ def run_scitabalign(manifest: object, *, model=None, batch=None) -> list[dict]:
                 break
             before, event_offset = batch.requests_used, len(model.events)
         try:
-            selected, stop_reason = _offline_selection(sample) if model is None else _model_selection(sample, model)
+            if model is None:
+                selected, stop_reason = _offline_selection(sample, cell_limit or _SELECTION_LIMIT)
+            else:
+                selected, stop_reason = _model_selection(sample, model, cell_limit or _selection_limit(sample))
         except ModelUnavailable as exc:
             if batch is None and isinstance(exc, ModelPaused):
                 raise
@@ -255,7 +280,7 @@ def score_scitabalign(predictions: object, gold: object) -> dict:
     predicted = _parse_predictions(predictions)
     fields = {"sample_id", "claim_id", "shape", "alignment_status", "cells"}
     metadata = {"dataset", "dataset_version", "source_sha256"}
-    metrics = {k: Counter() for k in _DEFAULT_RANK_CUTOFFS}
+    metrics = {k: Counter() for k in _TABLE_CUTOFFS}
     alignment = Counter(dict.fromkeys(_STATUSES, 0))
     cases, seen, ranked_count = [], set(), 0
     for key, label, _ in _rows(gold, "labels", fields, set(), metadata):

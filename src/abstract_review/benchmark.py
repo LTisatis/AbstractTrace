@@ -377,6 +377,8 @@ def _sample_result(result: dict, run: dict, report: dict, rows: list[dict], elap
         "prediction_count": len(rows), "wall_seconds": round(elapsed, 6),
         "model_requests": usage.get("external_requests"), "tokens": tokens, "request_usage": request_usage,
         "follow_up_count": sum(bool(row.get("follow_up_performed")) for row in report.get("findings", [])),
+        "follow_up_round_count": sum(row.get("follow_up_round_count", int(bool(row.get("follow_up_performed"))))
+                                     for row in report.get("findings", [])),
         "follow_up_new_evidence": sum(len(row.get("follow_up_evidence_ids", ())) for row in report.get("findings", [])),
         "unreadable_pages": sum(page.get("status") == "unreadable" for document in report.get("documents", [])
                                 for page in document.get("pages", [])),

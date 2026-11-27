@@ -122,7 +122,8 @@ def test_printed_heading_at_next_page_head_prevents_joining_different_sections()
         assert index.page_continuation(["tail"], [document]) is None
 
 
-def test_followup_preserves_both_prior_key_anchors_and_reuses_them_on_resume():
+@pytest.mark.parametrize("legacy", [False, True])
+def test_followup_preserves_both_prior_key_anchors_and_reuses_them_on_resume(legacy):
     rows = [
         _row("scope", "The fixed architecture uses one attention head.", 0),
         _row("result", "The model recognizes the finite-state language.", 0),
@@ -138,8 +139,67 @@ def test_followup_preserves_both_prior_key_anchors_and_reuses_them_on_resume():
         finding, _ = review_claim(CLAIM, index, model, documents=[_document()], save_targets=saved.append)
     assert len(finding["candidate_ids"]) == 8
     assert set(cited).issubset(finding["candidate_ids"])
-    assert saved == [[{**target, "retained_evidence_ids": cited}]]
+    rounds, = saved
+    plan, = rounds
+    assert plan["targets"] == [target] and plan["retained_ids"] == cited
+    if legacy:
+        rounds = [{**target, "retained_evidence_ids": cited}]
 
     with closing(EvidenceIndex(rows)) as index:
-        resumed, _ = review_claim(CLAIM, index, _Replies(_output()), documents=[_document()], saved_targets=saved[0])
+        resumed, _ = review_claim(CLAIM, index, _Replies(_output()), documents=[_document()], saved_targets=rounds)
     assert resumed["candidate_ids"] == finding["candidate_ids"]
+
+
+def test_targeted_followup_keeps_the_original_methods_excerpt_and_linked_table_on_resume():
+    evidence = [
+        _row("design", "Astra is the hierarchical computational model.", 0, section="Methods", box=[60, 130, 480, 140]),
+        _row("static", "Astra uses a static approximation of attentional modulation.", 0, section="Methods",
+             box=[60, 142, 480, 152]),
+        _row("winner", "Selective amplification promotes winner-take-all processing.", 0, section="Methods",
+             box=[60, 154, 480, 164]),
+        *(_row(f"circuit-{number}", f"Reciprocal inhibition circuit calibration detail {number}.", 1,
+               section="Methods", box=[60, 100 + 12 * number, 480, 110 + 12 * number]) for number in range(12)),
+        _row("caption", "Table 2. Model parameters.", 2, box=[60, 70, 260, 84]),
+        {**_row("count", "6", 2, box=[140, 118, 195, 133]), "kind": "table_cell", "row_header": "Astra",
+         "column_header": "df", "locator": {"section": "Results", "page_index": 2, "table_index": 0,
+                                            "row_index": 1, "column_index": 1, "bbox": [140, 118, 195, 133]}},
+        _row("fit", "The free parameters in Table 2 were fitted to the training data.", 3, section="Methods",
+             box=[60, 100, 480, 110]),
+    ]
+    document = _document()
+    document["pages"].extend({"page_index": page, "width": 600, "height": 800, "status": "parsed"} for page in (2, 3))
+    claim = {**CLAIM, "kind": "method", "proposition": "The six-parameter Astra model uses a static approximation of "
+             "attentional modulation that promotes winner-take-all processing through reciprocal inhibition.",
+             "support_query": "Astra static attentional modulation winner-take-all processing",
+             "counter_query": "Astra static approximation attentional modulation"}
+    target = {"query": "reciprocal inhibition circuit calibration", "page_index": 1, "doc_id": "paper",
+              "requirement": "fixed architecture"}
+    chain = ["count", "caption", "fit"]
+    expected = {*chain, "static", "winner"}
+    pending = _output(targets=[target], groups=[{"role": "support", "evidence_ids": chain}])
+    found = sorted(expected)
+    supported = _output(verdict="supported", groups=[{"role": "support", "evidence_ids": found}],
+                        coverage=[{"requirement": "fixed architecture", "status": "found", "evidence_ids": found}])
+
+    def sent(packet):
+        return ({row["evidence_id"] for row in packet["evidence"]}
+                | {row["evidence_id"] for group in packet.get("table_context", ()) for row in group["evidence"]}
+                | {line[0] for group in packet.get("body_context", ()) for line in group["lines"] if len(line) == 2})
+
+    model = _Replies(pending, supported)
+    saved = []
+    with closing(EvidenceIndex(evidence)) as index:
+        finding, _ = review_claim(claim, index, model, documents=[document], save_targets=saved.append)
+    assert len(model.calls) == 2 and all(expected <= sent(packet) for packet in model.calls)
+    lines = [line[1] for window in model.calls[1]["body_context"] for line in window["lines"] if len(line) == 2]
+    assert len(lines) <= 24 and sum(map(len, lines)) <= 1800
+    assert "circuit-0" in sent(model.calls[1])
+    assert saved[0][0]["linked_table_cell_id"] == "count"
+    assert finding["verdict"] == "supported"
+    assert any(path["evidence_ids"] == chain for path in finding["retrieval_paths"])
+
+    resumed = _Replies(supported)
+    with closing(EvidenceIndex(evidence)) as index:
+        recovered, _ = review_claim(claim, index, resumed, documents=[document], saved_targets=saved[0])
+    assert recovered["verdict"] == finding["verdict"]
+    assert resumed.calls[0] == model.calls[1]

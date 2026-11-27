@@ -311,12 +311,14 @@ def scifact_checkpoint(path: Path, manifest_sha256: str, configuration: dict, *,
 
 
 def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=ResponsesModel,
-                batch: _OnlineBenchmarkBatch | None = None) -> list[dict]:
+                batch: _OnlineBenchmarkBatch | None = None, recheck_model: str | None = None) -> list[dict]:
     """Apply the shared claim retrieval and judge to input-only cited abstracts."""
     if engine not in {"offline", "openai"}:
         raise ValueError("SciFact benchmark engine must be offline or openai")
     if batch is not None and engine != "openai":
         raise ValueError("SciFact batch checkpoints are for the online engine")
+    if recheck_model is not None and engine != "openai":
+        raise ValueError("SciFact recheck requires the online engine")
     documents, samples = _load_inputs(manifest)
     predictions = []
     for sample in samples:
@@ -338,15 +340,32 @@ def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=Re
             for n, text in enumerate(documents[doc_id]) if text.strip()
         ]
         index = EvidenceIndex(evidence)
-        model = None
+        model = rechecker = None
+        started = time.monotonic()
+        sample_seconds = 180 if batch is None else min(_BATCH_SAMPLE_SECONDS, batch.remaining_seconds)
         try:
             if batch is None:
-                model = None if engine == "offline" else make_model(model_name, max_requests=4, max_seconds=180)
+                model = None if engine == "offline" else make_model(model_name, max_requests=4, max_seconds=sample_seconds)
             else:
                 model = make_model(model_name, max_requests=min(4, batch.max_requests - before),
-                                   max_seconds=min(_BATCH_SAMPLE_SECONDS, batch.remaining_seconds), before_call=batch.reserve)
+                                   max_seconds=sample_seconds, before_call=batch.reserve)
             source_ids = None if model is None else [row["evidence_id"] for row in evidence]
             finding, _ = review_claim(claim, index, model, cited_abstract_ids=source_ids)
+            remaining = sample_seconds - (time.monotonic() - started)
+            if (recheck_model and source_ids and set(finding.get("sent_candidate_ids", ())) == set(source_ids)
+                    and not finding.get("retryable") and finding["review_status"] in {"completed", "pending"}
+                    and finding["verdict"] in {None, "insufficient"} and remaining > 0
+                    and (batch is None or batch.exhaustion() is None)):
+                try:
+                    budget = {} if batch is None else {"before_call": batch.reserve}
+                    rechecker = make_model(recheck_model, max_requests=1, max_seconds=remaining,
+                                           max_output_tokens=2048, **budget)
+                    checked, _ = review_claim(claim, index, rechecker, cited_abstract_ids=source_ids)
+                except ModelUnavailable:
+                    pass
+                else:
+                    if checked["verdict"] in _VERDICTS.values() and checked["evidence_ids"]:
+                        finding = checked
         except ModelUnavailable as exc:
             if batch is not None and isinstance(exc, ModelPaused):
                 batch.pause(sample_id, input_digest, batch.requests_used - before, getattr(model, "events", []))
@@ -359,7 +378,8 @@ def run_scifact(manifest: object, engine: str, model_name: str, *, make_model=Re
             break
         prediction = _prediction(sample_id, claim_id, finding)
         if batch is not None:
-            batch.record(sample_id, input_digest, prediction, batch.requests_used - before, getattr(model, "events", []))
+            events = [*getattr(model, "events", []), *getattr(rechecker, "events", [])]
+            batch.record(sample_id, input_digest, prediction, batch.requests_used - before, events)
         predictions.append(prediction)
     return predictions
 

@@ -169,7 +169,22 @@ def serve(args: argparse.Namespace) -> None:
 
     from .web import create_app
 
-    uvicorn.run(create_app(args.data_dir.resolve()), host="127.0.0.1", port=args.port)
+    app = create_app(args.data_dir.resolve())
+    host = "127.0.0.1"
+    if not args.open_browser:
+        uvicorn.run(app, host=host, port=args.port)
+        return
+
+    from threading import Thread
+    from webbrowser import open as open_url
+
+    class BrowserServer(uvicorn.Server):
+        async def startup(self, sockets=None) -> None:
+            await super().startup(sockets)
+            port = self.servers[0].sockets[0].getsockname()[1]
+            Thread(target=open_url, args=(f"http://{host}:{port}/",), daemon=True).start()
+
+    BrowserServer(uvicorn.Config(app, host=host, port=args.port)).run()
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
@@ -200,6 +215,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
                     if value is not None}
     if batch_limits and not online_dataset:
         raise ValueError("benchmark-wide limits are available for online SciFact and SciTabAlign")
+    if args.table_cell_limit is not None and args.dataset != "scitabalign":
+        raise ValueError("--table-cell-limit requires --dataset scitabalign")
+    if args.scifact_recheck_model and (args.dataset != "scifact" or args.engine != "openai"):
+        raise ValueError("--scifact-recheck-model requires online SciFact")
 
     def finish(predictions: list[dict], configuration: dict, batch: dict | None = None) -> None:
         if hashlib.sha256(args.input_manifest.read_bytes()).hexdigest() != manifest_hash:
@@ -225,8 +244,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scifact-cited-abstracts"
         if online_dataset:
+            configuration["cited_abstract_coverage_revision"] = 2
+            configuration["cited_abstract_citation_order"] = "decisive_result_first"
+            if args.scifact_recheck_model:
+                configuration["cited_abstract_recheck_model"] = args.scifact_recheck_model
             with scifact_checkpoint(checkpoints, manifest_hash, configuration, resume=args.resume, **batch_limits) as batch:
-                predictions = run_scifact(manifest, engine, args.model, batch=batch)
+                predictions = run_scifact(manifest, engine, args.model, batch=batch, recheck_model=args.scifact_recheck_model)
                 results.extend(batch.results)
                 finish(predictions, configuration, batch.summary(len(manifest["samples"])))
             return
@@ -240,7 +263,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
         engine = args.engine or "offline"
         configuration = benchmark_configuration(engine, args.model)
         configuration["dataset"] = "scitabalign-cells"
+        configuration["table_cell_limit"] = (
+            args.table_cell_limit if args.table_cell_limit is not None
+            else ("8_for_small_tables_else_24" if online_dataset else 8)
+        )
         if online_dataset:
+            configuration["table_selector_revision"] = 3
             from .models import ModelUnavailable, ResponsesModel
             from .scifact import benchmark_checkpoint
 
@@ -254,13 +282,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
                                            before_call=batch.reserve, max_output_tokens=max_output_tokens)
                 except ModelUnavailable as exc:
                     raise ValueError(str(exc)) from exc
-                predictions = run_scitabalign(manifest, model=model, batch=batch)
+                predictions = run_scitabalign(manifest, model=model, batch=batch, cell_limit=args.table_cell_limit)
                 results.extend(batch.results)
                 finish(predictions, configuration, batch.summary(len(manifest["samples"])))
             return
         if args.resume:
             raise ValueError("--resume is available for PDF benchmarks and online SciFact or SciTabAlign")
-        predictions = run_scitabalign(manifest)
+        predictions = run_scitabalign(manifest, cell_limit=args.table_cell_limit)
     elif args.engine:
         from .benchmark import benchmark_configuration, run_pdf_samples
 
@@ -438,7 +466,8 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostic.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     diagnostic.set_defaults(handler=doctor)
     server = commands.add_parser("serve", help="launch the local report interface on loopback")
-    server.add_argument("--port", type=int, default=8000)
+    server.add_argument("--port", type=int, default=8000, help="local port (0 chooses an available port)")
+    server.add_argument("--open", dest="open_browser", action="store_true", help="open the browser when the server is ready")
     server.set_defaults(handler=serve)
 
     review = commands.add_parser("review", help="review local PDFs or synthetic fixtures")
@@ -496,6 +525,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-dir", type=Path, required=True)
     run.add_argument("--engine", choices=("offline", "openai"), help="benchmark engine for PDF, SciFact or SciTabAlign")
     run.add_argument("--dataset", choices=("scifact", "scitabalign"), help="select a public benchmark adapter")
+    run.add_argument("--table-cell-limit", type=int, choices=(8, 16, 24, 48),
+                     help="override SciTabAlign selection size (online default: 8 for small tables, else 24; offline default: 8)")
+    run.add_argument("--scifact-recheck-model", help="optionally recheck one undecided complete SciFact abstract")
     run.add_argument("--model", default=os.environ.get("ABSTRACT_REVIEW_MODEL", "gpt-6.2-sol"))
     run.add_argument("--embed-model", type=Path, help="path to an installed local Sentence Transformers model")
     run.add_argument("--rerank-model", type=Path, help="path to an installed local CrossEncoder")

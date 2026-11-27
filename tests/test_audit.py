@@ -382,6 +382,23 @@ def test_completing_named_section_can_mark_requirement_searched_missing():
     assert [item["evidence_id"] for item in model.calls[-1]["evidence"]] == finding["sent_candidate_ids"]
 
 
+def test_primary_body_anchor_adds_its_own_source_range_to_the_review_packet():
+    rows = []
+    for page in range(2):
+        for number in range(5):
+            text = f"{'Wetland observations' if page else 'Calibration details'} were recorded at site {number}."
+            row = _source(f"p{page}-{number}", text, "Methods", page)
+            row["locator"]["bbox"] = [20, 50 + number * 12, 190, 60 + number * 12]
+            rows.append(row)
+    with closing(EvidenceIndex(rows)) as index:
+        ranked = index.ranked_body_context(["wetland observations"], page_index=1)
+        anchor = index.anchored_body_context(["p0-2"], ranked)
+        groups = index.pack_body_context([anchor, *ranked], ["p0-2"])
+    assert groups[0]["evidence_ids"] == [f"p0-{number}" for number in range(5)]
+    assert "p0-2" not in groups[0]["new_evidence_ids"]
+    assert groups[1]["evidence_ids"] == [f"p1-{number}" for number in range(5)]
+
+
 def test_truncated_named_source_is_not_exhaustive_even_with_ranked_hits():
     rows = [_source(f"m{i}", f"Paragraph {i}", "Methods", 1) for i in range(10)]
     index = EvidenceIndex([*rows, _source("r", "Biodiversity shifted.")])
@@ -490,7 +507,8 @@ def test_duplicate_followup_queries_leave_room_for_a_same_query_named_proof():
     saved = []
     with closing(EvidenceIndex(rows)) as index:
         finding, _ = review_claim(CLAIM, index, model, documents=[{"doc_id": "paper"}], save_targets=saved.append)
-    assert len(model.calls) == 2 and saved == [[target]]
+    assert len(model.calls) == 2 and len(saved) == 1
+    assert saved[0][0]["targets"] == [target]
     assert model.calls[1]["direct_inspections"][0]["section"] == "Methods"
     assert "proof" in finding["sent_candidate_ids"]
     assert finding["follow_up_performed"]
@@ -552,7 +570,7 @@ def test_printed_heading_hint_reaches_the_physical_page_when_the_parser_section_
                           "doc_id": hint["doc_id"], "page_index": hint["page_index"]}
                 return schema.model_validate(_judgement(verdict="pending", targets=[target]))
 
-            assert "source_hints" not in material
+            assert all(hint["page_index"] != evidence_page for hint in material.get("source_hints", []))
             scope, = material["direct_inspections"]
             assert scope["doc_id"] == "paper" and scope["page_index"] == evidence_page and scope["section"] is None
             assert scope["complete"] and scope["examined_evidence_ids"] == [evidence_id]
@@ -647,7 +665,8 @@ def test_retry_reuses_saved_target_without_reserving_a_second_round():
     audit_version(report, first, checkpoint, reserve_followup=mark_reservation)
     assert report["findings"][0]["retryable"] is True
     assert persisted[0] == [CLAIM["claim_id"]]
-    assert report["claim_followups"][CLAIM["claim_id"]] == [_methods_target()]
+    plan, = report["claim_followups"][CLAIM["claim_id"]]
+    assert plan["targets"] == [_methods_target()] and plan["sent_ids"] == ["r"]
 
     second = Model(_judgement())
     audit_version(report, second, checkpoint, reserve_followup=mark_reservation)
@@ -662,3 +681,54 @@ def test_disallowed_supplement_leaves_claim_pending_without_a_second_judgement()
     finding, _ = review_claim(CLAIM, index, model, reserve_followup=lambda: False)
     assert finding["stop_reason"] == "follow_up_budget"
     assert finding["verdict"] is None and len(model.calls) == 1
+
+
+def test_new_scoped_followup_keeps_prior_anchors_and_replays_both_rounds():
+    rows = [_source("prior", "The prototype tracks biodiversity."),
+            _source("protocol", "Sampling sites were visited twice.", "Methods", 1),
+            _source("definition", "Species counts excluded unverified sightings.", "Appendix", 2)]
+    documents = [{"doc_id": "paper", "role": "main",
+                  "pages": [{"page_index": page, "status": "parsed"} for page in range(3)]}]
+    required = "measurement definition"
+    first = {"query": "sampling protocol", "page_index": 1, "requirement": required, "doc_id": "paper"}
+    second = {"query": "species counting rules", "page_index": 2, "requirement": required, "doc_id": "paper"}
+    groups = [{"role": "support", "evidence_ids": ["prior"]}]
+    final = _judgement(verdict="supported", missing=[],
+                       groups=[{"role": "support", "evidence_ids": ["prior", "definition"]}],
+                       observations=[{"requirement": required, "status": "found", "evidence_ids": ["definition"]}])
+    initial = Model(_judgement(verdict="pending", targets=[first], groups=groups),
+                    _judgement(verdict="pending", targets=[second]), ModelPaused("interrupted"))
+    saved, reservations = [], []
+    with closing(EvidenceIndex(rows)) as index:
+        paused, _ = review_claim(CLAIM, index, initial, documents=documents, save_targets=saved.append,
+                                 reserve_followup=lambda: not reservations.append(True))
+
+    assert paused["retryable"] and paused["follow_up_round_count"] == 2
+    assert len(initial.calls) == 3 and reservations == [True]
+    assert [plan["targets"] for plan in saved[-1]] == [[first], [second]]
+    assert {row["evidence_id"] for row in initial.calls[-1]["evidence"]} >= {"prior", "definition"}
+    resumed_model = Model(final)
+    with closing(EvidenceIndex(rows)) as index:
+        result, _ = review_claim(CLAIM, index, resumed_model, documents=documents, saved_targets=saved[-1],
+                                 reserve_followup=lambda: pytest.fail("a saved inspection was reserved again"))
+    assert resumed_model.calls == [initial.calls[-1]]
+    assert result["verdict"] == "supported" and result["follow_up_round_count"] == 2
+    assert result["evidence_ids"] == ["prior", "definition"]
+
+
+@pytest.mark.parametrize("page", [1, 2])
+def test_second_followup_needs_a_new_source_and_new_sent_evidence(page):
+    records = [_source("prior", "The prototype tracks biodiversity."),
+               _source("method", "Sites used equal visits.", "Methods", 1)]
+    required = "measurement definition"
+    model = Model(_judgement(verdict="pending", targets=[{
+        "query": "visits", "requirement": required, "page_index": 1, "doc_id": "paper",
+    }]), _judgement(verdict="pending", targets=[{
+        "query": "measurement counts", "requirement": required, "page_index": page, "doc_id": "paper",
+    }]))
+    saved = []
+    with closing(EvidenceIndex(records)) as index:
+        result, _ = review_claim(CLAIM, index, model, documents=[{"doc_id": "paper"}], save_targets=saved.append)
+    assert len(model.calls) == 2 and len(saved) == 1
+    assert result["follow_up_round_count"] == 1
+    assert result["review_status"] == "pending"

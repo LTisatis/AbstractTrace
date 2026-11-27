@@ -1,0 +1,49 @@
+<main class="intake">
+  <section class="intake-intro" aria-labelledby="intake-title">
+    <p class="eyebrow">论文摘要审阅</p>
+    <h1 id="intake-title">摘要里的结论，<br>原文支持吗？</h1>
+    <p class="lead">导入论文 PDF，逐条核对摘要断言。每条有据的判定都可回到原文复核。</p>
+    <ul class="workflow-list">
+      <li><span class="workflow-icon icon-claim" aria-hidden="true"></span><div><strong>核对摘要断言</strong><span>查看判定、依据和仍待核实的问题。</span></div></li>
+      <li><span class="workflow-icon icon-page" aria-hidden="true"></span><div><strong>定位证据原页</strong><span>打开正文、图表和支撑判定的具体单元格。</span></div></li>
+      <li><span class="workflow-icon icon-check" aria-hidden="true"></span><div><strong>复核改句</strong><span>对照原句和建议，选择、编辑并提交复核。</span></div></li>
+    </ul>
+  </section>
+  <section class="card intake-card" aria-labelledby="upload-title">
+    <h2 id="upload-title">导入论文</h2>
+    {% if error %}<p class="alert" role="alert">{{ error }} 请重新选择需要上传的文件。</p>{% endif %}
+    <form class="fields" data-intake data-max-pdf-bytes="{{ max_pdf_bytes }}" method="post" enctype="multipart/form-data" action="{{ request.url_for('start_review') }}">
+      <label class="dropzone">
+        <input name="pdf" type="file" accept="application/pdf,.pdf" required aria-label="论文 PDF">
+        <span class="upload-icon" aria-hidden="true">↑</span>
+        <strong data-file-name>选择或拖入论文 PDF</strong>
+      </label>
+      <div class="form-grid">
+        <label class="field">待审摘要来源
+          <select name="abstract_source"><option value="pdf">从 PDF 提取</option><option value="pasted"{% if form.abstract_source == 'pasted' %} selected{% endif %}>使用粘贴内容</option></select>
+        </label>
+        <label class="field">审阅方式
+          <select name="engine"><option value="offline">本地规则</option><option value="openai"{% if form.engine == 'openai' %} selected{% endif %}>OpenAI 模型</option></select>
+        </label>
+      </div>
+      <label class="field" data-pasted-field>粘贴摘要 <small>选择使用粘贴内容时填写。</small>
+        <textarea name="pasted_abstract" rows="5">{{ form.pasted_abstract|default('', true) }}</textarea>
+      </label>
+      <p class="meta engine-note" data-engine-note>OpenAI 模型为 {{ default_model }}。使用时会向模型发送审阅所需的摘要和证据。{% if not model_configured %}本地服务尚未配置 OPENAI_API_KEY，在线审阅会暂停。{% endif %}</p>
+      <details class="extra-options"{% if form.check_external or form.check_omissions %} open{% endif %}>
+        <summary>补充材料与扩展核查</summary>
+        <div class="fields">
+          <label class="field">补充材料 <small>选择附件即确认它属于这篇论文。</small>
+            <input name="supplements" type="file" accept="application/pdf,.pdf" multiple>
+          </label>
+          <ul class="compact attachment-list" data-attachments hidden aria-label="已选补充材料"></ul>
+          <label class="option"><input type="checkbox" name="check_omissions" value="true"{% if form.check_omissions %} checked{% endif %}> 核查摘要遗漏</label>
+          <label class="option"><input type="checkbox" name="check_external" value="true"{% if form.check_external %} checked{% endif %}> 核查外部参考文献</label>
+          <p class="meta">外部核查会向 Unpaywall、arXiv 或 OpenAlex 等服务查询文献标识和检索词，并尝试获取开放全文。</p>
+        </div>
+      </details>
+      <p class="alert" role="alert" data-file-error hidden></p>
+      <button class="button primary start-review" type="submit">开始审阅 <span aria-hidden="true">→</span></button>
+    </form>
+  </section>
+</main>
