@@ -397,15 +397,19 @@ class ReviewService:
     def export(self, run_id: str, version_id: str) -> dict:
         return self.store.read(run_id, version_id)
 
-    def _responses(self, report: dict, *, before_call=None):
+    def _responses(self, report: dict, *, before_call=None, time_limit: float | None = None):
         from .models import ResponsesModel
 
         config = report.get("configuration", {})
         if config.get("engine") != "openai":
             return None
         usage = report["usage"]
-        return ResponsesModel(config["model"], config["max_requests"], config["max_seconds"],
-                              previous_attempts=usage["external_requests"], previous_seconds=usage.get("elapsed_seconds", 0),
+        previous_seconds = usage.get("elapsed_seconds", 0)
+        max_seconds = config["max_seconds"]
+        if time_limit is not None:
+            max_seconds = min(max_seconds, previous_seconds + time_limit)
+        return ResponsesModel(config["model"], config["max_requests"], max_seconds,
+                              previous_attempts=usage["external_requests"], previous_seconds=previous_seconds,
                               before_call=before_call)
 
     def resume(self, run_id: str, request_id: str | None = None, add_requests: int = 0, add_seconds: int = 0,
